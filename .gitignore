@@ -1,6 +1,50 @@
+# Python
 __pycache__/
 *.pyc
-.env
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
 .venv/
 venv/
+env/
+ENV/
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Secrets / env
+.env
+.env.*
+
+# Claude
+.claude/
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Training artifacts
+checkpoints/
+checkpoints_*/
+*.pt
+*.pth
+runs/
+tb_logs/
+*.jsonl
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
