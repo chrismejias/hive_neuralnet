@@ -82,7 +82,7 @@ def device_summary(device: torch.device) -> str:
     if device.type == "cuda":
         idx = device.index or 0
         name = torch.cuda.get_device_name(idx)
-        mem_gb = torch.cuda.get_device_properties(idx).total_mem / (1024**3)
+        mem_gb = torch.cuda.get_device_properties(idx).total_memory / (1024**3)
         return f"{device} ({name}, {mem_gb:.1f} GB)"
     elif device.type == "mps":
         return f"{device} (Apple Metal)"

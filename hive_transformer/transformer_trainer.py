@@ -25,6 +25,7 @@ import torch
 import torch.optim as optim
 
 from hive_engine.device import get_device, device_summary
+from hive_engine.endgame import generate_endgame
 from hive_engine.game_state import GameState, GameResult
 from hive_engine.mcts import MCTS, MCTSConfig
 from hive_engine.neural_net import compute_loss
@@ -80,6 +81,9 @@ class TransformerTrainConfig:
 
     # Game limits
     max_game_length: int = 200
+
+    # Endgame bootstrapping
+    endgame_ratio: float = 0.0  # fraction of self-play games starting from endgame positions
 
     # Buffer
     buffer_max_size: int = 50_000
@@ -246,11 +250,11 @@ class TransformerTrainer:
 
                 # 5. Promote
                 if win_rate >= self.config.arena_threshold:
-                    print("  ✓ New model accepted!")
+                    print("  [+] New model accepted!")
                     self.best_net = new_net
                     metrics.arena_model_accepted = True
                 else:
-                    print("  ✗ New model rejected, keeping current best.")
+                    print("  [-] New model rejected, keeping current best.")
                     metrics.arena_model_accepted = False
 
                 # 6. Checkpoint & logging
@@ -269,8 +273,8 @@ class TransformerTrainer:
                     f"loss={train_stats.avg_loss:.4f} "
                     f"lr={train_stats.learning_rate:.2e} "
                     f"elo={elo_rating:.0f} "
-                    f"arena={win_rate:.1%}"
-                    f"{'✓' if metrics.arena_model_accepted else '✗'} "
+                    f"arena={win_rate:.1%} "
+                    f"{'[+]' if metrics.arena_model_accepted else '[-]'} "
                     f"buf={len(self.buffer)} time={total_time:.0f}s"
                 )
         finally:
@@ -287,8 +291,12 @@ class TransformerTrainer:
         stats = SelfPlayStats()
 
         for _ in range(self.config.games_per_iteration):
+            use_endgame = (
+                self.config.endgame_ratio > 0
+                and np.random.random() < self.config.endgame_ratio
+            )
             examples, result, game_length = self._self_play_game(
-                self.best_net
+                self.best_net, use_endgame=use_endgame
             )
             all_examples.extend(examples)
 
@@ -306,7 +314,7 @@ class TransformerTrainer:
         return all_examples, stats
 
     def _self_play_game(
-        self, net: HiveTransformer
+        self, net: HiveTransformer, use_endgame: bool = False
     ) -> tuple[list[TransformerTrainingExample], GameResult, int]:
         """
         Play one self-play game and return Transformer training examples.
@@ -326,7 +334,7 @@ class TransformerTrainer:
         )
         mcts = MCTS(net, self.encoder, mcts_config)
 
-        game = GameState()
+        game = generate_endgame() if use_endgame else GameState()
         history: list[tuple[HiveTokenSequence, np.ndarray, Color]] = []
 
         move_number = 0

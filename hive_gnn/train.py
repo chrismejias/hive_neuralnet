@@ -106,6 +106,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--buffer-size", type=int, default=50_000,
         help="Maximum replay buffer size.",
     )
+    parser.add_argument(
+        "--endgame-ratio", type=float, default=0.0,
+        help="Fraction of self-play games starting from endgame positions (default: 0.0).",
+    )
 
     # GNN architecture
     parser.add_argument(
@@ -184,6 +188,7 @@ def main(argv: list[str] | None = None) -> None:
             arena_threshold=args.arena_threshold,
             max_game_length=args.max_game_length,
             buffer_max_size=args.buffer_size,
+            endgame_ratio=args.endgame_ratio,
             device=args.device,
             use_amp=False if args.no_amp else None,
             checkpoint_dir=args.checkpoint_dir,

@@ -460,11 +460,11 @@ class Trainer:
 
                 # 5. Promote
                 if win_rate >= self.config.arena_threshold:
-                    print("  ✓ New model accepted!")
+                    print("  [+] New model accepted!")
                     self.best_net = new_net
                     metrics.arena_model_accepted = True
                 else:
-                    print("  ✗ New model rejected, keeping current best.")
+                    print("  [-] New model rejected, keeping current best.")
                     metrics.arena_model_accepted = False
 
                 # 6. Checkpoint & logging
@@ -483,7 +483,7 @@ class Trainer:
         total_time = (
             m.selfplay_time_sec + m.train_time_sec + m.arena_time_sec
         )
-        accepted_str = "✓" if m.arena_model_accepted else "✗"
+        accepted_str = "[+]" if m.arena_model_accepted else "[-]"
         print(
             f"  Summary: iter={m.iteration} loss={m.train_avg_loss:.4f} "
             f"lr={m.train_learning_rate:.2e} elo={m.elo_rating:.0f} "

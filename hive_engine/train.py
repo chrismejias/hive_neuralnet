@@ -415,7 +415,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # Print configuration summary
     cfg = trainer.config
-    print(f"\n{'─'*50}")
+    print(f"\n{'='*50}")
     print(f"  Device: {device_summary(trainer.device)}")
     if trainer.use_amp:
         print(f"  Mixed precision: on (float16)")
@@ -441,7 +441,7 @@ def main(argv: list[str] | None = None) -> None:
     if cfg.tensorboard_dir:
         print(f"  TensorBoard: {cfg.tensorboard_dir}")
     print(f"  Checkpoint dir: {cfg.checkpoint_dir}")
-    print(f"{'─'*50}\n")
+    print(f"{'='*50}\n")
 
     trainer.run()
 
