@@ -1,0 +1,305 @@
+"""
+CLI entry point for GPU-accelerated Hive training.
+
+Uses batched GPU MCTS (CPU trees + GPU inference) for fast self-play.
+
+Usage:
+    python -m hive_gpu --iterations 20 --games 64 --simulations 100
+    python -m hive_gpu --model-size large --games 32
+    python -m hive_gpu --resume checkpoints_gpu/hive_gpu_checkpoint_0010.pt
+    python -m hive_gpu --device cuda --no-amp
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import sys
+
+from hive_engine.device import get_device, device_summary
+
+from hive_gnn.gnn_net import GNNNetConfig, HiveGNN
+from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
+from hive_gpu.gpu_trainer import GPUTrainConfig, GPUTrainer
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train a Hive AI using GPU-accelerated batched MCTS self-play.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Training loop
+    parser.add_argument(
+        "--iterations", type=int, default=20,
+        help="Number of training iterations.",
+    )
+    parser.add_argument(
+        "--games", type=int, default=64,
+        help="Number of concurrent self-play games per batch.",
+    )
+    parser.add_argument(
+        "--batches-per-iter", type=int, default=1,
+        help="Number of self-play batches per iteration.",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=5,
+        help="Training epochs per iteration.",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=64,
+        help="Training batch size.",
+    )
+    parser.add_argument(
+        "--lr", type=float, default=1e-3,
+        help="Base learning rate.",
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=1e-4,
+        help="Weight decay for Adam optimizer.",
+    )
+
+    # LR schedule
+    parser.add_argument(
+        "--lr-schedule", choices=["constant", "cosine"], default="constant",
+        help="Learning rate schedule.",
+    )
+    parser.add_argument(
+        "--lr-warmup", type=int, default=0,
+        help="Number of warmup iterations.",
+    )
+    parser.add_argument(
+        "--lr-min", type=float, default=1e-5,
+        help="Minimum learning rate for cosine schedule.",
+    )
+    parser.add_argument(
+        "--grad-clip", type=float, default=1.0,
+        help="Maximum gradient norm (0 to disable).",
+    )
+
+    # MCTS
+    parser.add_argument(
+        "--simulations", type=int, default=100,
+        help="MCTS simulations per move.",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=1.0,
+        help="MCTS temperature for exploration.",
+    )
+    parser.add_argument(
+        "--temp-drop", type=int, default=20,
+        help="Move number to switch to greedy.",
+    )
+    parser.add_argument(
+        "--c-puct", type=float, default=1.5,
+        help="PUCT exploration constant.",
+    )
+    parser.add_argument(
+        "--dirichlet-alpha", type=float, default=0.3,
+        help="Dirichlet noise alpha for root exploration.",
+    )
+    parser.add_argument(
+        "--dirichlet-epsilon", type=float, default=0.25,
+        help="Dirichlet noise weight at root.",
+    )
+    parser.add_argument(
+        "--max-game-length", type=int, default=300,
+        help="Maximum moves per game.",
+    )
+    parser.add_argument(
+        "--wave-size", type=int, default=8,
+        help="Parallel MCTS sims per wave (1 = sequential).",
+    )
+    parser.add_argument(
+        "--nn-max-batch", type=int, default=0,
+        help="Max NN batch size per forward pass (0 = no limit).",
+    )
+
+    # Arena
+    parser.add_argument(
+        "--arena-games", type=int, default=20,
+        help="Number of arena evaluation games.",
+    )
+    parser.add_argument(
+        "--arena-sims", type=int, default=50,
+        help="MCTS simulations for arena games.",
+    )
+    parser.add_argument(
+        "--arena-threshold", type=float, default=0.55,
+        help="Win rate threshold to accept new model.",
+    )
+    parser.add_argument(
+        "--skip-arena", action="store_true",
+        help="Skip arena evaluation and always accept new model.",
+    )
+
+    # Playout cap randomization (KataGo-style)
+    parser.add_argument(
+        "--playout-cap-randomize", action="store_true",
+        help="Enable playout cap randomization: each move randomly uses full or fast sims.",
+    )
+    parser.add_argument(
+        "--playout-cap-prob", type=float, default=0.25,
+        help="Probability of using full simulations per move (rest use fast sims).",
+    )
+    parser.add_argument(
+        "--playout-cap-fast-sims", type=int, default=0,
+        help="Number of fast sims (0 = auto: simulations // 8).",
+    )
+
+    # Policy softening (KataGo-style)
+    parser.add_argument(
+        "--policy-softening", type=float, default=0.0,
+        help="Mix policy targets toward uniform over legal moves (0=off, 0.03 typical).",
+    )
+
+    # Value head uncertainty
+    parser.add_argument(
+        "--predict-uncertainty", action="store_true",
+        help="Add log-variance head to value head; use Gaussian NLL loss instead of MSE.",
+    )
+
+    # Network architecture
+    parser.add_argument(
+        "--model-size", choices=["small", "large"], default="small",
+        help="GNN model size preset (small: ~8M params, large: ~12M params).",
+    )
+    parser.add_argument(
+        "--encoder-type", choices=["gnn", "transformer"], default="gnn",
+        help="Encoder type for GPU MCTS (gnn or transformer).",
+    )
+
+    # Replay buffer
+    parser.add_argument(
+        "--buffer-size", type=int, default=50_000,
+        help="Maximum replay buffer size.",
+    )
+
+    # Device
+    parser.add_argument(
+        "--device", type=str, default=None,
+        help="Device: auto, cpu, cuda, mps.",
+    )
+    parser.add_argument(
+        "--no-amp", action="store_true",
+        help="Disable mixed precision even on CUDA.",
+    )
+
+    # Checkpointing
+    parser.add_argument(
+        "--checkpoint-dir", type=str, default="checkpoints_gpu",
+        help="Directory for checkpoints.",
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None,
+        help="Resume from checkpoint file.",
+    )
+
+    return parser.parse_args(argv)
+
+
+def _build_train_config(args: argparse.Namespace) -> GPUTrainConfig:
+    """Build a GPUTrainConfig from parsed CLI args."""
+    return GPUTrainConfig(
+        num_iterations=args.iterations,
+        games_per_batch=args.games,
+        batches_per_iteration=args.batches_per_iter,
+        num_epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.grad_clip,
+        lr_schedule=args.lr_schedule,
+        lr_warmup_iterations=args.lr_warmup,
+        lr_min=args.lr_min,
+        mcts_simulations=args.simulations,
+        temperature=args.temperature,
+        temperature_drop_move=args.temp_drop,
+        c_puct=args.c_puct,
+        dirichlet_alpha=args.dirichlet_alpha,
+        dirichlet_epsilon=args.dirichlet_epsilon,
+        max_game_length=args.max_game_length,
+        arena_games=args.arena_games,
+        arena_mcts_simulations=args.arena_sims,
+        arena_threshold=args.arena_threshold,
+        encoder_type=args.encoder_type,
+        wave_size=args.wave_size,
+        nn_max_batch=args.nn_max_batch,
+        buffer_max_size=args.buffer_size,
+        device=args.device,
+        use_amp=False if args.no_amp else None,
+        checkpoint_dir=args.checkpoint_dir,
+        skip_arena=args.skip_arena,
+        playout_cap_randomize=args.playout_cap_randomize,
+        playout_cap_randomize_prob=args.playout_cap_prob,
+        playout_cap_fast_sims=args.playout_cap_fast_sims,
+        policy_softening=args.policy_softening,
+    )
+
+
+def _get_net_config_and_class(args: argparse.Namespace):
+    """Return (net_config, net_class) preset based on --encoder-type and --model-size."""
+    predict_uncertainty = getattr(args, "predict_uncertainty", False)
+    if args.encoder_type == "transformer":
+        cfg = TransformerConfig.large() if args.model_size == "large" else TransformerConfig.small()
+        cfg.predict_uncertainty = predict_uncertainty
+        return cfg, HiveTransformer
+    else:
+        cfg = GNNNetConfig.large() if args.model_size == "large" else GNNNetConfig.small()
+        cfg.predict_uncertainty = predict_uncertainty
+        return cfg, HiveGNN
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+
+    if args.resume:
+        train_config = _build_train_config(args)
+        overrides = dataclasses.asdict(train_config)
+        net_config, net_class = _get_net_config_and_class(args)
+        trainer = GPUTrainer.from_checkpoint(
+            args.resume, net_class=net_class, config_overrides=GPUTrainConfig(**overrides)
+        )
+        print(f"Resuming from checkpoint: {args.resume}")
+    else:
+        train_config = _build_train_config(args)
+        net_config, net_class = _get_net_config_and_class(args)
+        trainer = GPUTrainer(config=train_config, net_config=net_config, net_class=net_class)
+
+    # Print config summary
+    device = trainer.device
+    cfg = trainer.config
+    net_cfg = trainer.net_config
+    net = trainer.best_net
+    num_params = sum(p.numel() for p in net.parameters())
+    print(f"\n{'='*60}")
+    print("Hive GPU Training Configuration")
+    print(f"{'='*60}")
+    print(f"  Device:       {device} ({device_summary(device)})")
+    print(f"  AMP:          {trainer.use_amp}")
+    print(f"  Model size:   {args.model_size} ({num_params:,} params)")
+    print(f"  Encoder:      {cfg.encoder_type}")
+    print(f"  Iterations:   {cfg.num_iterations}")
+    print(f"  Games/batch:  {cfg.games_per_batch}  (×{cfg.batches_per_iteration} batches/iter)")
+    fast_sims = cfg.playout_cap_fast_sims or max(1, cfg.mcts_simulations // 8)
+    pcr_str = (
+        f"  Playout cap:  prob={cfg.playout_cap_randomize_prob} fast={fast_sims}"
+        if cfg.playout_cap_randomize else "  Playout cap:  disabled"
+    )
+    print(f"  MCTS sims:    {cfg.mcts_simulations}  (wave_size={cfg.wave_size})")
+    print(pcr_str)
+    print(f"  LR:           {cfg.learning_rate}  ({cfg.lr_schedule})")
+    print(f"  Batch size:   {cfg.batch_size}")
+    print(f"  Buffer:       {cfg.buffer_max_size:,}")
+    arena_str = "skipped (auto-accept)" if cfg.skip_arena else f"{cfg.arena_games} games @ {cfg.arena_mcts_simulations} sims"
+    print(f"  Arena:        {arena_str}")
+    print(f"  Policy soft:  {cfg.policy_softening}")
+    print(f"  Uncertainty:  {net_cfg.predict_uncertainty}")
+    print(f"  Checkpoints:  {cfg.checkpoint_dir}")
+    print(f"{'='*60}\n")
+
+    trainer.run()
+
+
+if __name__ == "__main__":
+    main()

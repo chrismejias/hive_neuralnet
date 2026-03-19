@@ -76,7 +76,7 @@ class TestGNNNetConfig:
         cfg = GNNNetConfig()
         assert cfg.hidden_dim == 128
         assert cfg.num_mp_layers == 6
-        assert cfg.action_space_size == 29407
+        assert cfg.action_space_size == 29914
         assert cfg.board_size == 13
 
     def test_small_preset(self):
@@ -143,8 +143,9 @@ class TestValueHead:
         batch = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1], dtype=torch.int64)
         global_feat = torch.randn(2, GLOBAL_FEAT_DIM)
 
-        out = head(node_emb, batch, global_feat, batch_size=2)
+        out, log_var = head(node_emb, batch, global_feat, batch_size=2)
         assert out.shape == (2, 1)
+        assert log_var is None  # no uncertainty by default
 
     def test_output_range(self):
         h_dim = 64
@@ -153,7 +154,7 @@ class TestValueHead:
         batch = torch.zeros(5, dtype=torch.int64)
         global_feat = torch.randn(1, GLOBAL_FEAT_DIM)
 
-        out = head(node_emb, batch, global_feat, batch_size=1)
+        out, _ = head(node_emb, batch, global_feat, batch_size=1)
         assert -1.0 <= out.item() <= 1.0
 
     def test_single_node(self):
@@ -163,7 +164,7 @@ class TestValueHead:
         batch = torch.zeros(1, dtype=torch.int64)
         global_feat = torch.randn(1, GLOBAL_FEAT_DIM)
 
-        out = head(node_emb, batch, global_feat, batch_size=1)
+        out, _ = head(node_emb, batch, global_feat, batch_size=1)
         assert out.shape == (1, 1)
 
 
@@ -180,7 +181,7 @@ class TestHiveGNN:
         net = HiveGNN(cfg)
         batch = _make_batch()
 
-        policy, value = net(batch)
+        policy, value, _aux = net(batch)
         batch_size = batch.global_features.size(0)
 
         assert policy.shape == (batch_size, cfg.action_space_size)
@@ -192,7 +193,7 @@ class TestHiveGNN:
         g = _make_graph(4, 2, 6)
         batch = HiveGraphBatch.collate([g])
 
-        policy, value = net(batch)
+        policy, value, _aux = net(batch)
         assert policy.shape == (1, cfg.action_space_size)
         assert value.shape == (1, 1)
 
@@ -202,7 +203,7 @@ class TestHiveGNN:
         g = _make_graph(num_piece_nodes=2, num_hand_nodes=3, num_edges=0)
         batch = HiveGraphBatch.collate([g])
 
-        policy, value = net(batch)
+        policy, value, _aux = net(batch)
         assert policy.shape == (1, cfg.action_space_size)
         assert value.shape == (1, 1)
 
@@ -213,7 +214,7 @@ class TestHiveGNN:
         g = _make_graph(num_piece_nodes=0, num_hand_nodes=10, num_edges=0)
         batch = HiveGraphBatch.collate([g])
 
-        policy, value = net(batch)
+        policy, value, _aux = net(batch)
         assert policy.shape == (1, cfg.action_space_size)
         assert value.shape == (1, 1)
 
@@ -222,7 +223,7 @@ class TestHiveGNN:
         net = HiveGNN(cfg)
         batch = _make_batch()
 
-        _, value = net(batch)
+        _, value, _aux = net(batch)
         for v in value.flatten():
             assert -1.0 <= v.item() <= 1.0
 
@@ -231,8 +232,11 @@ class TestHiveGNN:
         net = HiveGNN(cfg)
         batch = _make_batch()
 
-        policy, value = net(batch)
+        policy, value, aux = net(batch)
+        # Include aux outputs in loss so all heads get gradients
         loss = policy.sum() + value.sum()
+        for v in aux.values():
+            loss = loss + v.sum()
         loss.backward()
 
         # All parameters should have gradients
@@ -294,7 +298,7 @@ class TestHiveGNN:
         graphs = [_make_graph(2, 1, 2), _make_graph(4, 3, 6), _make_graph(1, 1, 0)]
         batch = HiveGraphBatch.collate(graphs)
 
-        policy, value = net(batch)
+        policy, value, _aux = net(batch)
         assert policy.shape == (3, cfg.action_space_size)
         assert value.shape == (3, 1)
 
@@ -322,3 +326,84 @@ class TestHybridPolicyHead:
 
         out = head.forward_with_grid(grid, global_feat)
         assert out.shape == (1, cfg.action_space_size)
+
+
+# ---------------------------------------------------------------------------
+# TestMessagePassingLayerGlobalPool
+# ---------------------------------------------------------------------------
+
+
+class TestMessagePassingLayerGlobalPool:
+    def test_output_shape_with_global_pool(self):
+        h_dim = 64
+        layer = MessagePassingLayer(h_dim, EDGE_FEAT_DIM, global_pool_bias=True)
+        node_feat = torch.randn(5, h_dim)
+        edge_idx = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.int64)
+        edge_feat = torch.randn(3, EDGE_FEAT_DIM)
+        batch = torch.tensor([0, 0, 0, 1, 1], dtype=torch.int64)
+
+        out = layer(node_feat, edge_idx, edge_feat, batch=batch, batch_size=2)
+        assert out.shape == (5, h_dim)
+
+    def test_no_edges_with_global_pool(self):
+        h_dim = 32
+        layer = MessagePassingLayer(h_dim, EDGE_FEAT_DIM, global_pool_bias=True)
+        node_feat = torch.randn(3, h_dim)
+        edge_idx = torch.zeros((2, 0), dtype=torch.int64)
+        edge_feat = torch.zeros((0, EDGE_FEAT_DIM))
+        batch = torch.zeros(3, dtype=torch.int64)
+
+        out = layer(node_feat, edge_idx, edge_feat, batch=batch, batch_size=1)
+        assert out.shape == (3, h_dim)
+
+    def test_gradients_flow_with_global_pool(self):
+        h_dim = 32
+        layer = MessagePassingLayer(h_dim, EDGE_FEAT_DIM, global_pool_bias=True)
+        node_feat = torch.randn(4, h_dim, requires_grad=True)
+        edge_idx = torch.tensor([[0, 1], [1, 2]], dtype=torch.int64)
+        edge_feat = torch.randn(2, EDGE_FEAT_DIM)
+        batch = torch.tensor([0, 0, 1, 1], dtype=torch.int64)
+
+        out = layer(node_feat, edge_idx, edge_feat, batch=batch, batch_size=2)
+        loss = out.sum()
+        loss.backward()
+        assert node_feat.grad is not None
+
+    def test_global_pool_proj_has_params(self):
+        h_dim = 64
+        layer = MessagePassingLayer(h_dim, EDGE_FEAT_DIM, global_pool_bias=True)
+        param_names = [name for name, _ in layer.named_parameters()]
+        assert any("global_pool_proj" in n for n in param_names)
+
+    def test_without_global_pool_no_extra_params(self):
+        h_dim = 64
+        layer = MessagePassingLayer(h_dim, EDGE_FEAT_DIM, global_pool_bias=False)
+        param_names = [name for name, _ in layer.named_parameters()]
+        assert not any("global_pool_proj" in n for n in param_names)
+
+
+class TestHiveGNNGlobalPool:
+    def test_forward_with_global_pool_bias(self):
+        cfg = GNNNetConfig(hidden_dim=32, num_mp_layers=2, global_pool_bias=True)
+        net = HiveGNN(cfg)
+        batch = _make_batch()
+        policy, value, _aux = net(batch)
+        batch_size = batch.global_features.size(0)
+        assert policy.shape == (batch_size, cfg.action_space_size)
+        assert value.shape == (batch_size, 1)
+
+    def test_forward_without_global_pool_bias(self):
+        cfg = GNNNetConfig(hidden_dim=32, num_mp_layers=2, global_pool_bias=False)
+        net = HiveGNN(cfg)
+        batch = _make_batch()
+        policy, value, _aux = net(batch)
+        batch_size = batch.global_features.size(0)
+        assert policy.shape == (batch_size, cfg.action_space_size)
+        assert value.shape == (batch_size, 1)
+
+    def test_parameter_count_increases_with_global_pool(self):
+        cfg_without = GNNNetConfig(hidden_dim=32, num_mp_layers=2, global_pool_bias=False)
+        cfg_with = GNNNetConfig(hidden_dim=32, num_mp_layers=2, global_pool_bias=True)
+        net_without = HiveGNN(cfg_without)
+        net_with = HiveGNN(cfg_with)
+        assert net_with.count_parameters() > net_without.count_parameters()

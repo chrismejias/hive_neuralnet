@@ -4,7 +4,9 @@ Graph Neural Network for Hive.
 Architecture:
     HiveGraph → NodeEmbedding → [MessagePassingLayer × N] →
         ├── HybridPolicyHead → logits (29407,)
-        └── ValueHead → scalar in [-1, 1]
+        ├── ValueHead → scalar in [-1, 1]
+        ├── MobilityHead → per-piece binary logit (optional)
+        └── QueenSurroundHead → per-piece (2,) logits (optional)
 
 The message-passing layers use direction-aware edges: each message
 includes the source node, destination node, and edge features (dq, dr,
@@ -51,6 +53,20 @@ class GNNNetConfig:
     action_space_size: int = HiveEncoder.ACTION_SPACE_SIZE  # 29407
     board_size: int = HiveEncoder.BOARD_SIZE                # 13
 
+    # Global pooling bias in message passing
+    global_pool_bias: bool = True
+
+    # Auxiliary heads
+    aux_mobility_enabled: bool = True
+    aux_queen_surround_enabled: bool = True
+    aux_final_mobility_enabled: bool = True
+    aux_mobility_hidden: int = 64
+    aux_queen_surround_hidden: int = 64
+    aux_final_mobility_hidden: int = 64
+
+    # Value uncertainty (Gaussian NLL instead of MSE)
+    predict_uncertainty: bool = False
+
     @classmethod
     def small(cls) -> GNNNetConfig:
         """Small network preset (~1.5M parameters)."""
@@ -67,19 +83,28 @@ class GNNNetConfig:
 
 class MessagePassingLayer(nn.Module):
     """
-    Direction-aware message passing layer.
+    Direction-aware message passing layer with optional global pooling bias.
 
     For each edge (src → dst) with edge features e_ij:
         message_ij = MLP([h_dst || h_src || e_ij])
         aggregated_i = scatter_add(messages, dst_indices)
         h_i' = LayerNorm(h_i + MLP([h_i || aggregated_i]))
 
+    When global_pool_bias=True, after the residual + LayerNorm, a global
+    summary (mean + max pool projected through a linear layer) is added
+    to every node embedding, giving each node access to graph-level context.
+
     The edge features include directional information (dq, dr,
     direction_onehot) which allows the GNN to reason about spatial
     relationships.
     """
 
-    def __init__(self, hidden_dim: int, edge_feat_dim: int) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        edge_feat_dim: int,
+        global_pool_bias: bool = False,
+    ) -> None:
         super().__init__()
         # Message MLP: [h_dst, h_src, e_ij] → hidden_dim
         self.message_mlp = nn.Sequential(
@@ -95,11 +120,53 @@ class MessagePassingLayer(nn.Module):
         )
         self.layer_norm = nn.LayerNorm(hidden_dim)
 
+        self._global_pool_bias = global_pool_bias
+        if global_pool_bias:
+            self.global_pool_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+
+    def _apply_global_pool_bias(
+        self,
+        h: torch.Tensor,
+        batch: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Add global pooling bias to node embeddings."""
+        hidden_dim = h.size(1)
+        device = h.device
+
+        # Mean pool per graph
+        mean_pool = torch.zeros(batch_size, hidden_dim, device=device)
+        count = torch.zeros(batch_size, 1, device=device)
+        mean_pool.scatter_add_(0, batch.unsqueeze(1).expand_as(h), h)
+        count.scatter_add_(
+            0, batch.unsqueeze(1),
+            torch.ones(batch.size(0), 1, device=device),
+        )
+        mean_pool = mean_pool / count.clamp(min=1)
+
+        # Max pool per graph
+        max_pool = torch.full(
+            (batch_size, hidden_dim), float("-inf"), device=device
+        )
+        max_pool.scatter_reduce_(
+            0, batch.unsqueeze(1).expand_as(h), h,
+            reduce="amax", include_self=False,
+        )
+        max_pool = max_pool.masked_fill(max_pool == float("-inf"), 0.0)
+
+        # Project and broadcast back to nodes
+        global_summary = self.global_pool_proj(
+            torch.cat([mean_pool, max_pool], dim=1)
+        )  # (B, hidden_dim)
+        return h + global_summary[batch]  # (N, hidden_dim)
+
     def forward(
         self,
         node_features: torch.Tensor,   # (N, hidden_dim)
         edge_index: torch.Tensor,       # (2, E)
         edge_features: torch.Tensor,    # (E, edge_feat_dim)
+        batch: torch.Tensor | None = None,   # (N,) graph index per node
+        batch_size: int | None = None,
     ) -> torch.Tensor:
         """
         Forward pass of one message-passing step.
@@ -108,6 +175,8 @@ class MessagePassingLayer(nn.Module):
             node_features: Node embeddings (N, hidden_dim).
             edge_index: Edge list, shape (2, E). Row 0 = src, row 1 = dst.
             edge_features: Per-edge features (E, edge_feat_dim).
+            batch: Graph index for each node (required when global_pool_bias=True).
+            batch_size: Number of graphs in batch (required when global_pool_bias=True).
 
         Returns:
             Updated node embeddings (N, hidden_dim).
@@ -116,31 +185,35 @@ class MessagePassingLayer(nn.Module):
         num_edges = edge_index.size(1)
 
         if num_edges == 0:
-            # No edges — skip message passing, just pass through
-            return self.layer_norm(node_features)
+            h = self.layer_norm(node_features)
+        else:
+            src_idx = edge_index[0]  # (E,)
+            dst_idx = edge_index[1]  # (E,)
 
-        src_idx = edge_index[0]  # (E,)
-        dst_idx = edge_index[1]  # (E,)
+            h_src = node_features[src_idx]   # (E, hidden_dim)
+            h_dst = node_features[dst_idx]   # (E, hidden_dim)
 
-        h_src = node_features[src_idx]   # (E, hidden_dim)
-        h_dst = node_features[dst_idx]   # (E, hidden_dim)
+            # Compute messages: [h_dst || h_src || e_ij]
+            msg_input = torch.cat([h_dst, h_src, edge_features], dim=1)
+            messages = self.message_mlp(msg_input)  # (E, hidden_dim)
 
-        # Compute messages: [h_dst || h_src || e_ij]
-        msg_input = torch.cat([h_dst, h_src, edge_features], dim=1)
-        messages = self.message_mlp(msg_input)  # (E, hidden_dim)
+            # Aggregate messages at destination nodes via scatter_add
+            aggregated = torch.zeros(
+                num_nodes, messages.size(1),
+                dtype=messages.dtype, device=messages.device
+            )
+            aggregated.scatter_add_(0, dst_idx.unsqueeze(1).expand_as(messages), messages)
 
-        # Aggregate messages at destination nodes via scatter_add
-        aggregated = torch.zeros(
-            num_nodes, messages.size(1),
-            dtype=messages.dtype, device=messages.device
-        )
-        aggregated.scatter_add_(0, dst_idx.unsqueeze(1).expand_as(messages), messages)
+            # Update: h_i' = LayerNorm(h_i + MLP([h_i || aggregated_i]))
+            update_input = torch.cat([node_features, aggregated], dim=1)
+            updated = self.update_mlp(update_input)  # (N, hidden_dim)
+            h = self.layer_norm(node_features + updated)
 
-        # Update: h_i' = LayerNorm(h_i + MLP([h_i || aggregated_i]))
-        update_input = torch.cat([node_features, aggregated], dim=1)
-        updated = self.update_mlp(update_input)  # (N, hidden_dim)
+        # Global pooling bias: inject graph-level context into each node
+        if self._global_pool_bias and batch is not None and batch_size is not None:
+            h = self._apply_global_pool_bias(h, batch, batch_size)
 
-        return self.layer_norm(node_features + updated)
+        return h
 
 
 # ── Policy Head ────────────────────────────────────────────────────
@@ -208,32 +281,6 @@ class HybridPolicyHead(nn.Module):
 
         # 2. Scatter piece node embeddings into grid
         if num_piece_nodes > 0:
-            # Get embeddings for piece nodes only (first num_piece_nodes
-            # within each graph, but they're scattered — use piece_node indices)
-            # We need to extract piece node embeddings from the full node_embeddings
-            # piece_node_batch tells us which graph each piece node belongs to
-            # node_positions tells us (row, col) for each piece node
-
-            # Build piece node indices in the full node_embeddings tensor
-            # Piece nodes are the first num_piece_nodes in each graph within
-            # the batch vector. We need a mapping from piece_node index → global index.
-            # Actually, piece node embeddings correspond to the first
-            # graph.num_piece_nodes of each graph's nodes. Since the batch
-            # concatenates them, we need to track which global node indices
-            # are piece nodes.
-            # For simplicity: we trust that the caller provides positions
-            # aligned with piece nodes. We'll use piece_node_batch to extract
-            # the right embeddings.
-
-            # piece_node_embeddings: we need to find them in node_embeddings
-            # The batch vector has all piece nodes first per graph, but that's
-            # not guaranteed across graphs. We'll precompute them.
-            # Actually: in our collate, piece nodes from graph i are at the
-            # start of graph i's node block. So we can reconstruct indices.
-            # BUT: it's simpler and safer to pass piece node embeddings directly.
-            # For now, we'll rely on the caller slicing correctly.
-
-            # The HiveGNN.forward() will extract piece_embeddings and pass them here.
             pass
 
         # The actual scatter happens in HiveGNN.forward which passes
@@ -276,14 +323,22 @@ class ValueHead(nn.Module):
 
     Architecture:
         node_embeddings → mean_pool + max_pool → concat with global →
-        FC → ReLU → FC → tanh → scalar
+        FC → ReLU → FC → tanh → scalar (+ optional log-variance head)
     """
 
-    def __init__(self, hidden_dim: int, global_feat_dim: int) -> None:
+    def __init__(
+        self, hidden_dim: int, global_feat_dim: int, predict_uncertainty: bool = False
+    ) -> None:
         super().__init__()
         # Input: mean_pool(h) + max_pool(h) + global = 2*h + g
         self.fc1 = nn.Linear(hidden_dim * 2 + global_feat_dim, 256)
         self.fc2 = nn.Linear(256, 1)
+        self.predict_uncertainty = predict_uncertainty
+        if predict_uncertainty:
+            # Log-variance head: initialized to zero → starts as pure MSE
+            self.fc2_logvar = nn.Linear(256, 1)
+            nn.init.zeros_(self.fc2_logvar.weight)
+            nn.init.zeros_(self.fc2_logvar.bias)
 
     def forward(
         self,
@@ -291,7 +346,7 @@ class ValueHead(nn.Module):
         batch: torch.Tensor,             # (total_N,)
         global_features: torch.Tensor,   # (B, global_feat_dim)
         batch_size: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Compute value prediction.
 
@@ -302,7 +357,8 @@ class ValueHead(nn.Module):
             batch_size: Number of graphs in batch.
 
         Returns:
-            Value predictions (B, 1) in [-1, 1].
+            (value, log_var) where value is (B, 1) in [-1, 1] and
+            log_var is (B, 1) or None if predict_uncertainty is False.
         """
         hidden_dim = node_embeddings.size(1)
         device = node_embeddings.device
@@ -336,7 +392,59 @@ class ValueHead(nn.Module):
         combined = torch.cat([mean_pool, max_pool, global_features], dim=1)
 
         v = F.relu(self.fc1(combined))
-        return torch.tanh(self.fc2(v))  # (B, 1)
+        value = torch.tanh(self.fc2(v))  # (B, 1)
+        log_var = self.fc2_logvar(v).clamp(-10, 10) if self.predict_uncertainty else None
+        return value, log_var
+
+
+# ── Auxiliary Heads ────────────────────────────────────────────────
+
+
+class _PerNodeBinaryHead(nn.Module):
+    """
+    Base per-node binary prediction head.
+
+    Takes piece-node embeddings from the trunk and predicts logit(s)
+    per piece node via a two-layer MLP.
+    """
+
+    def __init__(
+        self, hidden_dim: int, out_dim: int = 1, aux_hidden: int = 64
+    ) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, aux_hidden),
+            nn.ReLU(),
+            nn.Linear(aux_hidden, out_dim),
+        )
+
+    def forward(self, piece_node_embeddings: torch.Tensor) -> torch.Tensor:
+        return self.mlp(piece_node_embeddings)
+
+
+class MobilityHead(_PerNodeBinaryHead):
+    """Per-node binary prediction: can this piece move right now?"""
+
+    def __init__(self, hidden_dim: int, aux_hidden: int = 64) -> None:
+        super().__init__(hidden_dim, out_dim=1, aux_hidden=aux_hidden)
+
+
+class QueenSurroundHead(_PerNodeBinaryHead):
+    """Per-node prediction: is this piece adjacent to each queen at game end?
+
+    Output dim 0 = white queen adjacency logit.
+    Output dim 1 = black queen adjacency logit.
+    """
+
+    def __init__(self, hidden_dim: int, aux_hidden: int = 64) -> None:
+        super().__init__(hidden_dim, out_dim=2, aux_hidden=aux_hidden)
+
+
+class FinalMobilityHead(_PerNodeBinaryHead):
+    """Per-node binary prediction: will this piece be mobile at game end?"""
+
+    def __init__(self, hidden_dim: int, aux_hidden: int = 64) -> None:
+        super().__init__(hidden_dim, out_dim=1, aux_hidden=aux_hidden)
 
 
 # ── HiveGNN ────────────────────────────────────────────────────────
@@ -345,14 +453,17 @@ class ValueHead(nn.Module):
 class HiveGNN(nn.Module):
     """
     Graph Neural Network for Hive, producing the same output interface
-    as HiveNet: policy logits (batch, 29407) and value (batch, 1).
+    as HiveNet: policy logits (batch, 29407) and value (batch, 1),
+    plus optional auxiliary head outputs.
 
     Forward input: HiveGraphBatch (batched graph with node/edge features).
 
     Architecture:
         Linear projection → [MessagePassingLayer × N] →
             ├── HybridPolicyHead (scatter to grid → conv → FC) → logits
-            └── ValueHead (pool → FC → tanh) → value
+            ├── ValueHead (pool → FC → tanh) → value
+            ├── MobilityHead (per-piece MLP → binary logit) [optional]
+            └── QueenSurroundHead (per-piece MLP → 2 logits) [optional]
     """
 
     def __init__(self, config: GNNNetConfig | None = None) -> None:
@@ -368,7 +479,10 @@ class HiveGNN(nn.Module):
 
         # Message passing layers
         self.mp_layers = nn.ModuleList([
-            MessagePassingLayer(h, config.edge_feat_dim)
+            MessagePassingLayer(
+                h, config.edge_feat_dim,
+                global_pool_bias=config.global_pool_bias,
+            )
             for _ in range(config.num_mp_layers)
         ])
 
@@ -376,14 +490,93 @@ class HiveGNN(nn.Module):
         self.policy_head = HybridPolicyHead(config)
 
         # Value head
-        self.value_head = ValueHead(h, config.global_feat_dim)
+        self.value_head = ValueHead(h, config.global_feat_dim, config.predict_uncertainty)
+
+        # Auxiliary heads
+        self.mobility_head: MobilityHead | None = None
+        if config.aux_mobility_enabled:
+            self.mobility_head = MobilityHead(h, config.aux_mobility_hidden)
+
+        self.queen_surround_head: QueenSurroundHead | None = None
+        if config.aux_queen_surround_enabled:
+            self.queen_surround_head = QueenSurroundHead(
+                h, config.aux_queen_surround_hidden
+            )
+
+        self.final_mobility_head: FinalMobilityHead | None = None
+        if config.aux_final_mobility_enabled:
+            self.final_mobility_head = FinalMobilityHead(
+                h, config.aux_final_mobility_hidden
+            )
 
         self._board_size = config.board_size
         self._hidden_dim = h
 
+    def _extract_piece_embeddings(
+        self,
+        node_embeddings: torch.Tensor,
+        graph_batch: HiveGraphBatch,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """
+        Extract piece-node embeddings from the full node embedding tensor.
+
+        Piece nodes are the first num_piece_nodes of each graph in the
+        concatenated batch. This method computes global node indices for
+        all piece nodes and gathers their embeddings.
+
+        Args:
+            node_embeddings: All node embeddings (total_N, hidden_dim).
+            graph_batch: The batched graph data.
+            batch_size: Number of graphs in batch.
+
+        Returns:
+            Piece node embeddings (total_piece_nodes, hidden_dim).
+        """
+        num_piece = graph_batch.num_piece_nodes
+        if num_piece == 0:
+            return torch.zeros(
+                0, self._hidden_dim,
+                device=node_embeddings.device, dtype=node_embeddings.dtype,
+            )
+
+        device = node_embeddings.device
+        total_nodes = node_embeddings.size(0)
+        batch_vec = graph_batch.batch  # (total_N,)
+
+        # Count nodes per graph
+        nodes_per_graph = torch.zeros(batch_size, dtype=torch.long, device=device)
+        nodes_per_graph.scatter_add_(
+            0, batch_vec, torch.ones(total_nodes, dtype=torch.long, device=device)
+        )
+
+        # Compute piece nodes per graph from piece_node_batch
+        piece_per_graph = torch.zeros(batch_size, dtype=torch.long, device=device)
+        piece_per_graph.scatter_add_(
+            0,
+            graph_batch.piece_node_batch,
+            torch.ones(num_piece, dtype=torch.long, device=device),
+        )
+
+        # Cumulative node offsets per graph
+        cum_nodes = torch.zeros(batch_size + 1, dtype=torch.long, device=device)
+        cum_nodes[1:] = nodes_per_graph.cumsum(0)
+
+        # Cumulative piece node offsets per graph
+        cum_piece = torch.zeros(batch_size + 1, dtype=torch.long, device=device)
+        cum_piece[1:] = piece_per_graph.cumsum(0)
+
+        # For each piece node j, compute its global node index:
+        # global_idx = cum_nodes[graph_idx] + (j - cum_piece[graph_idx])
+        graph_indices = graph_batch.piece_node_batch  # (num_piece,)
+        local_piece_idx = torch.arange(num_piece, device=device) - cum_piece[graph_indices]
+        global_node_idx = cum_nodes[graph_indices] + local_piece_idx
+
+        return node_embeddings[global_node_idx]  # (num_piece, hidden_dim)
+
     def forward(
         self, graph_batch: HiveGraphBatch
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """
         Forward pass on a batched graph.
 
@@ -391,9 +584,13 @@ class HiveGNN(nn.Module):
             graph_batch: A HiveGraphBatch with all tensors on the same device.
 
         Returns:
-            (policy_logits, value) where:
+            (policy_logits, value, aux_outputs) where:
                 policy_logits: shape (batch, 29407)
                 value: shape (batch, 1), in [-1, 1]
+                aux_outputs: dict with optional keys:
+                    "mobility_logits": (total_piece_nodes, 1)
+                    "queen_surround_logits": (total_piece_nodes, 2)
+                    "final_mobility_logits": (total_piece_nodes, 1)
         """
         batch_size = graph_batch.global_features.size(0)
         device = graph_batch.node_features.device
@@ -403,28 +600,54 @@ class HiveGNN(nn.Module):
 
         # 2. Message passing
         for mp_layer in self.mp_layers:
-            h = mp_layer(h, graph_batch.edge_index, graph_batch.edge_features)
+            h = mp_layer(
+                h, graph_batch.edge_index, graph_batch.edge_features,
+                batch=graph_batch.batch, batch_size=batch_size,
+            )
 
-        # 3. Build spatial grid for policy head
-        grid = self._scatter_to_grid(
-            h, graph_batch, batch_size, device
+        # 3. Extract piece node embeddings (shared by policy head + aux heads)
+        piece_embeddings = self._extract_piece_embeddings(
+            h, graph_batch, batch_size
         )
 
-        # 4. Policy logits
+        # 4. Build spatial grid for policy head
+        grid = self._scatter_to_grid(
+            piece_embeddings, graph_batch, batch_size, device
+        )
+
+        # 5. Policy logits
         policy_logits = self.policy_head.forward_with_grid(
             grid, graph_batch.global_features
         )
 
-        # 5. Value
-        value = self.value_head(
+        # 6. Value
+        value, value_logvar = self.value_head(
             h, graph_batch.batch, graph_batch.global_features, batch_size
         )
 
-        return policy_logits, value
+        # 7. Auxiliary heads
+        aux_outputs: dict[str, torch.Tensor] = {}
+        if value_logvar is not None:
+            aux_outputs["value_logvar"] = value_logvar
+
+        if self.mobility_head is not None and piece_embeddings.size(0) > 0:
+            aux_outputs["mobility_logits"] = self.mobility_head(piece_embeddings)
+
+        if self.queen_surround_head is not None and piece_embeddings.size(0) > 0:
+            aux_outputs["queen_surround_logits"] = self.queen_surround_head(
+                piece_embeddings
+            )
+
+        if self.final_mobility_head is not None and piece_embeddings.size(0) > 0:
+            aux_outputs["final_mobility_logits"] = self.final_mobility_head(
+                piece_embeddings
+            )
+
+        return policy_logits, value, aux_outputs
 
     def _scatter_to_grid(
         self,
-        node_embeddings: torch.Tensor,
+        piece_embeddings: torch.Tensor,
         graph_batch: HiveGraphBatch,
         batch_size: int,
         device: torch.device,
@@ -436,7 +659,7 @@ class HiveGNN(nn.Module):
         embedding into the corresponding cell of a (B, H, 13, 13) tensor.
 
         Args:
-            node_embeddings: All node embeddings (N, hidden_dim).
+            piece_embeddings: Piece node embeddings (total_piece_nodes, hidden_dim).
             graph_batch: The batched graph data.
             batch_size: Number of graphs.
             device: Target device.
@@ -453,82 +676,15 @@ class HiveGNN(nn.Module):
         if num_piece == 0:
             return grid
 
-        # Extract piece node embeddings
-        # Piece nodes are the first num_piece_nodes of each graph in order.
-        # We need to find them in the concatenated node_embeddings.
-        # Strategy: build a boolean mask over all nodes indicating piece nodes.
-        total_nodes = node_embeddings.size(0)
-        batch_vec = graph_batch.batch  # (total_N,)
-
-        # Count nodes per graph
-        nodes_per_graph = torch.zeros(batch_size, dtype=torch.long, device=device)
-        nodes_per_graph.scatter_add_(
-            0, batch_vec, torch.ones(total_nodes, dtype=torch.long, device=device)
-        )
-
-        # For each graph, piece nodes are the first graph_i.num_piece_nodes
-        # We'll build piece node indices by iterating (this is at collate level,
-        # but piece_node_batch already tells us which piece nodes belong to which graph)
-        # Actually, we already have piece_node_batch (total_piece_nodes,) and
-        # node_positions (total_piece_nodes, 2). We need the global node indices
-        # of piece nodes.
-
-        # Approach: the piece nodes in each graph are at the beginning of that
-        # graph's node block. We can compute cumulative offsets.
-        # piece_node_batch[j] = graph_idx means piece node j is in graph graph_idx
-        # We need to figure out which global node index corresponds to piece node j.
-
-        # Simpler approach: build a mask. For each graph i, the first
-        # piece_count_i nodes (within graph i's block) are piece nodes.
-        # But we don't store per-graph piece counts in the batch...
-
-        # Best approach: explicitly compute piece node global indices.
-        # We know: nodes_per_graph gives the count. For graph i, the node
-        # block starts at cum_nodes[i]. Within that block, the first
-        # piece_nodes_for_graph_i nodes are piece nodes.
-
-        # Compute piece nodes per graph from piece_node_batch
-        piece_per_graph = torch.zeros(batch_size, dtype=torch.long, device=device)
-        piece_per_graph.scatter_add_(
-            0,
-            graph_batch.piece_node_batch,
-            torch.ones(num_piece, dtype=torch.long, device=device),
-        )
-
-        # Compute cumulative node offsets per graph
-        cum_nodes = torch.zeros(batch_size + 1, dtype=torch.long, device=device)
-        cum_nodes[1:] = nodes_per_graph.cumsum(0)
-
-        # Build piece node global indices
-        # For graph i, piece nodes are at cum_nodes[i], cum_nodes[i]+1, ..., cum_nodes[i]+piece_per_graph[i]-1
-        piece_indices = []
-        cum_piece = torch.zeros(batch_size + 1, dtype=torch.long, device=device)
-        cum_piece[1:] = piece_per_graph.cumsum(0)
-
-        # Vectorized approach: for each piece node j, its graph is piece_node_batch[j]
-        # and its local index within that graph's piece nodes is j - cum_piece[graph_idx]
-        # Its global node index is cum_nodes[graph_idx] + local_index
-        graph_indices = graph_batch.piece_node_batch  # (num_piece,)
-        local_piece_idx = torch.arange(num_piece, device=device) - cum_piece[graph_indices]
-        global_node_idx = cum_nodes[graph_indices] + local_piece_idx
-
-        # Get piece node embeddings
-        piece_embeddings = node_embeddings[global_node_idx]  # (num_piece, h)
-
         # Scatter into grid using node_positions
         positions = graph_batch.node_positions.long()  # (num_piece, 2) → (row, col)
         rows = positions[:, 0].clamp(0, bs - 1)
         cols = positions[:, 1].clamp(0, bs - 1)
 
-        # Use index_put_ with accumulate for overlapping positions
         batch_idx = graph_batch.piece_node_batch  # (num_piece,)
 
         # Grid shape: (B, H, bs, bs)
         # We want: grid[batch_idx[j], :, rows[j], cols[j]] += piece_embeddings[j, :]
-        # Use advanced indexing with accumulate
-        idx = (batch_idx, slice(None), rows, cols)
-        # Can't use slice with index_put_ directly; expand batch_idx/rows/cols
-        # to match (num_piece, H) shape
         b_exp = batch_idx.unsqueeze(1).expand(-1, h)  # (num_piece, h)
         r_exp = rows.unsqueeze(1).expand(-1, h)
         c_exp = cols.unsqueeze(1).expand(-1, h)
@@ -572,7 +728,7 @@ class HiveGNN(nn.Module):
         batch = HiveGraphBatch.collate([graph]).to(device)
         mask = torch.from_numpy(legal_mask).to(device)
 
-        policy_logits, value_tensor = self.forward(batch)
+        policy_logits, value_tensor, _aux = self.forward(batch)
 
         # Apply legal mask
         policy_logits = policy_logits.squeeze(0)  # (29407,)

@@ -197,6 +197,9 @@ class TrainStats:
     avg_loss: float = 0.0
     avg_policy_loss: float = 0.0
     avg_value_loss: float = 0.0
+    avg_mobility_loss: float = 0.0
+    avg_queen_surround_loss: float = 0.0
+    avg_final_mobility_loss: float = 0.0
     num_batches: int = 0
     learning_rate: float = 0.0
 

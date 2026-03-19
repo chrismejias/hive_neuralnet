@@ -256,3 +256,260 @@ def compute_loss(
     total_loss = policy_loss + value_loss
 
     return total_loss, policy_loss, value_loss
+
+
+# ── GNN Loss with Auxiliary Heads ──────────────────────────────────
+
+
+def compute_gnn_loss(
+    policy_logits: torch.Tensor,
+    value_pred: torch.Tensor,
+    target_policy: torch.Tensor,
+    target_value: torch.Tensor,
+    aux_outputs: dict[str, torch.Tensor],
+    mobility_targets: torch.Tensor,
+    queen_surround_targets: torch.Tensor,
+    queen_surround_mask: torch.Tensor,
+    final_mobility_targets: torch.Tensor,
+    value_mask: torch.Tensor,
+    piece_node_batch: torch.Tensor,
+    policy_weight: float = 1.0,
+    value_weight: float = 1.0,
+    mobility_weight: float = 0.15,
+    queen_surround_weight: float = 0.15,
+    final_mobility_weight: float = 0.15,
+    policy_softening: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Compute the combined loss with auxiliary heads and playout cap masking.
+
+    Args:
+        policy_logits: Raw logits, shape (B, 29407).
+        value_pred: Predicted values, shape (B, 1).
+        target_policy: Target policy distribution, shape (B, 29407).
+        target_value: Target values, shape (B, 1). In [-1, 1].
+        aux_outputs: Dict from HiveGNN.forward() with optional keys
+            ``mobility_logits``, ``queen_surround_logits``, and
+            ``final_mobility_logits``.
+        mobility_targets: Per-piece binary targets, shape (total_piece_nodes,).
+        queen_surround_targets: Per-piece queen adjacency targets,
+            shape (total_piece_nodes, 2).
+        queen_surround_mask: Per-graph mask indicating which queens are
+            on the board, shape (B, 2). 1.0 if placed, 0.0 otherwise.
+        final_mobility_targets: Per-piece binary targets for end-of-game
+            mobility, shape (total_piece_nodes,).
+        value_mask: Per-graph mask for playout cap, shape (B,). 1.0 for
+            full-playout games that contribute to value loss.
+        piece_node_batch: Graph index for each piece node,
+            shape (total_piece_nodes,).
+        policy_weight: Weight for policy loss.
+        value_weight: Weight for value loss.
+        mobility_weight: Weight for mobility auxiliary loss.
+        queen_surround_weight: Weight for queen surround auxiliary loss.
+        final_mobility_weight: Weight for final mobility auxiliary loss.
+
+    Returns:
+        (total_loss, loss_dict) where loss_dict maps loss names to scalars.
+    """
+    # Policy softening: mix MCTS target with uniform over legal moves
+    if policy_softening > 0.0:
+        legal = (target_policy > 0).float()
+        num_legal = legal.sum(dim=1, keepdim=True).clamp(min=1)
+        uniform = legal / num_legal
+        target_policy = (1.0 - policy_softening) * target_policy + policy_softening * uniform
+
+    # Policy loss: cross-entropy with soft targets
+    log_probs = F.log_softmax(policy_logits, dim=1)
+    policy_loss = -torch.mean(torch.sum(target_policy * log_probs, dim=1))
+
+    # Value loss: Gaussian NLL if uncertainty head present, else MSE; both masked by playout cap
+    if "value_logvar" in aux_outputs:
+        log_var = aux_outputs["value_logvar"].squeeze(-1)  # (B,)
+        var = torch.exp(log_var)
+        diff_sq = (value_pred.squeeze(-1) - target_value.squeeze(-1)) ** 2
+        per_sample = 0.5 * diff_sq / var + 0.5 * log_var
+        if value_mask.sum() > 0:
+            value_loss = (per_sample * value_mask).sum() / value_mask.sum()
+        else:
+            value_loss = torch.tensor(0.0, device=policy_logits.device)
+    else:
+        value_diff = (value_pred.squeeze(-1) - target_value.squeeze(-1)) ** 2
+        if value_mask.sum() > 0:
+            value_loss = (value_diff * value_mask).sum() / value_mask.sum()
+        else:
+            value_loss = torch.tensor(0.0, device=policy_logits.device)
+
+    loss_dict: dict[str, torch.Tensor] = {
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+    }
+
+    total = policy_weight * policy_loss + value_weight * value_loss
+
+    # Mobility auxiliary loss (current-state mobility)
+    if "mobility_logits" in aux_outputs and mobility_targets.numel() > 0:
+        mob_logits = aux_outputs["mobility_logits"].squeeze(-1)  # (total_piece_nodes,)
+        mob_loss = F.binary_cross_entropy_with_logits(mob_logits, mobility_targets)
+        loss_dict["mobility_loss"] = mob_loss
+        total = total + mobility_weight * mob_loss
+
+    # Queen surround auxiliary loss
+    if "queen_surround_logits" in aux_outputs and queen_surround_targets.numel() > 0:
+        qs_logits = aux_outputs["queen_surround_logits"]  # (total_piece_nodes, 2)
+
+        # Expand queen_surround_mask from (B, 2) to (total_piece_nodes, 2)
+        per_node_mask = queen_surround_mask[piece_node_batch]  # (total_piece_nodes, 2)
+
+        # Binary cross-entropy with masking
+        qs_bce = F.binary_cross_entropy_with_logits(
+            qs_logits, queen_surround_targets, reduction="none"
+        )  # (total_piece_nodes, 2)
+        qs_bce = qs_bce * per_node_mask
+
+        if per_node_mask.sum() > 0:
+            qs_loss = qs_bce.sum() / per_node_mask.sum()
+        else:
+            qs_loss = torch.tensor(0.0, device=policy_logits.device)
+
+        loss_dict["queen_surround_loss"] = qs_loss
+        total = total + queen_surround_weight * qs_loss
+
+    # Final mobility auxiliary loss (end-of-game mobility)
+    if "final_mobility_logits" in aux_outputs and final_mobility_targets.numel() > 0:
+        fm_logits = aux_outputs["final_mobility_logits"].squeeze(-1)
+        fm_loss = F.binary_cross_entropy_with_logits(fm_logits, final_mobility_targets)
+        loss_dict["final_mobility_loss"] = fm_loss
+        total = total + final_mobility_weight * fm_loss
+
+    loss_dict["total_loss"] = total
+    return total, loss_dict
+
+
+# ── Transformer Loss with Auxiliary Heads ─────────────────────────
+
+
+def compute_transformer_loss(
+    policy_logits: torch.Tensor,
+    value_pred: torch.Tensor,
+    target_policy: torch.Tensor,
+    target_value: torch.Tensor,
+    aux_outputs: dict[str, torch.Tensor],
+    mobility_targets: torch.Tensor,
+    queen_surround_targets: torch.Tensor,
+    queen_surround_mask: torch.Tensor,
+    final_mobility_targets: torch.Tensor,
+    value_mask: torch.Tensor,
+    board_token_batch: torch.Tensor,
+    policy_weight: float = 1.0,
+    value_weight: float = 1.0,
+    mobility_weight: float = 0.15,
+    queen_surround_weight: float = 0.15,
+    final_mobility_weight: float = 0.15,
+    policy_softening: float = 0.0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Compute the combined loss with auxiliary heads and playout cap masking.
+
+    Same structure as compute_gnn_loss() but uses board_token_batch
+    instead of piece_node_batch for per-token target indexing.
+
+    Args:
+        policy_logits: Raw logits, shape (B, 29407).
+        value_pred: Predicted values, shape (B, 1).
+        target_policy: Target policy distribution, shape (B, 29407).
+        target_value: Target values, shape (B, 1). In [-1, 1].
+        aux_outputs: Dict from HiveTransformer.forward() with optional keys
+            ``mobility_logits``, ``queen_surround_logits``, and
+            ``final_mobility_logits``.
+        mobility_targets: Per-board-token binary targets, shape (total_board_tokens,).
+        queen_surround_targets: Per-board-token queen adjacency targets,
+            shape (total_board_tokens, 2).
+        queen_surround_mask: Per-sequence mask indicating which queens are
+            on the board, shape (B, 2). 1.0 if placed, 0.0 otherwise.
+        final_mobility_targets: Per-board-token binary targets for end-of-game
+            mobility, shape (total_board_tokens,).
+        value_mask: Per-sequence mask for playout cap, shape (B,). 1.0 for
+            full-playout games that contribute to value loss.
+        board_token_batch: Sequence index for each board token,
+            shape (total_board_tokens,).
+        policy_weight: Weight for policy loss.
+        value_weight: Weight for value loss.
+        mobility_weight: Weight for mobility auxiliary loss.
+        queen_surround_weight: Weight for queen surround auxiliary loss.
+        final_mobility_weight: Weight for final mobility auxiliary loss.
+
+    Returns:
+        (total_loss, loss_dict) where loss_dict maps loss names to scalars.
+    """
+    # Policy softening: mix MCTS target with uniform over legal moves
+    if policy_softening > 0.0:
+        legal = (target_policy > 0).float()
+        num_legal = legal.sum(dim=1, keepdim=True).clamp(min=1)
+        uniform = legal / num_legal
+        target_policy = (1.0 - policy_softening) * target_policy + policy_softening * uniform
+
+    # Policy loss: cross-entropy with soft targets
+    log_probs = F.log_softmax(policy_logits, dim=1)
+    policy_loss = -torch.mean(torch.sum(target_policy * log_probs, dim=1))
+
+    # Value loss: Gaussian NLL if uncertainty head present, else MSE; both masked by playout cap
+    if "value_logvar" in aux_outputs:
+        log_var = aux_outputs["value_logvar"].squeeze(-1)  # (B,)
+        var = torch.exp(log_var)
+        diff_sq = (value_pred.squeeze(-1) - target_value.squeeze(-1)) ** 2
+        per_sample = 0.5 * diff_sq / var + 0.5 * log_var
+        if value_mask.sum() > 0:
+            value_loss = (per_sample * value_mask).sum() / value_mask.sum()
+        else:
+            value_loss = torch.tensor(0.0, device=policy_logits.device)
+    else:
+        value_diff = (value_pred.squeeze(-1) - target_value.squeeze(-1)) ** 2
+        if value_mask.sum() > 0:
+            value_loss = (value_diff * value_mask).sum() / value_mask.sum()
+        else:
+            value_loss = torch.tensor(0.0, device=policy_logits.device)
+
+    loss_dict: dict[str, torch.Tensor] = {
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+    }
+
+    total = policy_weight * policy_loss + value_weight * value_loss
+
+    # Mobility auxiliary loss (current-state mobility)
+    if "mobility_logits" in aux_outputs and mobility_targets.numel() > 0:
+        mob_logits = aux_outputs["mobility_logits"].squeeze(-1)
+        mob_loss = F.binary_cross_entropy_with_logits(mob_logits, mobility_targets)
+        loss_dict["mobility_loss"] = mob_loss
+        total = total + mobility_weight * mob_loss
+
+    # Queen surround auxiliary loss
+    if "queen_surround_logits" in aux_outputs and queen_surround_targets.numel() > 0:
+        qs_logits = aux_outputs["queen_surround_logits"]  # (total_board_tokens, 2)
+
+        # Expand queen_surround_mask from (B, 2) to (total_board_tokens, 2)
+        per_token_mask = queen_surround_mask[board_token_batch]  # (total_board_tokens, 2)
+
+        # Binary cross-entropy with masking
+        qs_bce = F.binary_cross_entropy_with_logits(
+            qs_logits, queen_surround_targets, reduction="none"
+        )  # (total_board_tokens, 2)
+        qs_bce = qs_bce * per_token_mask
+
+        if per_token_mask.sum() > 0:
+            qs_loss = qs_bce.sum() / per_token_mask.sum()
+        else:
+            qs_loss = torch.tensor(0.0, device=policy_logits.device)
+
+        loss_dict["queen_surround_loss"] = qs_loss
+        total = total + queen_surround_weight * qs_loss
+
+    # Final mobility auxiliary loss (end-of-game mobility)
+    if "final_mobility_logits" in aux_outputs and final_mobility_targets.numel() > 0:
+        fm_logits = aux_outputs["final_mobility_logits"].squeeze(-1)
+        fm_loss = F.binary_cross_entropy_with_logits(fm_logits, final_mobility_targets)
+        loss_dict["final_mobility_loss"] = fm_loss
+        total = total + final_mobility_weight * fm_loss
+
+    loss_dict["total_loss"] = total
+    return total, loss_dict

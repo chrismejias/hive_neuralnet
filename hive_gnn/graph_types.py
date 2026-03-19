@@ -11,7 +11,7 @@ import torch
 # Constants
 # ---------------------------------------------------------------------------
 
-NODE_FEAT_DIM = 21
+NODE_FEAT_DIM = 25
 EDGE_FEAT_DIM = 9
 GLOBAL_FEAT_DIM = 6
 

@@ -48,15 +48,15 @@ class TestEncoderConstants:
         assert HiveEncoder.HALF_BOARD == 6
 
     def test_channel_count(self):
-        assert HiveEncoder.NUM_PIECE_CHANNELS == 20
+        assert HiveEncoder.NUM_PIECE_CHANNELS == 32
         assert HiveEncoder.NUM_META_CHANNELS == 6
-        assert HiveEncoder.NUM_CHANNELS == 26
+        assert HiveEncoder.NUM_CHANNELS == 38
 
     def test_action_space_size(self):
-        assert HiveEncoder.NUM_PLACEMENT_ACTIONS == 5 * 169  # 845
+        assert HiveEncoder.NUM_PLACEMENT_ACTIONS == 8 * 169  # 1352
         assert HiveEncoder.NUM_MOVEMENT_ACTIONS == 169 * 169  # 28561
-        assert HiveEncoder.ACTION_SPACE_SIZE == 845 + 28561 + 1  # 29407
-        assert HiveEncoder.PASS_ACTION_INDEX == 29406
+        assert HiveEncoder.ACTION_SPACE_SIZE == 1352 + 28561 + 1  # 29914
+        assert HiveEncoder.PASS_ACTION_INDEX == 29913
 
 
 # ── State Encoding Basics ───────────────────────────────────────
@@ -67,7 +67,7 @@ class TestEncodeStateBasics:
         enc = HiveEncoder()
         gs = GameState()
         tensor = enc.encode_state(gs)
-        assert tensor.shape == (26, 13, 13)
+        assert tensor.shape == (38, 13, 13)
 
     def test_dtype_float32(self):
         enc = HiveEncoder()
@@ -89,15 +89,15 @@ class TestEncodeStateBasics:
         gs = GameState()
         tensor = enc.encode_state(gs)
         # Current player = WHITE = 1.0
-        assert np.all(tensor[20] == 1.0)
+        assert np.all(tensor[32] == 1.0)
         # Turn 0 -> normalized = 0.0
-        assert np.all(tensor[21] == 0.0)
+        assert np.all(tensor[33] == 0.0)
         # No queens placed
-        assert np.all(tensor[22] == 0.0)
-        assert np.all(tensor[23] == 0.0)
-        # Full hands (11/11 = 1.0)
-        assert np.allclose(tensor[24], 1.0)
-        assert np.allclose(tensor[25], 1.0)
+        assert np.all(tensor[34] == 0.0)
+        assert np.all(tensor[35] == 0.0)
+        # Full hands (11/14.0)
+        assert np.allclose(tensor[36], 11.0 / 14.0)
+        assert np.allclose(tensor[37], 11.0 / 14.0)
 
     def test_single_piece_at_origin(self):
         """Place white queen at origin. Should appear at center of grid."""
@@ -111,7 +111,7 @@ class TestEncodeStateBasics:
         # White Queen (ground) = channel 0, at center (6, 6)
         assert tensor[0, 6, 6] == 1.0
         # Only one piece on board — all other piece plane cells should be 0
-        piece_sum = tensor[:20].sum()
+        piece_sum = tensor[:32].sum()
         assert piece_sum == 1.0
 
     def test_two_pieces_adjacent(self):
@@ -128,13 +128,13 @@ class TestEncodeStateBasics:
         wq_row = 0 - center_r + 6
         assert tensor[0, wq_row, wq_col] == 1.0
 
-        # Black queen (channel 5)
+        # Black queen (channel 8 = 1*8+0)
         bq_col = 1 - center_q + 6
         bq_row = 0 - center_r + 6
-        assert tensor[5, bq_row, bq_col] == 1.0
+        assert tensor[8, bq_row, bq_col] == 1.0
 
         # Exactly 2 piece indicators total
-        assert tensor[:20].sum() == 2.0
+        assert tensor[:32].sum() == 2.0
 
 
 # ── Centering ────────────────────────────────────────────────────
@@ -248,7 +248,7 @@ class TestPiecePlanes:
 
         # Check each piece appears in the correct channel
         for p, pos in pieces_and_positions:
-            expected_ch = p.color.value * 5 + p.piece_type.value
+            expected_ch = p.color.value * 8 + p.piece_type.value
             grid = HiveEncoder._hex_to_grid(pos.q, pos.r, center_q, center_r)
             assert grid is not None
             row, col = grid
@@ -271,10 +271,10 @@ class TestPiecePlanes:
 
         # Ground: white queen → channel 0
         assert tensor[0, 6, 6] == 1.0
-        # Stacked: black beetle → channel 10 + 1*5 + 4 = 19
-        assert tensor[19, 6, 6] == 1.0
+        # Stacked: black beetle → channel 16 + 1*8 + 4 = 28
+        assert tensor[28, 6, 6] == 1.0
         # No other piece data at (6,6)
-        total_at_center = sum(tensor[ch, 6, 6] for ch in range(20))
+        total_at_center = sum(tensor[ch, 6, 6] for ch in range(32))
         assert total_at_center == 2.0
 
     def test_stack_height_3(self):
@@ -294,12 +294,12 @@ class TestPiecePlanes:
 
         # Ground: white queen → channel 0
         assert tensor[0, 6, 6] == 1.0
-        # Stacked: white beetle (top) → channel 10 + 0*5 + 4 = 14
-        assert tensor[14, 6, 6] == 1.0
-        # Middle piece (black beetle, ch 19) should NOT appear in stacked
-        assert tensor[19, 6, 6] == 0.0
+        # Stacked: white beetle (top) → channel 16 + 0*8 + 4 = 20
+        assert tensor[20, 6, 6] == 1.0
+        # Middle piece (black beetle, ch 28) should NOT appear in stacked
+        assert tensor[28, 6, 6] == 0.0
         # Total piece data at center = 2 (ground + top)
-        total_at_center = sum(tensor[ch, 6, 6] for ch in range(20))
+        total_at_center = sum(tensor[ch, 6, 6] for ch in range(32))
         assert total_at_center == 2.0
 
 
@@ -311,7 +311,7 @@ class TestMetaPlanes:
         enc = HiveEncoder()
         gs = GameState()  # Turn 0, WHITE's turn
         tensor = enc.encode_state(gs)
-        assert np.all(tensor[20] == 1.0)
+        assert np.all(tensor[32] == 1.0)
 
     def test_current_player_black(self):
         enc = HiveEncoder()
@@ -320,7 +320,7 @@ class TestMetaPlanes:
         moves = gs.legal_moves()
         gs.apply_move(moves[0])
         tensor = enc.encode_state(gs)
-        assert np.all(tensor[20] == 0.0)
+        assert np.all(tensor[32] == 0.0)
 
     def test_turn_normalization(self):
         enc = HiveEncoder()
@@ -328,20 +328,20 @@ class TestMetaPlanes:
 
         # Turn 0
         tensor = enc.encode_state(gs)
-        assert np.all(tensor[21] == 0.0)
+        assert np.all(tensor[33] == 0.0)
 
         # Play 10 turns
         gs = _play_n_turns(gs, 10)
         tensor = enc.encode_state(gs)
         expected = min(gs.turn / 100.0, 1.0)
-        assert np.allclose(tensor[21], expected)
+        assert np.allclose(tensor[33], expected)
 
     def test_turn_normalization_clamps_at_1(self):
         enc = HiveEncoder()
         gs = GameState()
         gs.turn = 200  # Force high turn
         tensor = enc.encode_state(gs)
-        assert np.all(tensor[21] == 1.0)
+        assert np.all(tensor[33] == 1.0)
 
     def test_queen_placed_channels(self):
         enc = HiveEncoder()
@@ -349,38 +349,38 @@ class TestMetaPlanes:
         # No queens placed
         gs = GameState()
         tensor = enc.encode_state(gs)
-        assert np.all(tensor[22] == 0.0)  # White queen not placed
-        assert np.all(tensor[23] == 0.0)  # Black queen not placed
+        assert np.all(tensor[34] == 0.0)  # White queen not placed
+        assert np.all(tensor[35] == 0.0)  # Black queen not placed
 
         # Place white queen
         wq = gs.pieces_in_hand(Color.WHITE, PieceType.QUEEN)[0]
         gs.apply_move(Move(MoveType.PLACE, wq, ORIGIN))
         tensor = enc.encode_state(gs)
-        assert np.all(tensor[22] == 1.0)  # White queen placed
-        assert np.all(tensor[23] == 0.0)  # Black queen not placed
+        assert np.all(tensor[34] == 1.0)  # White queen placed
+        assert np.all(tensor[35] == 0.0)  # Black queen not placed
 
         # Place black queen
         bq = gs.pieces_in_hand(Color.BLACK, PieceType.QUEEN)[0]
         gs.apply_move(Move(MoveType.PLACE, bq, HexCoord(1, 0)))
         tensor = enc.encode_state(gs)
-        assert np.all(tensor[22] == 1.0)
-        assert np.all(tensor[23] == 1.0)
+        assert np.all(tensor[34] == 1.0)
+        assert np.all(tensor[35] == 1.0)
 
     def test_hand_count_channels(self):
         enc = HiveEncoder()
         gs = GameState()
         tensor = enc.encode_state(gs)
 
-        # Full hands: 11/11 = 1.0
-        assert np.allclose(tensor[24], 1.0)
-        assert np.allclose(tensor[25], 1.0)
+        # Full hands: 11/14.0 (base game, normalized by max possible)
+        assert np.allclose(tensor[36], 11.0 / 14.0)
+        assert np.allclose(tensor[37], 11.0 / 14.0)
 
-        # After white places, white hand = 10/11
+        # After white places, white hand = 10/14.0
         moves = gs.legal_moves()
         gs.apply_move(moves[0])
         tensor = enc.encode_state(gs)
-        assert np.allclose(tensor[24], 10.0 / 11.0)
-        assert np.allclose(tensor[25], 1.0)
+        assert np.allclose(tensor[36], 10.0 / 14.0)
+        assert np.allclose(tensor[37], 11.0 / 14.0)
 
 
 # ── Hex ↔ Grid Conversion ───────────────────────────────────────
@@ -433,7 +433,7 @@ class TestEncodeAction:
         assert idx == HiveEncoder.PASS_ACTION_INDEX
 
     def test_placement_action_range(self):
-        """All placement actions should be in [0, 845)."""
+        """All placement actions should be in [0, 1352)."""
         enc = HiveEncoder()
         gs = GameState()
         moves = gs.legal_moves()
@@ -443,7 +443,7 @@ class TestEncodeAction:
                 assert 0 <= idx < HiveEncoder.NUM_PLACEMENT_ACTIONS
 
     def test_movement_action_range(self):
-        """All movement actions should be in [845, 29406)."""
+        """All movement actions should be in [1352, 29913)."""
         enc = HiveEncoder()
         gs = _setup_two_queens()
         gs = _play_n_turns(gs, 8)
@@ -557,11 +557,11 @@ class TestLegalActionMask:
         assert mask.dtype == np.float32
 
     def test_mask_first_turn(self):
-        """First turn: 5 piece types at 1 position (ORIGIN) = 5 legal moves."""
+        """First turn: 4 piece types at 1 position (no queen on first turn per tournament rules)."""
         enc = HiveEncoder()
         gs = GameState()
         mask = enc.get_legal_action_mask(gs)
-        assert mask.sum() == 5
+        assert mask.sum() == 4
 
     def test_mask_count_matches_legal_moves(self):
         """The number of 1s in the mask should equal len(legal_moves())."""
@@ -677,7 +677,7 @@ class TestFullGameEncoding:
 
             # Encode state
             tensor = enc.encode_state(gs)
-            assert tensor.shape == (26, 13, 13)
+            assert tensor.shape == (38, 13, 13)
             assert not np.any(np.isnan(tensor))
             assert not np.any(np.isinf(tensor))
 
@@ -747,7 +747,7 @@ class TestEdgeCases:
 
         # Should not crash
         tensor = enc.encode_state(gs)
-        assert tensor.shape == (26, 13, 13)
+        assert tensor.shape == (38, 13, 13)
         # At least one piece should be visible (within grid)
         # The centroid is at (10, 0), so one piece is at (-10, 0) from center
         # which is col = -10 + 6 = -4, out of bounds → clipped

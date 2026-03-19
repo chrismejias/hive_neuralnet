@@ -75,7 +75,7 @@ class TestEmptyBoard:
         g = encoder.encode(empty_state)
         # All nodes should be hand nodes
         for i in range(g.node_features.shape[0]):
-            assert g.node_features[i, 19] == 1.0  # is_hand_node
+            assert g.node_features[i, 22] == 1.0  # is_hand_node
 
 
 # ---------------------------------------------------------------------------
@@ -100,21 +100,21 @@ class TestSinglePiece:
         assert feat[PieceType.QUEEN.value] == 1.0
         assert feat[PieceType.ANT.value] == 0.0
         # Color: WHITE
-        assert feat[5] == 1.0  # WHITE
-        assert feat[6] == 0.0  # BLACK
+        assert feat[8] == 1.0  # WHITE
+        assert feat[9] == 0.0  # BLACK
         # is_on_ground
-        assert feat[7] == 1.0
-        # is_on_top
-        assert feat[8] == 1.0
-        # stack_height / 4
-        assert feat[9] == pytest.approx(0.25)
-        # is_queen
         assert feat[10] == 1.0
+        # is_on_top
+        assert feat[11] == 1.0
+        # stack_height / 4
+        assert feat[12] == pytest.approx(0.25)
+        # is_queen
+        assert feat[13] == 1.0
         # No occupied neighbors for a single piece
-        assert feat[12] == 0.0
+        assert feat[15] == 0.0
         # All 6 directions empty
         for d in range(6):
-            assert feat[13 + d] == 1.0
+            assert feat[16 + d] == 1.0
 
     def test_no_edges_for_single_piece(self, encoder, empty_state):
         s = _place(empty_state, PieceType.QUEEN, ORIGIN)
@@ -186,14 +186,14 @@ class TestTwoPieces:
         g = encoder.encode(s)
         # Each piece has 1 occupied neighbor
         for i in range(2):
-            assert g.node_features[i, 12] == pytest.approx(1.0 / 6.0)
+            assert g.node_features[i, 15] == pytest.approx(1.0 / 6.0)
 
     def test_empty_dir_mask(self, encoder):
         s = self._two_piece_state()
         g = encoder.encode(s)
         # Each piece has 5 empty directions (1 occupied neighbor)
         for i in range(2):
-            empty_dirs = g.node_features[i, 13:19].sum()
+            empty_dirs = g.node_features[i, 16:22].sum()
             assert empty_dirs == pytest.approx(5.0)
 
 
@@ -214,15 +214,15 @@ class TestGlobalFeatures:
 
     def test_hand_fraction(self, encoder, empty_state):
         g = encoder.encode(empty_state)
-        # Full hand: 11 pieces / 11.0 = 1.0
-        assert g.global_features[4] == pytest.approx(1.0)
-        assert g.global_features[5] == pytest.approx(1.0)
+        # Full hand: 11 pieces / 14.0
+        assert g.global_features[4] == pytest.approx(11.0 / 14.0)
+        assert g.global_features[5] == pytest.approx(11.0 / 14.0)
 
     def test_hand_decreases_after_placement(self, encoder):
         s = GameState()
         s = _place(s, PieceType.QUEEN, ORIGIN)
         g = encoder.encode(s)
-        assert g.global_features[4] == pytest.approx(10.0 / 11.0)  # White played 1
+        assert g.global_features[4] == pytest.approx(10.0 / 14.0)  # White played 1
 
     def test_turn_progress(self, encoder):
         s = GameState()
@@ -268,19 +268,19 @@ class TestHandNodes:
         # All nodes are hand nodes in empty state
         for i in range(g.node_features.shape[0]):
             feat = g.node_features[i]
-            assert feat[19] == 1.0  # is_hand_node
-            assert feat[20] > 0.0  # count_remaining > 0
+            assert feat[22] == 1.0  # is_hand_node
+            assert feat[23] > 0.0  # count_remaining > 0
 
     def test_hand_nodes_have_no_spatial_features(self, encoder, empty_state):
         g = encoder.encode(empty_state)
         for i in range(g.node_features.shape[0]):
             feat = g.node_features[i]
-            assert feat[7] == 0.0  # is_on_ground
-            assert feat[8] == 0.0  # is_on_top
-            assert feat[9] == 0.0  # stack_height
-            assert feat[12] == 0.0  # num_occupied_neighbors
+            assert feat[10] == 0.0  # is_on_ground
+            assert feat[11] == 0.0  # is_on_top
+            assert feat[12] == 0.0  # stack_height
+            assert feat[15] == 0.0  # num_occupied_neighbors
             # empty_dir_mask all zeros for hand
-            assert feat[13:19].sum() == 0.0
+            assert feat[16:22].sum() == 0.0
 
     def test_hand_diminishes_after_placement(self, encoder):
         s = GameState()
@@ -302,9 +302,9 @@ class TestHandNodes:
         # Find the white ant hand node
         for i in range(hand_nodes.shape[0]):
             feat = hand_nodes[i]
-            if feat[PieceType.ANT.value] == 1.0 and feat[5] == 1.0:  # ANT + WHITE
+            if feat[PieceType.ANT.value] == 1.0 and feat[8] == 1.0:  # ANT + WHITE
                 # Was 3, now 2 → 2/3
-                assert feat[20] == pytest.approx(2.0 / 3.0)
+                assert feat[23] == pytest.approx(2.0 / 3.0)
                 break
 
 
@@ -343,3 +343,161 @@ class TestMultiplePieces:
         g = encoder.encode(s)
         # No stacked pieces, so is_stacked should be 0 for all edges
         assert (g.edge_features[:, 8] == 0.0).all()
+
+    def test_stack_position_zero_for_ground(self, encoder):
+        """Ground-level pieces should have stack_position = 0."""
+        s = self._small_hive()
+        g = encoder.encode(s)
+        for i in range(g.num_piece_nodes):
+            assert g.node_features[i, 24] == 0.0  # all on ground
+
+
+# ---------------------------------------------------------------------------
+# TestStackedPieces
+# ---------------------------------------------------------------------------
+
+
+class TestStackedPieces:
+    """Graph encoding with beetles creating stacked positions."""
+
+    def _stacked_state(self):
+        """Create a state with a beetle on top of a piece.
+
+        Board after setup:
+            ORIGIN.W: White Beetle (moved on top of WQ at ORIGIN)
+            ORIGIN: White Queen (bottom) + White Beetle (top) -- STACK of 2
+            ORIGIN.E: Black Queen
+            ORIGIN.E.E: Black Ant
+        """
+        s = GameState()
+        # Turn 0: White Queen at origin
+        s = _place(s, PieceType.QUEEN, ORIGIN)
+        # Turn 1: Black Queen east
+        e = ORIGIN.neighbor(ALL_DIRECTIONS[0])
+        s = _place(s, PieceType.QUEEN, e)
+        # Turn 2: White Beetle west of origin
+        w = ORIGIN.neighbor(ALL_DIRECTIONS[3])
+        s = _place(s, PieceType.BEETLE, w)
+        # Turn 3: Black Ant east of black queen
+        ee = e.neighbor(ALL_DIRECTIONS[0])
+        s = _place(s, PieceType.ANT, ee)
+        # Turn 4: Move white beetle from W onto origin (on top of queen)
+        beetle = None
+        for p in s.board.grid[w]:
+            if p.piece_type == PieceType.BEETLE:
+                beetle = p
+                break
+        move = Move(move_type=MoveType.MOVE, piece=beetle, to=ORIGIN)
+        s.apply_move(move)
+        return s
+
+    def test_stacked_creates_extra_nodes(self, encoder):
+        """Stacked position should produce 2 piece nodes instead of 1."""
+        s = self._stacked_state()
+        g = encoder.encode(s)
+        # We have 3 positions: ORIGIN (stack of 2), E (1), EE (1)
+        # Total piece nodes = 2 + 1 + 1 = 4
+        assert g.num_piece_nodes == 4
+
+    def test_stacked_positions_shared(self, encoder):
+        """Both pieces in stack should have same (row, col) position."""
+        s = self._stacked_state()
+        g = encoder.encode(s)
+        # Find which nodes share positions (stacked pieces)
+        positions = [(g.node_positions[i, 0], g.node_positions[i, 1])
+                     for i in range(g.num_piece_nodes)]
+        # At least two nodes should share the same position
+        from collections import Counter
+        pos_counts = Counter(positions)
+        stacked_positions = [pos for pos, cnt in pos_counts.items() if cnt > 1]
+        assert len(stacked_positions) >= 1
+
+    def test_vertical_edges_exist(self, encoder):
+        """Stacked pieces should have vertical edges (is_stacked=1.0)."""
+        s = self._stacked_state()
+        g = encoder.encode(s)
+        stacked_edges = g.edge_features[:, 8] == 1.0
+        # Should have exactly 2 vertical edges (bidirectional)
+        assert stacked_edges.sum() == 2
+
+    def test_vertical_edge_features(self, encoder):
+        """Vertical edges should have dq=0, dr=0 and no direction one-hot."""
+        s = self._stacked_state()
+        g = encoder.encode(s)
+        for i in range(g.edge_features.shape[0]):
+            if g.edge_features[i, 8] == 1.0:  # is_stacked
+                assert g.edge_features[i, 0] == 0.0  # dq
+                assert g.edge_features[i, 1] == 0.0  # dr
+                assert g.edge_features[i, 2:8].sum() == 0.0  # no direction
+
+    def test_stack_position_feature(self, encoder):
+        """Bottom piece should have stack_position=0, top should have 0.25."""
+        s = self._stacked_state()
+        g = encoder.encode(s)
+        # Find the stacked pair by position
+        positions = [(g.node_positions[i, 0], g.node_positions[i, 1])
+                     for i in range(g.num_piece_nodes)]
+        from collections import Counter
+        pos_counts = Counter(positions)
+        for pos, cnt in pos_counts.items():
+            if cnt == 2:
+                # Find the two nodes at this position
+                indices = [i for i in range(g.num_piece_nodes)
+                           if (g.node_positions[i, 0], g.node_positions[i, 1]) == pos]
+                # Bottom piece (first in iteration order)
+                assert g.node_features[indices[0], 24] == pytest.approx(0.0)  # height 0
+                # Top piece
+                assert g.node_features[indices[1], 24] == pytest.approx(0.25)  # height 1
+
+    def test_is_on_ground_and_top(self, encoder):
+        """Bottom piece: is_on_ground=1, is_on_top=0. Top: is_on_ground=0, is_on_top=1."""
+        s = self._stacked_state()
+        g = encoder.encode(s)
+        positions = [(g.node_positions[i, 0], g.node_positions[i, 1])
+                     for i in range(g.num_piece_nodes)]
+        from collections import Counter
+        pos_counts = Counter(positions)
+        for pos, cnt in pos_counts.items():
+            if cnt == 2:
+                indices = [i for i in range(g.num_piece_nodes)
+                           if (g.node_positions[i, 0], g.node_positions[i, 1]) == pos]
+                # Bottom piece
+                assert g.node_features[indices[0], 10] == 1.0   # is_on_ground
+                assert g.node_features[indices[0], 11] == 0.0   # NOT is_on_top
+                # Top piece
+                assert g.node_features[indices[1], 10] == 0.0   # NOT is_on_ground
+                assert g.node_features[indices[1], 11] == 1.0   # is_on_top
+
+    def test_empty_dir_mask_only_top(self, encoder):
+        """Only the top piece in a stack should have empty_dir_mask set."""
+        s = self._stacked_state()
+        g = encoder.encode(s)
+        positions = [(g.node_positions[i, 0], g.node_positions[i, 1])
+                     for i in range(g.num_piece_nodes)]
+        from collections import Counter
+        pos_counts = Counter(positions)
+        for pos, cnt in pos_counts.items():
+            if cnt == 2:
+                indices = [i for i in range(g.num_piece_nodes)
+                           if (g.node_positions[i, 0], g.node_positions[i, 1]) == pos]
+                # Bottom piece: no empty_dir_mask
+                assert g.node_features[indices[0], 16:22].sum() == 0.0
+                # Top piece: may have some empty directions
+                # (don't assert specific count, just that bottom is zero)
+
+    def test_piece_types_in_stack(self, encoder):
+        """Bottom piece should be queen, top should be beetle."""
+        s = self._stacked_state()
+        g = encoder.encode(s)
+        positions = [(g.node_positions[i, 0], g.node_positions[i, 1])
+                     for i in range(g.num_piece_nodes)]
+        from collections import Counter
+        pos_counts = Counter(positions)
+        for pos, cnt in pos_counts.items():
+            if cnt == 2:
+                indices = [i for i in range(g.num_piece_nodes)
+                           if (g.node_positions[i, 0], g.node_positions[i, 1]) == pos]
+                # Bottom is queen
+                assert g.node_piece_types[indices[0]] == PieceType.QUEEN.value
+                # Top is beetle
+                assert g.node_piece_types[indices[1]] == PieceType.BEETLE.value

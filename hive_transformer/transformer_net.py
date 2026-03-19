@@ -5,7 +5,10 @@ Architecture:
     HiveTokenBatch → token/position/type embeddings →
     TransformerEncoder (self-attention × N) →
         ├── PolicyHead (scatter to grid → conv → FC) → logits (29407,)
-        └── ValueHead (CLS token → FC → tanh) → scalar in [-1, 1]
+        ├── ValueHead (CLS token → FC → tanh) → scalar in [-1, 1]
+        ├── MobilityHead (per-board-token MLP → binary logit) [optional]
+        ├── QueenSurroundHead (per-board-token MLP → 2 logits) [optional]
+        └── FinalMobilityHead (per-board-token MLP → binary logit) [optional]
 
 Uses standard nn.TransformerEncoder with batch_first=True for
 optimal GPU tensor core utilization and torch.compile() compatibility.
@@ -46,11 +49,22 @@ class TransformerConfig:
     dropout: float = 0.1
     max_positions: int = 170        # 169 grid cells + 1 off-board
     num_token_types: int = 3        # CLS=0, board=1, hand=2
-    token_feat_dim: int = TOKEN_FEAT_DIM   # 21
+    token_feat_dim: int = TOKEN_FEAT_DIM   # 22
     global_feat_dim: int = GLOBAL_FEAT_DIM  # 6
     policy_conv_channels: int = 32
     action_space_size: int = HiveEncoder.ACTION_SPACE_SIZE  # 29407
     board_size: int = HiveEncoder.BOARD_SIZE                # 13
+
+    # Auxiliary heads
+    aux_mobility_enabled: bool = True
+    aux_queen_surround_enabled: bool = True
+    aux_final_mobility_enabled: bool = True
+    aux_mobility_hidden: int = 64
+    aux_queen_surround_hidden: int = 64
+    aux_final_mobility_hidden: int = 64
+
+    # Value uncertainty (Gaussian NLL instead of MSE)
+    predict_uncertainty: bool = False
 
     @classmethod
     def small(cls) -> TransformerConfig:
@@ -118,28 +132,89 @@ class TransformerValueHead(nn.Module):
     """
     Value head using CLS token embedding + global features.
 
-    CLS token → concat with global → FC → ReLU → FC → tanh
+    CLS token → concat with global → FC → ReLU → FC → tanh (+ optional log-variance)
     """
 
-    def __init__(self, d_model: int, global_feat_dim: int) -> None:
+    def __init__(
+        self, d_model: int, global_feat_dim: int, predict_uncertainty: bool = False
+    ) -> None:
         super().__init__()
         self.fc1 = nn.Linear(d_model + global_feat_dim, 256)
         self.fc2 = nn.Linear(256, 1)
+        self.predict_uncertainty = predict_uncertainty
+        if predict_uncertainty:
+            # Log-variance head: initialized to zero → starts as pure MSE
+            self.fc2_logvar = nn.Linear(256, 1)
+            nn.init.zeros_(self.fc2_logvar.weight)
+            nn.init.zeros_(self.fc2_logvar.bias)
 
     def forward(
         self,
         cls_embedding: torch.Tensor,      # (B, d_model)
         global_features: torch.Tensor,    # (B, global_feat_dim)
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Compute value from CLS token.
 
         Returns:
-            Value predictions (B, 1) in [-1, 1].
+            (value, log_var) where value is (B, 1) in [-1, 1] and
+            log_var is (B, 1) or None if predict_uncertainty is False.
         """
         combined = torch.cat([cls_embedding, global_features], dim=1)
         v = F.relu(self.fc1(combined))
-        return torch.tanh(self.fc2(v))
+        value = torch.tanh(self.fc2(v))
+        log_var = self.fc2_logvar(v).clamp(-10, 10) if self.predict_uncertainty else None
+        return value, log_var
+
+
+# ── Auxiliary Heads ────────────────────────────────────────────────
+
+
+class _PerTokenBinaryHead(nn.Module):
+    """
+    Base per-token binary prediction head.
+
+    Takes board-token embeddings from the trunk and predicts logit(s)
+    per board token via a two-layer MLP.
+    """
+
+    def __init__(
+        self, d_model: int, out_dim: int = 1, aux_hidden: int = 64
+    ) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, aux_hidden),
+            nn.ReLU(),
+            nn.Linear(aux_hidden, out_dim),
+        )
+
+    def forward(self, board_token_embeddings: torch.Tensor) -> torch.Tensor:
+        return self.mlp(board_token_embeddings)
+
+
+class TransformerMobilityHead(_PerTokenBinaryHead):
+    """Per-board-token binary prediction: can this piece move right now?"""
+
+    def __init__(self, d_model: int, aux_hidden: int = 64) -> None:
+        super().__init__(d_model, out_dim=1, aux_hidden=aux_hidden)
+
+
+class TransformerQueenSurroundHead(_PerTokenBinaryHead):
+    """Per-board-token prediction: is this piece adjacent to each queen at game end?
+
+    Output dim 0 = white queen adjacency logit.
+    Output dim 1 = black queen adjacency logit.
+    """
+
+    def __init__(self, d_model: int, aux_hidden: int = 64) -> None:
+        super().__init__(d_model, out_dim=2, aux_hidden=aux_hidden)
+
+
+class TransformerFinalMobilityHead(_PerTokenBinaryHead):
+    """Per-board-token binary prediction: will this piece be mobile at game end?"""
+
+    def __init__(self, d_model: int, aux_hidden: int = 64) -> None:
+        super().__init__(d_model, out_dim=1, aux_hidden=aux_hidden)
 
 
 # ── HiveTransformer ───────────────────────────────────────────────
@@ -148,15 +223,17 @@ class TransformerValueHead(nn.Module):
 class HiveTransformer(nn.Module):
     """
     Transformer network for Hive, producing the same output interface
-    as HiveNet and HiveGNN: policy logits (B, 29407) and value (B, 1).
+    as HiveGNN: policy logits (B, 29407), value (B, 1), and auxiliary
+    head outputs.
 
     Architecture:
-        1. Linear projection of token features (21 → d_model)
+        1. Linear projection of token features (22 → d_model)
         2. Add learned position embedding (170 positions)
         3. Add token type embedding (3 types: CLS, board, hand)
         4. TransformerEncoder with self-attention (num_layers)
         5. PolicyHead: scatter board tokens to grid → conv → FC → logits
         6. ValueHead: CLS token → FC → tanh → value
+        7. AuxHeads: board token embeddings → MLP → logits (optional)
     """
 
     def __init__(self, config: TransformerConfig | None = None) -> None:
@@ -194,14 +271,63 @@ class HiveTransformer(nn.Module):
         self.policy_head = TransformerPolicyHead(config)
 
         # Value head
-        self.value_head = TransformerValueHead(d, config.global_feat_dim)
+        self.value_head = TransformerValueHead(d, config.global_feat_dim, config.predict_uncertainty)
+
+        # Auxiliary heads
+        self.mobility_head: TransformerMobilityHead | None = None
+        if config.aux_mobility_enabled:
+            self.mobility_head = TransformerMobilityHead(
+                d, config.aux_mobility_hidden
+            )
+
+        self.queen_surround_head: TransformerQueenSurroundHead | None = None
+        if config.aux_queen_surround_enabled:
+            self.queen_surround_head = TransformerQueenSurroundHead(
+                d, config.aux_queen_surround_hidden
+            )
+
+        self.final_mobility_head: TransformerFinalMobilityHead | None = None
+        if config.aux_final_mobility_enabled:
+            self.final_mobility_head = TransformerFinalMobilityHead(
+                d, config.aux_final_mobility_hidden
+            )
 
         self._d_model = d
         self._board_size = config.board_size
 
+    def _extract_board_embeddings(
+        self,
+        embeddings: torch.Tensor,        # (B, S, d)
+        batch: HiveTokenBatch,
+    ) -> torch.Tensor:
+        """
+        Extract board-token embeddings from the full sequence.
+
+        Board tokens have token_type == TOKEN_TYPE_BOARD. Returns a flat
+        tensor of all board token embeddings across the batch, aligned
+        with per-board-token auxiliary targets.
+
+        Args:
+            embeddings: Transformer output (B, S, d).
+            batch: Token batch data.
+
+        Returns:
+            Board token embeddings (total_board_tokens, d).
+        """
+        board_mask = batch.token_types == TOKEN_TYPE_BOARD  # (B, S)
+
+        if not board_mask.any():
+            return torch.zeros(
+                0, self._d_model,
+                device=embeddings.device, dtype=embeddings.dtype,
+            )
+
+        b_idx, s_idx = torch.where(board_mask)
+        return embeddings[b_idx, s_idx]  # (total_board_tokens, d)
+
     def forward(
         self, batch: HiveTokenBatch
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """
         Forward pass on a padded token batch.
 
@@ -209,9 +335,13 @@ class HiveTransformer(nn.Module):
             batch: HiveTokenBatch with all tensors on the same device.
 
         Returns:
-            (policy_logits, value) where:
+            (policy_logits, value, aux_outputs) where:
                 policy_logits: shape (B, 29407)
                 value: shape (B, 1), in [-1, 1]
+                aux_outputs: dict with optional keys:
+                    "mobility_logits": (total_board_tokens, 1)
+                    "queen_surround_logits": (total_board_tokens, 2)
+                    "final_mobility_logits": (total_board_tokens, 1)
         """
         B = batch.global_features.size(0)
         device = batch.token_features.device
@@ -238,9 +368,31 @@ class HiveTransformer(nn.Module):
 
         # 6. Value from CLS token (always at position 0)
         cls_embedding = h[:, 0, :]  # (B, d)
-        value = self.value_head(cls_embedding, batch.global_features)
+        value, value_logvar = self.value_head(cls_embedding, batch.global_features)
 
-        return policy_logits, value
+        # 7. Auxiliary heads on board token embeddings
+        aux_outputs: dict[str, torch.Tensor] = {}
+        if value_logvar is not None:
+            aux_outputs["value_logvar"] = value_logvar
+
+        board_embeddings = self._extract_board_embeddings(h, batch)
+
+        if self.mobility_head is not None and board_embeddings.size(0) > 0:
+            aux_outputs["mobility_logits"] = self.mobility_head(
+                board_embeddings
+            )
+
+        if self.queen_surround_head is not None and board_embeddings.size(0) > 0:
+            aux_outputs["queen_surround_logits"] = self.queen_surround_head(
+                board_embeddings
+            )
+
+        if self.final_mobility_head is not None and board_embeddings.size(0) > 0:
+            aux_outputs["final_mobility_logits"] = self.final_mobility_head(
+                board_embeddings
+            )
+
+        return policy_logits, value, aux_outputs
 
     def _scatter_to_grid(
         self,
@@ -331,7 +483,7 @@ class HiveTransformer(nn.Module):
         batch = HiveTokenBatch.collate([sequence]).to(device)
         mask = torch.from_numpy(legal_mask).to(device)
 
-        policy_logits, value_tensor = self.forward(batch)
+        policy_logits, value_tensor, _aux = self.forward(batch)
 
         # Apply legal mask
         policy_logits = policy_logits.squeeze(0)  # (29407,)

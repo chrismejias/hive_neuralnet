@@ -6,16 +6,16 @@ convolutional neural network processing, and maps between Move
 objects and flat action indices for the policy head.
 
 Tensor layout: (NUM_CHANNELS, BOARD_SIZE, BOARD_SIZE)
-  Channels 0-4:   White pieces at ground level (Q, A, G, S, B)
-  Channels 5-9:   Black pieces at ground level (Q, A, G, S, B)
-  Channels 10-14: White pieces at stacked level (top piece when stack >= 2)
-  Channels 15-19: Black pieces at stacked level
-  Channels 20-25: Meta information (current player, turn, queens, hands)
+  Channels 0-7:   White pieces at ground level (Q, A, G, S, B, M, L, P)
+  Channels 8-15:  Black pieces at ground level
+  Channels 16-23: White pieces at stacked level (top piece when stack >= 2)
+  Channels 24-31: Black pieces at stacked level
+  Channels 32-37: Meta information (current player, turn, queens, hands)
 
 Action space: flat index over placements, movements, and pass.
-  [0, 845):        Placement actions (5 piece types × 169 grid positions)
-  [845, 29406):    Movement actions (169 source × 169 destination)
-  [29406]:         Pass action
+  [0, 1352):       Placement actions (8 piece types × 169 grid positions)
+  [1352, 29913):   Movement actions (169 source × 169 destination)
+  [29913]:         Pass action
 """
 
 from __future__ import annotations
@@ -59,28 +59,28 @@ class HiveEncoder:
 
     # ── Channel Layout ──────────────────────────────────────────
 
-    NUM_PIECE_TYPES: int = 5
+    NUM_PIECE_TYPES: int = 8  # Q, A, G, S, B, M, L, P
     NUM_COLORS: int = 2
     NUM_STACK_LEVELS: int = 2  # ground (0) and stacked (1+)
 
-    NUM_PIECE_CHANNELS: int = NUM_PIECE_TYPES * NUM_COLORS * NUM_STACK_LEVELS  # 20
+    NUM_PIECE_CHANNELS: int = NUM_PIECE_TYPES * NUM_COLORS * NUM_STACK_LEVELS  # 32
     NUM_META_CHANNELS: int = 6
-    NUM_CHANNELS: int = NUM_PIECE_CHANNELS + NUM_META_CHANNELS  # 26
+    NUM_CHANNELS: int = NUM_PIECE_CHANNELS + NUM_META_CHANNELS  # 38
 
     # Meta channel offsets
-    CH_CURRENT_PLAYER: int = 20
-    CH_TURN_NUMBER: int = 21
-    CH_WHITE_QUEEN_PLACED: int = 22
-    CH_BLACK_QUEEN_PLACED: int = 23
-    CH_WHITE_HAND_COUNT: int = 24
-    CH_BLACK_HAND_COUNT: int = 25
+    CH_CURRENT_PLAYER: int = 32
+    CH_TURN_NUMBER: int = 33
+    CH_WHITE_QUEEN_PLACED: int = 34
+    CH_BLACK_QUEEN_PLACED: int = 35
+    CH_WHITE_HAND_COUNT: int = 36
+    CH_BLACK_HAND_COUNT: int = 37
 
     # ── Action Space Constants ──────────────────────────────────
 
     NUM_GRID_CELLS: int = BOARD_SIZE * BOARD_SIZE  # 169
 
-    # Placement: piece_type (5) × grid_position (169)
-    NUM_PLACEMENT_ACTIONS: int = NUM_PIECE_TYPES * NUM_GRID_CELLS  # 845
+    # Placement: piece_type (8) × grid_position (169)
+    NUM_PLACEMENT_ACTIONS: int = NUM_PIECE_TYPES * NUM_GRID_CELLS  # 1352
 
     # Movement: source_position (169) × destination_position (169)
     NUM_MOVEMENT_ACTIONS: int = NUM_GRID_CELLS * NUM_GRID_CELLS  # 28,561
@@ -88,12 +88,12 @@ class HiveEncoder:
     # Total action space
     ACTION_SPACE_SIZE: int = (
         NUM_PLACEMENT_ACTIONS + NUM_MOVEMENT_ACTIONS + 1  # +1 for pass
-    )  # 29,407
+    )  # 29,914
 
-    PASS_ACTION_INDEX: int = ACTION_SPACE_SIZE - 1  # 29,406
+    PASS_ACTION_INDEX: int = ACTION_SPACE_SIZE - 1  # 29,913
 
     # Offset where movement actions begin
-    _MOVEMENT_OFFSET: int = NUM_PLACEMENT_ACTIONS  # 845
+    _MOVEMENT_OFFSET: int = NUM_PLACEMENT_ACTIONS  # 1352
 
     def __init__(self) -> None:
         # Centroid cache: (board_piece_count, board_id) → (center_q, center_r)
@@ -151,13 +151,13 @@ class HiveEncoder:
 
             # Ground level: piece at stack index 0
             ground_piece = stack[0]
-            ch = ground_piece.color.value * 5 + ground_piece.piece_type.value
+            ch = ground_piece.color.value * 8 + ground_piece.piece_type.value
             tensor[ch, row, col] = 1.0
 
             # Stacked level: top piece when stack height >= 2
             if len(stack) >= 2:
                 top_piece = stack[-1]
-                ch = 10 + top_piece.color.value * 5 + top_piece.piece_type.value
+                ch = 16 + top_piece.color.value * 8 + top_piece.piece_type.value
                 tensor[ch, row, col] = 1.0
 
         # ── Encode meta planes ──────────────────────────────────
@@ -179,10 +179,10 @@ class HiveEncoder:
 
         # Hand counts (normalized)
         tensor[self.CH_WHITE_HAND_COUNT, :, :] = (
-            len(game_state.hand(Color.WHITE)) / 11.0
+            len(game_state.hand(Color.WHITE)) / 14.0
         )
         tensor[self.CH_BLACK_HAND_COUNT, :, :] = (
-            len(game_state.hand(Color.BLACK)) / 11.0
+            len(game_state.hand(Color.BLACK)) / 14.0
         )
 
         return tensor

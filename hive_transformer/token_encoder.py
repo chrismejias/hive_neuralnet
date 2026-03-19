@@ -2,12 +2,13 @@
 Token encoder for converting Hive game states to transformer-ready sequences.
 
 Converts a GameState into a HiveTokenSequence. Each piece on the board
-becomes one token, each (color, piece_type) in hand becomes one hand token,
-and a CLS token is prepended for the value head.
+becomes one token (including pieces sandwiched under beetles), each
+(color, piece_type) in hand becomes one hand token, and a CLS token is
+prepended for the value head.
 
-Token features are identical to GNN node features (21 dims).
-Position encoding uses grid index: row * 13 + col for board pieces,
-169 for CLS and hand tokens.
+Token features are identical to GNN node features (25 dims).
+Position encoding uses grid index: row * 13 + col for board pieces
+(stacked pieces share the same position index), 169 for CLS and hand tokens.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import numpy as np
 from hive_engine.board import Board
 from hive_engine.encoder import HiveEncoder
 from hive_engine.game_state import GameState
-from hive_engine.hex_coord import ALL_DIRECTIONS, HexCoord
+from hive_engine.hex_coord import HexCoord, _OFFSET_LIST
 from hive_engine.pieces import Color, PieceType
 
 from hive_transformer.token_types import (
@@ -39,8 +40,9 @@ class TokenEncoder:
 
     Token ordering: [CLS, board_piece₁, ..., board_pieceₙ, hand₁, ..., handₘ]
 
-    Board piece features and hand node features are identical to the GNN
-    graph_encoder.py implementation (21-dim per token).
+    Board piece tokens include all pieces in each stack (bottom to top),
+    not just the top piece. Features are 25-dim per token, matching the
+    GNN graph_encoder.py implementation.
 
     Usage:
         encoder = TokenEncoder()
@@ -73,21 +75,36 @@ class TokenEncoder:
         board = game_state.board
         center_q, center_r = self._cached_center(board)
 
-        features_list: list[np.ndarray] = []
-        positions_list: list[int] = []
-        types_list: list[int] = []
+        # -----------------------------------------------------------------
+        # Pre-allocate output buffers.
+        # Upper bound: 1 CLS + all pieces across all stacks + hand tokens.
+        # Avoids per-token np.zeros() + np.stack() at the end.
+        # -----------------------------------------------------------------
+        n_grid = len(board.grid)
+        max_tokens = 1 + n_grid * 4 + 22  # conservative upper bound
+        token_features = np.zeros((max_tokens, TOKEN_FEAT_DIM), dtype=np.float32)
+        token_positions = np.empty(max_tokens, dtype=np.int32)
+        token_types    = np.empty(max_tokens, dtype=np.int32)
+        tok = 0  # running token index
 
         # -----------------------------------------------------------------
-        # 1. CLS token
+        # 1. CLS token (features already zero from np.zeros above)
         # -----------------------------------------------------------------
-        features_list.append(np.zeros(TOKEN_FEAT_DIM, dtype=np.float32))
-        positions_list.append(OFF_BOARD_POSITION)
-        types_list.append(TOKEN_TYPE_CLS)
+        token_positions[tok] = OFF_BOARD_POSITION
+        token_types[tok]     = TOKEN_TYPE_CLS
+        tok += 1
 
         # -----------------------------------------------------------------
-        # 2. Board piece tokens (one per occupied position, top piece)
+        # 2. Board piece tokens (one per piece, including stacked)
         # -----------------------------------------------------------------
         num_board_tokens = 0
+
+        # Build a tuple set for O(1) neighbor checks without HexCoord allocation.
+        # queen_surrounded_count() is the same for all pieces of a given color,
+        # so compute it once here rather than once per piece.
+        grid_tuples: set[tuple[int, int]] = {(p.q, p.r) for p in board.grid}
+        queen_surround_w = game_state.queen_surrounded_count(Color.WHITE) / 6.0
+        queen_surround_b = game_state.queen_surrounded_count(Color.BLACK) / 6.0
 
         for pos, stack in board.grid.items():
             grid = HiveEncoder._hex_to_grid(pos.q, pos.r, center_q, center_r)
@@ -95,51 +112,76 @@ class TokenEncoder:
                 continue
 
             row, col = grid
-            top_piece = stack[-1]
             stack_height = len(stack)
+            grid_pos = row * 13 + col
 
-            feat = np.zeros(TOKEN_FEAT_DIM, dtype=np.float32)
+            # --- Compute per-position neighbor info in one unrolled pass ---
+            # Inlining _OFFSET_LIST avoids Python loop + tuple-unpack overhead.
+            # Simultaneously computes occ_count (feat[12]) and the 6-bit
+            # empty_dir_mask (feat[13:19]) so we only scan neighbors once.
+            pq, pr = pos.q, pos.r
+            e_occ  = int((pq + 1, pr    ) in grid_tuples)
+            ne_occ = int((pq + 1, pr - 1) in grid_tuples)
+            nw_occ = int((pq,     pr - 1) in grid_tuples)
+            w_occ  = int((pq - 1, pr    ) in grid_tuples)
+            sw_occ = int((pq - 1, pr + 1) in grid_tuples)
+            se_occ = int((pq,     pr + 1) in grid_tuples)
+            occ_count = e_occ + ne_occ + nw_occ + w_occ + sw_occ + se_occ
 
-            # [0:5] piece_type one-hot
-            feat[top_piece.piece_type.value] = 1.0
+            for height, piece in enumerate(stack):
+                is_top = (height == stack_height - 1)
+                f = token_features[tok]  # direct view — no allocation
 
-            # [5:7] color one-hot
-            feat[5 + top_piece.color.value] = 1.0
+                # [0:8] piece_type one-hot
+                f[piece.piece_type.value] = 1.0
 
-            # [7] is_on_ground
-            feat[7] = 1.0 if stack_height == 1 else 0.0
+                # [8:10] color one-hot
+                f[8 + piece.color.value] = 1.0
 
-            # [8] is_on_top
-            feat[8] = 1.0
+                # [10] is_on_ground
+                if height == 0:
+                    f[10] = 1.0
 
-            # [9] stack_height / 4.0
-            feat[9] = stack_height / 4.0
+                # [11] is_on_top
+                if is_top:
+                    f[11] = 1.0
 
-            # [10] is_queen
-            feat[10] = 1.0 if top_piece.piece_type == PieceType.QUEEN else 0.0
+                # [12] stack_height / 4.0
+                f[12] = stack_height * 0.25
 
-            # [11] queen_neighbor_count / 6.0
-            feat[11] = game_state.queen_surrounded_count(top_piece.color) / 6.0
+                # [13] is_queen
+                if piece.piece_type == PieceType.QUEEN:
+                    f[13] = 1.0
 
-            # [12] num_occupied_neighbors / 6.0
-            feat[12] = board.num_occupied_neighbors(pos) / 6.0
+                # [14] queen_neighbor_count / 6.0  (hoisted: same for all pieces of this color)
+                f[14] = (
+                    queen_surround_w
+                    if piece.color == Color.WHITE
+                    else queen_surround_b
+                )
 
-            # [13:19] empty_dir_mask
-            for d in ALL_DIRECTIONS:
-                neighbor = pos.neighbor(d)
-                if neighbor not in board.grid:
-                    feat[13 + d.value] = 1.0
+                # [15] num_occupied_neighbors / 6.0  (hoisted: same for all pieces at this pos)
+                f[15] = occ_count * (1.0 / 6.0)
 
-            # [19] is_hand_node = 0 for board pieces
-            feat[19] = 0.0
+                # [16:22] empty_dir_mask — only for top piece.
+                # Unrolled from the occ booleans computed above; no extra lookup.
+                if is_top:
+                    if not e_occ:  f[16] = 1.0
+                    if not ne_occ: f[17] = 1.0
+                    if not nw_occ: f[18] = 1.0
+                    if not w_occ:  f[19] = 1.0
+                    if not sw_occ: f[20] = 1.0
+                    if not se_occ: f[21] = 1.0
 
-            # [20] count_remaining = 0 for board pieces
-            feat[20] = 0.0
+                # [22] is_hand_node = 0 (already zero from np.zeros)
+                # [23] count_remaining = 0 (already zero)
+                # [24] stack_position
+                f[24] = height * 0.25
 
-            features_list.append(feat)
-            positions_list.append(row * 13 + col)  # grid position index
-            types_list.append(TOKEN_TYPE_BOARD)
-            num_board_tokens += 1
+                token_positions[tok] = grid_pos
+                token_types[tok]     = TOKEN_TYPE_BOARD
+                tok += 1
+                num_board_tokens += 1
 
         # -----------------------------------------------------------------
         # 3. Hand tokens (one per piece type per player with count)
@@ -151,23 +193,21 @@ class TokenEncoder:
                 type_counts[p.piece_type] += 1
 
             for pt, count in type_counts.items():
-                feat = np.zeros(TOKEN_FEAT_DIM, dtype=np.float32)
+                f = token_features[tok]  # already zero
 
-                feat[pt.value] = 1.0
-                feat[5 + color.value] = 1.0
-                feat[7] = 0.0   # not on ground
-                feat[8] = 0.0   # not on top
-                feat[9] = 0.0   # no stack height
-                feat[10] = 1.0 if pt == PieceType.QUEEN else 0.0
-                feat[11] = 0.0  # no queen neighbor count
-                feat[12] = 0.0  # no occupied neighbors
-                # [13:19] empty_dir_mask all zeros
-                feat[19] = 1.0  # is_hand_node
-                feat[20] = count / pt.count_per_player
+                f[pt.value] = 1.0
+                f[8 + color.value] = 1.0
+                # [10][11][12] stay 0: not on ground, not on top, no stack height
+                if pt == PieceType.QUEEN:
+                    f[13] = 1.0
+                # [14][15][16:22] stay 0: hand token
+                f[22] = 1.0  # is_hand_node
+                f[23] = count / pt.count_per_player
+                # [24] stays 0
 
-                features_list.append(feat)
-                positions_list.append(OFF_BOARD_POSITION)
-                types_list.append(TOKEN_TYPE_HAND)
+                token_positions[tok] = OFF_BOARD_POSITION
+                token_types[tok]     = TOKEN_TYPE_HAND
+                tok += 1
 
         # -----------------------------------------------------------------
         # 4. Global features
@@ -178,23 +218,19 @@ class TokenEncoder:
                 min(game_state.turn / 100.0, 1.0),
                 1.0 if game_state._queen_placed[Color.WHITE] else 0.0,
                 1.0 if game_state._queen_placed[Color.BLACK] else 0.0,
-                len(game_state.hand(Color.WHITE)) / 11.0,
-                len(game_state.hand(Color.BLACK)) / 11.0,
+                len(game_state.hand(Color.WHITE)) / 14.0,
+                len(game_state.hand(Color.BLACK)) / 14.0,
             ],
             dtype=np.float32,
         )
 
         # -----------------------------------------------------------------
-        # 5. Assemble
+        # 5. Return slices of the pre-allocated buffers (no copy needed).
         # -----------------------------------------------------------------
-        token_features = np.stack(features_list, axis=0)
-        token_positions = np.array(positions_list, dtype=np.int32)
-        token_types = np.array(types_list, dtype=np.int32)
-
         return HiveTokenSequence(
-            token_features=token_features,
-            token_positions=token_positions,
-            token_types=token_types,
+            token_features=token_features[:tok],
+            token_positions=token_positions[:tok],
+            token_types=token_types[:tok],
             num_board_tokens=num_board_tokens,
             global_features=global_features,
         )

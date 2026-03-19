@@ -11,9 +11,9 @@ import torch
 # Constants
 # ---------------------------------------------------------------------------
 
-TOKEN_FEAT_DIM = 21
+TOKEN_FEAT_DIM = 25
 GLOBAL_FEAT_DIM = 6
-MAX_SEQ_LEN = 35  # 22 board + 10 hand + 1 CLS + 2 margin
+MAX_SEQ_LEN = 55  # 28 board (with stacks) + 16 hand + 1 CLS + 10 margin
 
 TOKEN_TYPE_CLS = 0
 TOKEN_TYPE_BOARD = 1

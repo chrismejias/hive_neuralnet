@@ -39,6 +39,8 @@ checkpoints_*/
 runs/
 tb_logs/
 *.jsonl
+*.log
+gpu_log.csv
 
 # Jupyter
 .ipynb_checkpoints/

@@ -61,8 +61,8 @@ class TestReplayBuffer:
 
         examples = [
             TrainingExample(
-                np.zeros((26, 13, 13), dtype=np.float32),
-                np.zeros(29407, dtype=np.float32),
+                np.zeros((38, 13, 13), dtype=np.float32),
+                np.zeros(29914, dtype=np.float32),
                 1.0,
             )
             for _ in range(10)
@@ -74,8 +74,8 @@ class TestReplayBuffer:
         buf = ReplayBuffer(max_size=5)
         examples = [
             TrainingExample(
-                np.zeros((26, 13, 13), dtype=np.float32),
-                np.zeros(29407, dtype=np.float32),
+                np.zeros((38, 13, 13), dtype=np.float32),
+                np.zeros(29914, dtype=np.float32),
                 0.0,
             )
             for _ in range(10)
@@ -87,8 +87,8 @@ class TestReplayBuffer:
         buf = ReplayBuffer(max_size=100)
         examples = [
             TrainingExample(
-                np.random.randn(26, 13, 13).astype(np.float32),
-                np.random.dirichlet(np.ones(29407)).astype(np.float32),
+                np.random.randn(38, 13, 13).astype(np.float32),
+                np.random.dirichlet(np.ones(29914)).astype(np.float32),
                 np.random.choice([-1.0, 0.0, 1.0]),
             )
             for _ in range(20)
@@ -96,8 +96,8 @@ class TestReplayBuffer:
         buf.add_examples(examples)
 
         states, policies, values = buf.sample_batch(8)
-        assert states.shape == (8, 26, 13, 13)
-        assert policies.shape == (8, 29407)
+        assert states.shape == (8, 38, 13, 13)
+        assert policies.shape == (8, 29914)
         assert values.shape == (8, 1)
         assert states.dtype == torch.float32
         assert policies.dtype == torch.float32
@@ -108,8 +108,8 @@ class TestReplayBuffer:
         buf = ReplayBuffer(max_size=100)
         examples = [
             TrainingExample(
-                np.zeros((26, 13, 13), dtype=np.float32),
-                np.zeros(29407, dtype=np.float32),
+                np.zeros((38, 13, 13), dtype=np.float32),
+                np.zeros(29914, dtype=np.float32),
                 0.0,
             )
             for _ in range(3)
@@ -125,12 +125,12 @@ class TestReplayBuffer:
 class TestTrainingExample:
     def test_named_tuple_fields(self):
         ex = TrainingExample(
-            state_tensor=np.zeros((26, 13, 13), dtype=np.float32),
-            policy_target=np.zeros(29407, dtype=np.float32),
+            state_tensor=np.zeros((38, 13, 13), dtype=np.float32),
+            policy_target=np.zeros(29914, dtype=np.float32),
             value_target=1.0,
         )
-        assert ex.state_tensor.shape == (26, 13, 13)
-        assert ex.policy_target.shape == (29407,)
+        assert ex.state_tensor.shape == (38, 13, 13)
+        assert ex.policy_target.shape == (29914,)
         assert ex.value_target == 1.0
 
 
@@ -146,8 +146,8 @@ class TestSelfPlay:
         assert len(examples) > 0
 
         for ex in examples:
-            assert ex.state_tensor.shape == (26, 13, 13)
-            assert ex.policy_target.shape == (29407,)
+            assert ex.state_tensor.shape == (38, 13, 13)
+            assert ex.policy_target.shape == (29914,)
             assert ex.value_target in [-1.0, 0.0, 1.0]
             # Policy should be a valid distribution
             assert abs(ex.policy_target.sum() - 1.0) < 1e-4
@@ -181,8 +181,8 @@ class TestTrainPhase:
         # Fill buffer with some examples
         examples = []
         for _ in range(20):
-            state = np.random.randn(26, 13, 13).astype(np.float32)
-            policy = np.zeros(29407, dtype=np.float32)
+            state = np.random.randn(38, 13, 13).astype(np.float32)
+            policy = np.zeros(29914, dtype=np.float32)
             policy[0] = 1.0  # Deterministic target
             value = 1.0
             examples.append(TrainingExample(state, policy, value))

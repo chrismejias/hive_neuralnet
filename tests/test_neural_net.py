@@ -41,8 +41,8 @@ class TestNetConfig:
         cfg = NetConfig()
         assert cfg.num_blocks == 5
         assert cfg.num_filters == 128
-        assert cfg.input_channels == 26
-        assert cfg.action_space_size == 29407
+        assert cfg.input_channels == 38
+        assert cfg.action_space_size == 29914
         assert cfg.board_size == 13
 
     def test_small_preset(self):
@@ -80,27 +80,27 @@ class TestResidualBlock:
 
 class TestHiveNet:
     def test_forward_output_shapes(self, small_net):
-        x = torch.randn(4, 26, 13, 13)
+        x = torch.randn(4, 38, 13, 13)
         policy, value = small_net(x)
-        assert policy.shape == (4, 29407)
+        assert policy.shape == (4, 29914)
         assert value.shape == (4, 1)
 
     def test_forward_single_sample(self, small_net):
-        x = torch.randn(1, 26, 13, 13)
+        x = torch.randn(1, 38, 13, 13)
         policy, value = small_net(x)
-        assert policy.shape == (1, 29407)
+        assert policy.shape == (1, 29914)
         assert value.shape == (1, 1)
 
     def test_value_in_range(self, small_net):
         """Value head uses tanh, so output must be in [-1, 1]."""
-        x = torch.randn(8, 26, 13, 13)
+        x = torch.randn(8, 38, 13, 13)
         _, value = small_net(x)
         assert (value >= -1.0).all()
         assert (value <= 1.0).all()
 
     def test_gradient_flows(self, small_net):
         """Ensure loss.backward() works without errors."""
-        x = torch.randn(2, 26, 13, 13)
+        x = torch.randn(2, 38, 13, 13)
         policy, value = small_net(x)
         loss = policy.sum() + value.sum()
         loss.backward()
@@ -120,7 +120,7 @@ class TestHiveNet:
         net = HiveNet(NetConfig.small())
         params = net.count_parameters()
         # Expect roughly 8-12M for small config (policy head dominates
-        # due to 256→29407 linear layer = ~7.5M params)
+        # due to 256→29914 linear layer = ~7.5M params)
         assert 5_000_000 < params < 15_000_000, f"Unexpected param count: {params}"
 
     def test_parameter_count_large_gt_small(self):
@@ -131,7 +131,7 @@ class TestHiveNet:
     def test_eval_mode_deterministic(self, small_net):
         """In eval mode, same input should produce same output (no dropout etc)."""
         small_net.eval()
-        x = torch.randn(1, 26, 13, 13)
+        x = torch.randn(1, 38, 13, 13)
         p1, v1 = small_net(x)
         p2, v2 = small_net(x)
         assert torch.allclose(p1, p2)
@@ -146,7 +146,7 @@ class TestPredict:
         state = encoder.encode_state(game_state)
         mask = encoder.get_legal_action_mask(game_state)
         probs, value = small_net.predict(state, mask)
-        assert probs.shape == (29407,)
+        assert probs.shape == (29914,)
         assert isinstance(value, float)
 
     def test_predict_probs_sum_to_one(self, small_net, encoder, game_state):
@@ -173,7 +173,7 @@ class TestPredict:
     def test_predict_all_zero_mask(self, small_net, encoder, game_state):
         """Edge case: all-zero mask should return all-zero probabilities."""
         state = encoder.encode_state(game_state)
-        mask = np.zeros(29407, dtype=np.float32)
+        mask = np.zeros(29914, dtype=np.float32)
         probs, _ = small_net.predict(state, mask)
         assert probs.sum() == 0.0
 
@@ -209,11 +209,11 @@ class TestPredict:
 
 class TestComputeLoss:
     def test_loss_is_positive_scalar(self, small_net):
-        x = torch.randn(4, 26, 13, 13)
+        x = torch.randn(4, 38, 13, 13)
         policy_logits, value_pred = small_net(x)
 
         # Create dummy targets
-        target_policy = torch.zeros(4, 29407)
+        target_policy = torch.zeros(4, 29914)
         target_policy[:, 0] = 1.0  # One-hot
         target_value = torch.zeros(4, 1)
 
@@ -226,10 +226,10 @@ class TestComputeLoss:
         assert val.item() >= 0
 
     def test_loss_backward_no_error(self, small_net):
-        x = torch.randn(2, 26, 13, 13)
+        x = torch.randn(2, 38, 13, 13)
         policy_logits, value_pred = small_net(x)
 
-        target_policy = torch.zeros(2, 29407)
+        target_policy = torch.zeros(2, 29914)
         target_policy[:, 5] = 1.0
         target_value = torch.tensor([[1.0], [-1.0]])
 
@@ -243,7 +243,7 @@ class TestComputeLoss:
         # Create deterministic small net
         torch.manual_seed(0)
         net = HiveNet(NetConfig(num_blocks=1, num_filters=16))
-        x = torch.randn(1, 26, 13, 13)
+        x = torch.randn(1, 38, 13, 13)
         policy_logits, value_pred = net(x)
 
         # Use the network's own output as target

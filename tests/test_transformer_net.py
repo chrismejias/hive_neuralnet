@@ -18,6 +18,9 @@ from hive_transformer.transformer_net import (
     TransformerConfig,
     TransformerPolicyHead,
     TransformerValueHead,
+    TransformerMobilityHead,
+    TransformerQueenSurroundHead,
+    TransformerFinalMobilityHead,
     HiveTransformer,
 )
 
@@ -67,7 +70,13 @@ class TestTransformerConfig:
         assert cfg.d_model == 128
         assert cfg.num_heads == 8
         assert cfg.num_layers == 6
-        assert cfg.action_space_size == 29407
+        assert cfg.action_space_size == 29914
+
+    def test_default_aux_heads_enabled(self):
+        cfg = TransformerConfig()
+        assert cfg.aux_mobility_enabled is True
+        assert cfg.aux_queen_surround_enabled is True
+        assert cfg.aux_final_mobility_enabled is True
 
     def test_small(self):
         cfg = TransformerConfig.small()
@@ -113,15 +122,79 @@ class TestTransformerValueHead:
         head = TransformerValueHead(32, GLOBAL_FEAT_DIM)
         cls_emb = torch.randn(2, 32)
         global_feat = torch.randn(2, GLOBAL_FEAT_DIM)
-        out = head(cls_emb, global_feat)
+        out, log_var = head(cls_emb, global_feat)
         assert out.shape == (2, 1)
+        assert log_var is None  # no uncertainty by default
 
     def test_output_range(self):
         head = TransformerValueHead(32, GLOBAL_FEAT_DIM)
         cls_emb = torch.randn(1, 32)
         global_feat = torch.randn(1, GLOBAL_FEAT_DIM)
-        out = head(cls_emb, global_feat)
+        out, _ = head(cls_emb, global_feat)
         assert -1.0 <= out.item() <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# TestAuxiliaryHeads
+# ---------------------------------------------------------------------------
+
+
+class TestAuxiliaryHeads:
+    def test_mobility_head_shape(self):
+        head = TransformerMobilityHead(32, aux_hidden=16)
+        x = torch.randn(5, 32)
+        out = head(x)
+        assert out.shape == (5, 1)
+
+    def test_queen_surround_head_shape(self):
+        head = TransformerQueenSurroundHead(32, aux_hidden=16)
+        x = torch.randn(5, 32)
+        out = head(x)
+        assert out.shape == (5, 2)
+
+    def test_final_mobility_head_shape(self):
+        head = TransformerFinalMobilityHead(32, aux_hidden=16)
+        x = torch.randn(5, 32)
+        out = head(x)
+        assert out.shape == (5, 1)
+
+    def test_heads_disabled(self):
+        cfg = TransformerConfig(
+            d_model=32, num_heads=4, num_layers=2, dim_feedforward=64,
+            aux_mobility_enabled=False,
+            aux_queen_surround_enabled=False,
+            aux_final_mobility_enabled=False,
+        )
+        net = HiveTransformer(cfg)
+        assert net.mobility_head is None
+        assert net.queen_surround_head is None
+        assert net.final_mobility_head is None
+
+        batch = _make_batch()
+        policy, value, aux = net(batch)
+        assert len(aux) == 0
+
+    def test_heads_enabled_produce_outputs(self):
+        net = HiveTransformer(SMALL_CFG)
+        batch = _make_batch()
+        policy, value, aux = net(batch)
+
+        assert "mobility_logits" in aux
+        assert "queen_surround_logits" in aux
+        assert "final_mobility_logits" in aux
+
+    def test_aux_output_shapes(self):
+        net = HiveTransformer(SMALL_CFG)
+        s1 = _make_sequence(3, 2)
+        s2 = _make_sequence(2, 1)
+        batch = HiveTokenBatch.collate([s1, s2])
+
+        _, _, aux = net(batch)
+
+        total_board = s1.num_board_tokens + s2.num_board_tokens  # 3 + 2 = 5
+        assert aux["mobility_logits"].shape == (total_board, 1)
+        assert aux["queen_surround_logits"].shape == (total_board, 2)
+        assert aux["final_mobility_logits"].shape == (total_board, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -133,16 +206,17 @@ class TestHiveTransformer:
     def test_forward_output_shapes(self):
         net = HiveTransformer(SMALL_CFG)
         batch = _make_batch()
-        policy, value = net(batch)
+        policy, value, aux = net(batch)
         B = batch.global_features.size(0)
         assert policy.shape == (B, SMALL_CFG.action_space_size)
         assert value.shape == (B, 1)
+        assert isinstance(aux, dict)
 
     def test_forward_single(self):
         net = HiveTransformer(SMALL_CFG)
         seq = _make_sequence(4, 2)
         batch = HiveTokenBatch.collate([seq])
-        policy, value = net(batch)
+        policy, value, aux = net(batch)
         assert policy.shape == (1, SMALL_CFG.action_space_size)
         assert value.shape == (1, 1)
 
@@ -151,7 +225,7 @@ class TestHiveTransformer:
         s1 = _make_sequence(1, 1)   # short
         s2 = _make_sequence(5, 3)   # long
         batch = HiveTokenBatch.collate([s1, s2])
-        policy, value = net(batch)
+        policy, value, aux = net(batch)
         assert policy.shape == (2, SMALL_CFG.action_space_size)
         assert value.shape == (2, 1)
 
@@ -160,14 +234,16 @@ class TestHiveTransformer:
         net = HiveTransformer(SMALL_CFG)
         seq = _make_sequence(0, 10)
         batch = HiveTokenBatch.collate([seq])
-        policy, value = net(batch)
+        policy, value, aux = net(batch)
         assert policy.shape == (1, SMALL_CFG.action_space_size)
         assert value.shape == (1, 1)
+        # No board tokens, so aux outputs should be empty
+        assert len(aux) == 0
 
     def test_value_in_range(self):
         net = HiveTransformer(SMALL_CFG)
         batch = _make_batch()
-        _, value = net(batch)
+        _, value, _ = net(batch)
         for v in value.flatten():
             assert -1.0 <= v.item() <= 1.0
 
@@ -175,8 +251,10 @@ class TestHiveTransformer:
         net = HiveTransformer(SMALL_CFG)
         net.train()
         batch = _make_batch()
-        policy, value = net(batch)
+        policy, value, aux = net(batch)
         loss = policy.sum() + value.sum()
+        for key in aux:
+            loss = loss + aux[key].sum()
         loss.backward()
         for name, param in net.named_parameters():
             if param.requires_grad:
@@ -219,6 +297,6 @@ class TestHiveTransformer:
         net = HiveTransformer(SMALL_CFG)
         seqs = [_make_sequence(2, 1), _make_sequence(4, 3), _make_sequence(1, 1)]
         batch = HiveTokenBatch.collate(seqs)
-        policy, value = net(batch)
+        policy, value, aux = net(batch)
         assert policy.shape == (3, SMALL_CFG.action_space_size)
         assert value.shape == (3, 1)

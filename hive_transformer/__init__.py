@@ -23,9 +23,13 @@ from hive_transformer.transformer_net import (
     HiveTransformer,
     TransformerPolicyHead,
     TransformerValueHead,
+    TransformerMobilityHead,
+    TransformerQueenSurroundHead,
+    TransformerFinalMobilityHead,
 )
 from hive_transformer.transformer_replay_buffer import (
     TransformerTrainingExample,
+    TransformerTrainingBatch,
     TokenReplayBuffer,
 )
 from hive_transformer.transformer_trainer import (
@@ -48,7 +52,11 @@ __all__ = [
     "HiveTransformer",
     "TransformerPolicyHead",
     "TransformerValueHead",
+    "TransformerMobilityHead",
+    "TransformerQueenSurroundHead",
+    "TransformerFinalMobilityHead",
     "TransformerTrainingExample",
+    "TransformerTrainingBatch",
     "TokenReplayBuffer",
     "TransformerTrainConfig",
     "TransformerTrainer",

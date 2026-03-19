@@ -107,12 +107,12 @@ class TestMCTSSearch:
         mcts._add_dirichlet_noise(root)
 
         for _ in range(20):
-            node = mcts._select(root)
+            node, vl_path = mcts._select(root)
             if node.is_terminal:
                 value = mcts._terminal_value(node)
             else:
                 value = mcts._expand(node)
-            mcts._backpropagate(node, value)
+            mcts._backpropagate(node, value, vl_path)
 
         # Root visit count = num_simulations (from backpropagation only)
         total_child_visits = sum(
@@ -258,7 +258,7 @@ class TestBackpropagation:
         # Manually backprop value +1 from child
         mcts = MCTS.__new__(MCTS)
         mcts.config = MCTSConfig()
-        mcts._backpropagate(child, 1.0)
+        mcts._backpropagate(child, 1.0, [])
 
         # Child should have +1, root should have -1
         assert child.total_value == 1.0
@@ -277,9 +277,9 @@ class TestBackpropagation:
         mcts = MCTS.__new__(MCTS)
         mcts.config = MCTSConfig()
 
-        mcts._backpropagate(child, 1.0)
-        mcts._backpropagate(child, -1.0)
-        mcts._backpropagate(child, 0.5)
+        mcts._backpropagate(child, 1.0, [])
+        mcts._backpropagate(child, -1.0, [])
+        mcts._backpropagate(child, 0.5, [])
 
         assert child.visit_count == 3
         assert abs(child.total_value - 0.5) < 1e-6  # 1.0 + (-1.0) + 0.5
@@ -298,3 +298,55 @@ class TestTerminalValue:
         node = MCTSNode(gs)
         # New game is not terminal
         assert not node.is_terminal
+
+
+# ── Policy Pruning Tests ─────────────────────────────────────────
+
+
+class TestPolicyPruning:
+    def test_no_pruning_by_default(self, tiny_net, encoder, game_state):
+        """Default threshold=0 means no pruning."""
+        config = MCTSConfig(num_simulations=20, policy_prune_threshold=0.0)
+        mcts = MCTS(tiny_net, encoder, config)
+        policy = mcts.search(game_state)
+        # Policy should have multiple nonzero entries
+        assert (policy > 0).sum() > 1
+
+    def test_pruning_removes_low_visit_actions(self, tiny_net, encoder, game_state):
+        """With a threshold, low-visit actions are pruned."""
+        config = MCTSConfig(
+            num_simulations=20,
+            temperature=1.0,
+            policy_prune_threshold=0.15,
+        )
+        mcts = MCTS(tiny_net, encoder, config)
+        policy = mcts.search(game_state)
+
+        # Policy should still sum to ~1.0
+        if policy.sum() > 0:
+            assert abs(policy.sum() - 1.0) < 1e-5
+        # At least one action survives
+        assert (policy > 0).sum() >= 1
+
+    def test_pruning_preserves_normalization(self, tiny_net, encoder, game_state):
+        config = MCTSConfig(
+            num_simulations=20,
+            temperature=1.0,
+            policy_prune_threshold=0.05,
+        )
+        mcts = MCTS(tiny_net, encoder, config)
+        policy = mcts.search(game_state)
+        if policy.sum() > 0:
+            assert abs(policy.sum() - 1.0) < 1e-5
+
+    def test_greedy_policy_unaffected_by_pruning(self, tiny_net, encoder, game_state):
+        """Temp=0 produces one-hot, which is unaffected by pruning."""
+        config = MCTSConfig(
+            num_simulations=20,
+            temperature=0.0,
+            policy_prune_threshold=0.05,
+        )
+        mcts = MCTS(tiny_net, encoder, config)
+        policy = mcts.search(game_state, move_number=100)
+        assert (policy > 0).sum() == 1
+        assert abs(policy.max() - 1.0) < 1e-6

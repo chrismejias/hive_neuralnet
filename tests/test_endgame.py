@@ -135,9 +135,9 @@ class TestEndgameEncoding:
         for _ in range(10):
             gs = generate_endgame(rng)
             tensor = encoder.encode_state(gs)
-            assert tensor.shape == (26, 13, 13)
+            assert tensor.shape == (38, 13, 13)
             # Piece channels should have some 1s (pieces exist)
-            assert tensor[:20].sum() > 0
+            assert tensor[:32].sum() > 0
 
     def test_endgame_legal_mask_valid(self, rng):
         """Legal action mask should have at least one legal action."""

@@ -21,10 +21,13 @@ from hive_engine.pieces import (
     Color,
     PieceType,
     Piece,
+    ExpansionConfig,
     create_player_pieces,
     PIECES_PER_PLAYER,
+    NO_EXPANSIONS,
 )
 from hive_engine.board import Board
+from hive_engine.move_gen import MoveGenCache
 
 
 class MoveType(IntEnum):
@@ -85,15 +88,16 @@ class GameState:
             state.apply_move(moves[0])  # or pick intelligently
     """
 
-    def __init__(self) -> None:
+    def __init__(self, expansions: ExpansionConfig | None = None) -> None:
         self.board = Board()
         self.turn: int = 0  # Incremented after each move (0 = White's first)
         self.result: GameResult = GameResult.IN_PROGRESS
+        self.expansions: ExpansionConfig = expansions or NO_EXPANSIONS
 
         # Pieces in each player's hand (not yet placed on the board)
         self._hands: dict[Color, list[Piece]] = {
-            Color.WHITE: create_player_pieces(Color.WHITE),
-            Color.BLACK: create_player_pieces(Color.BLACK),
+            Color.WHITE: create_player_pieces(Color.WHITE, self.expansions),
+            Color.BLACK: create_player_pieces(Color.BLACK, self.expansions),
         }
 
         # Track whether each player's queen is on the board
@@ -107,6 +111,8 @@ class GameState:
 
         # Legal moves cache (invalidated on apply_move / undo_move)
         self._legal_moves_cache: list[Move] | None = None
+        # Incremental move generation cache
+        self._move_gen_cache = MoveGenCache()
 
     @property
     def current_player(self) -> Color:
@@ -127,10 +133,12 @@ class GameState:
         gs.board = self.board.copy()
         gs.turn = self.turn
         gs.result = self.result
+        gs.expansions = self.expansions  # Frozen dataclass, no copy needed
         gs._hands = {c: list(h) for c, h in self._hands.items()}
         gs._queen_placed = dict(self._queen_placed)
         gs._history = []  # Don't copy history for rollouts
-        gs._legal_moves_cache = None  # Don't copy cache — copies diverge
+        gs._legal_moves_cache = None  # Don't copy cache -- copies diverge
+        gs._move_gen_cache = self._move_gen_cache.copy()
         return gs
 
     # ── Hand Management ─────────────────────────────────────────
@@ -222,6 +230,9 @@ class GameState:
             placeable_types = {PieceType.QUEEN}
         else:
             placeable_types = {p.piece_type for p in hand}
+            # Tournament rules: queen cannot be placed on player's first turn
+            if player_turn == 0:
+                placeable_types.discard(PieceType.QUEEN)
 
         # Get valid positions
         positions = self._get_placement_positions(color)
@@ -254,7 +265,7 @@ class GameState:
             return set(ORIGIN.neighbors()) & self._all_empty_neighbors()
 
         # Normal placement: adjacent to friendly, not adjacent to enemy
-        return self.board.valid_placement_positions(color)
+        return self._move_gen_cache.get_placement_positions(self.board, color)
 
     def _all_empty_neighbors(self) -> set[HexCoord]:
         """Return all empty positions adjacent to any occupied position."""
@@ -272,6 +283,9 @@ class GameState:
         # Find articulation points (pinned pieces)
         articulation_points = self.board.find_articulation_points()
 
+        # Track positions that have pillbug special ability for mosquito copying
+        pillbug_ability_positions: list[HexCoord] = []
+
         for piece in self.board.pieces_of_color(color):
             pos = self.board.position_of(piece)
             if pos is None:
@@ -281,15 +295,81 @@ class GameState:
             if not self.board.is_on_top(piece):
                 continue
 
+            # Track friendly pillbugs on top for special ability generation
+            if piece.piece_type == PieceType.PILLBUG:
+                pillbug_ability_positions.append(pos)
+
             # Check if piece is pinned (One Hive rule)
             # A piece is pinned if it's at an articulation point AND alone in its stack
             if pos in articulation_points and self.board.stack_height(pos) == 1:
                 continue
 
             # Generate type-specific destinations
-            destinations = self.board.generate_piece_moves(piece)
+            if piece.piece_type == PieceType.ANT:
+                destinations = self._move_gen_cache.get_ant_moves(
+                    self.board, pos
+                )
+            elif piece.piece_type == PieceType.SPIDER:
+                destinations = self._move_gen_cache.get_spider_moves(
+                    self.board, pos
+                )
+            else:
+                destinations = self.board.generate_piece_moves(piece)
             for dest in destinations:
                 moves.append(Move(MoveType.MOVE, piece, dest, from_pos=pos))
+
+        # ── Pillbug special ability: throw adjacent pieces ────────
+        # Pillbug can use special even if it's an AP, but NOT if under a beetle.
+        # We already filtered to on-top pillbugs above.
+        thrown_set: set[tuple[int, int, int, int]] = set()  # (piece hash, dest q, dest r) dedup
+
+        for pb_pos in pillbug_ability_positions:
+            throws = self.board.generate_pillbug_throws(pb_pos, articulation_points)
+            for target_piece, dest in throws:
+                target_pos = self.board.position_of(target_piece)
+                key = (hash(target_piece), dest.q, dest.r, target_pos.q if target_pos else 0)
+                if key not in thrown_set:
+                    thrown_set.add(key)
+                    moves.append(Move(
+                        MoveType.MOVE, target_piece, dest,
+                        from_pos=target_pos,
+                    ))
+
+        # ── Mosquito copying pillbug special ability ──────────────
+        # A friendly mosquito on the ground adjacent to any pillbug (either color)
+        # can use the pillbug's special throw ability.
+        for piece in self.board.pieces_of_color(color):
+            if piece.piece_type != PieceType.MOSQUITO:
+                continue
+            pos = self.board.position_of(piece)
+            if pos is None:
+                continue
+            if not self.board.is_on_top(piece):
+                continue
+            # Mosquito must be on the ground (not elevated) to copy pillbug
+            if self.board.stack_height(pos) > 1:
+                continue
+            # Check if adjacent to any pillbug (either color) on top
+            has_adjacent_pillbug = False
+            for n in pos.neighbors():
+                if n in self.board.grid:
+                    top = self.board.grid[n][-1]
+                    if top.piece_type == PieceType.PILLBUG:
+                        has_adjacent_pillbug = True
+                        break
+            if not has_adjacent_pillbug:
+                continue
+            # Generate throws from the mosquito's position
+            throws = self.board.generate_pillbug_throws(pos, articulation_points)
+            for target_piece, dest in throws:
+                target_pos = self.board.position_of(target_piece)
+                key = (hash(target_piece), dest.q, dest.r, target_pos.q if target_pos else 0)
+                if key not in thrown_set:
+                    thrown_set.add(key)
+                    moves.append(Move(
+                        MoveType.MOVE, target_piece, dest,
+                        from_pos=target_pos,
+                    ))
 
         return moves
 
@@ -308,13 +388,17 @@ class GameState:
             assert move.piece is not None and move.to is not None
             self._remove_from_hand(move.piece)
             self.board.place_piece(move.piece, move.to)
+            self._move_gen_cache.notify_place(self.board, move.piece, move.to)
             if move.piece.piece_type == PieceType.QUEEN:
                 self._queen_placed[move.piece.color] = True
             undo_info["placed"] = True
 
         elif move.move_type == MoveType.MOVE:
             assert move.piece is not None and move.to is not None
-            self.board.move_piece(move.piece, move.to)
+            old = self.board.move_piece(move.piece, move.to)
+            self._move_gen_cache.notify_move(
+                self.board, move.piece, old, move.to
+            )
             undo_info["placed"] = False
             undo_info["from_pos"] = move.from_pos
 
@@ -328,6 +412,7 @@ class GameState:
     def undo_move(self) -> Move:
         """Undo the last move. Returns the move that was undone."""
         self._legal_moves_cache = None  # Invalidate cache
+        self._move_gen_cache.invalidate()  # Full recompute on next query
         move, undo_info = self._history.pop()
         self.turn = undo_info["turn"]
         self.result = undo_info["result"]

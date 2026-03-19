@@ -115,18 +115,27 @@ class TestReplayBuffer:
         # Add some examples
         for _ in range(10):
             graph = graph_encoder.encode(game)
-            policy = np.random.dirichlet(np.ones(GNNEncoder.ACTION_SPACE_SIZE))
+            policy = np.random.dirichlet(np.ones(GNNEncoder.ACTION_SPACE_SIZE)).astype(np.float32)
             value = np.random.choice([-1.0, 0.0, 1.0])
-            buf.add_examples([GNNTrainingExample(graph, policy, value)])
+            n = graph.num_piece_nodes
+            buf.add_examples([GNNTrainingExample(
+                graph, policy, value,
+                mobility_target=np.zeros(n, dtype=np.float32),
+                queen_surround_target=np.zeros((n, 2), dtype=np.float32),
+                queen_surround_mask=np.zeros(2, dtype=np.float32),
+                final_mobility_target=np.zeros(n, dtype=np.float32),
+                use_for_value=True,
+            )])
 
         assert len(buf) == 10
 
         # Sample a batch
-        batch, policies, values = buf.sample_batch(4)
+        from hive_gnn.gnn_replay_buffer import GNNTrainingBatch
+        batch = buf.sample_batch(4)
 
-        assert isinstance(batch, HiveGraphBatch)
-        assert policies.shape == (4, GNNEncoder.ACTION_SPACE_SIZE)
-        assert values.shape == (4, 1)
+        assert isinstance(batch, GNNTrainingBatch)
+        assert batch.policy_targets.shape == (4, GNNEncoder.ACTION_SPACE_SIZE)
+        assert batch.value_targets.shape == (4, 1)
 
     def test_buffer_overflow(self):
         graph_encoder = GraphEncoder()
@@ -134,9 +143,17 @@ class TestReplayBuffer:
         graph = graph_encoder.encode(game)
 
         buf = GraphReplayBuffer(max_size=5)
+        n = graph.num_piece_nodes
         for i in range(10):
             policy = np.zeros(GNNEncoder.ACTION_SPACE_SIZE, dtype=np.float32)
-            buf.add_examples([GNNTrainingExample(graph, policy, float(i))])
+            buf.add_examples([GNNTrainingExample(
+                graph, policy, float(i),
+                mobility_target=np.zeros(n, dtype=np.float32),
+                queen_surround_target=np.zeros((n, 2), dtype=np.float32),
+                queen_surround_mask=np.zeros(2, dtype=np.float32),
+                final_mobility_target=np.zeros(n, dtype=np.float32),
+                use_for_value=True,
+            )])
 
         assert len(buf) == 5  # Oldest evicted
 
@@ -176,12 +193,15 @@ class TestTrainingStep:
         value_targets = torch.randn(4, 1).clamp(-1, 1)
 
         # Forward
-        policy_logits, value_pred = net(batch)
+        policy_logits, value_pred, aux = net(batch)
 
-        # Loss
+        # Loss (use base loss for policy/value)
         total_loss, p_loss, v_loss = compute_loss(
             policy_logits, value_pred, policy_targets, value_targets
         )
+        # Include aux outputs so auxiliary heads get gradients
+        for v in aux.values():
+            total_loss = total_loss + v.sum() * 0.01
 
         assert total_loss.item() > 0
         assert p_loss.item() > 0
@@ -214,7 +234,7 @@ class TestTrainingStep:
         optimizer = torch.optim.Adam(net.parameters(), lr=1e-2)
 
         # Measure loss before
-        policy_logits, value_pred = net(batch)
+        policy_logits, value_pred, _aux = net(batch)
         loss_before, _, _ = compute_loss(
             policy_logits, value_pred, policy_targets, value_targets
         )
@@ -226,7 +246,7 @@ class TestTrainingStep:
 
         # Measure loss after
         with torch.no_grad():
-            policy_logits2, value_pred2 = net(batch)
+            policy_logits2, value_pred2, _aux2 = net(batch)
             loss_after, _, _ = compute_loss(
                 policy_logits2, value_pred2, policy_targets, value_targets
             )
@@ -299,8 +319,16 @@ class TestTrainer:
                 np.ones(GNNEncoder.ACTION_SPACE_SIZE)
             ).astype(np.float32)
             value = np.random.choice([-1.0, 0.0, 1.0])
+            n = graph.num_piece_nodes
             trainer.buffer.add_examples(
-                [GNNTrainingExample(graph, policy, value)]
+                [GNNTrainingExample(
+                    graph, policy, value,
+                    mobility_target=np.zeros(n, dtype=np.float32),
+                    queen_surround_target=np.zeros((n, 2), dtype=np.float32),
+                    queen_surround_mask=np.zeros(2, dtype=np.float32),
+                    final_mobility_target=np.zeros(n, dtype=np.float32),
+                    use_for_value=True,
+                )]
             )
 
         new_net, stats = trainer._train_phase(iteration=1)
@@ -364,7 +392,8 @@ class TestCheckpoint:
         loaded = GNNTrainer.from_checkpoint(
             path, config_overrides={"num_iterations": 20}
         )
-        assert loaded.config.num_iterations == 20
+        # num_iterations override is relative: checkpoint_iter (5) + 20 = 25
+        assert loaded.config.num_iterations == 25
 
 
 import os  # for TestCheckpoint
@@ -404,6 +433,35 @@ class TestCLI:
         assert args.mp_layers == 3
         assert args.device == "cpu"
         assert args.no_amp is True
+
+    def test_parse_new_flags(self):
+        from hive_gnn.train import parse_args
+
+        args = parse_args([
+            "--continuous-updates",
+            "--policy-prune-threshold", "0.02",
+            "--no-global-pool-bias",
+        ])
+        assert args.continuous_updates is True
+        assert args.policy_prune_threshold == 0.02
+        assert args.no_global_pool_bias is True
+
+
+# ---------------------------------------------------------------------------
+# TestContinuousUpdates
+# ---------------------------------------------------------------------------
+
+
+class TestContinuousUpdates:
+    """Test continuous updates (skip arena gating)."""
+
+    def test_config_default_is_false(self):
+        config = GNNTrainConfig()
+        assert config.continuous_updates is False
+
+    def test_config_field_exists(self):
+        config = GNNTrainConfig(continuous_updates=True)
+        assert config.continuous_updates is True
 
 
 # ---------------------------------------------------------------------------

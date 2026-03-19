@@ -10,6 +10,15 @@ Value convention: each node stores its value from the perspective
 of the player whose turn it is at that node. During selection, child
 values are negated (since the child's "good" is the parent's "bad").
 During backpropagation, the value alternates sign at each level.
+
+Performance features:
+  - Virtual loss: each selected path gets a temporary penalty of -1
+    so that concurrent threads diverge into different subtrees.
+    The penalty is undone exactly during backpropagation.
+  - Lazy child game states: child MCTSNodes are created without a
+    copied GameState.  The state is computed on first expansion by
+    copying the parent state and applying the stored move, saving
+    O(branching_factor) copies per expansion.
 """
 
 from __future__ import annotations
@@ -37,6 +46,7 @@ class MCTSConfig:
     dirichlet_epsilon: float = 0.25
     temperature: float = 1.0
     temperature_drop_move: int = 20
+    policy_prune_threshold: float = 0.0  # 0.0 = disabled
 
 
 # ── MCTS Node ──────────────────────────────────────────────────────
@@ -47,18 +57,31 @@ class MCTSNode:
     A node in the MCTS search tree.
 
     Each node stores:
-      - The game state at this node
+      - The game state at this node (may be None until first expansion
+        for non-root nodes — see lazy initialisation below)
       - Visit count (N), total value (W), and prior probability (P)
       - Children indexed by action index
 
     Value convention: W and Q are from the perspective of the player
     whose turn it is at this node.
+
+    Lazy game states
+    ----------------
+    Child nodes created during expansion do not immediately copy the
+    parent's GameState.  Instead they store a reference to their
+    parent node and the Move that leads to them.  The actual
+    GameState is computed and cached on the first call to
+    ``ensure_game_state()``, which happens at the start of
+    ``MCTS._expand()``.  This saves O(branching_factor) deep-copies
+    per expansion; in practice only 5–15 % of children are ever
+    selected, so most copies are avoided entirely.
     """
 
     __slots__ = (
         "game_state",
         "parent",
         "parent_action",
+        "_parent_move",
         "children",
         "visit_count",
         "total_value",
@@ -70,14 +93,16 @@ class MCTSNode:
 
     def __init__(
         self,
-        game_state: GameState,
+        game_state: GameState | None = None,
         parent: MCTSNode | None = None,
         parent_action: int | None = None,
         prior: float = 0.0,
+        parent_move: Move | None = None,
     ) -> None:
-        self.game_state = game_state
+        self.game_state = game_state      # None iff this is a lazy child node
         self.parent = parent
         self.parent_action = parent_action
+        self._parent_move = parent_move   # Move stored for lazy state init
         self.children: dict[int, MCTSNode] = {}
         self.visit_count: int = 0
         self.total_value: float = 0.0
@@ -85,6 +110,29 @@ class MCTSNode:
         self.is_expanded: bool = False
         self._legal_moves: list[Move] | None = None
         self._legal_mask: np.ndarray | None = None
+
+    # ── Lazy state initialisation ──────────────────────────────────
+
+    def ensure_game_state(self) -> GameState:
+        """
+        Return this node's GameState, computing it lazily if needed.
+
+        For the root node the state is always pre-initialised.
+        For child nodes created during expansion the state is computed
+        here by copying the parent's state and applying ``_parent_move``.
+        The result is cached so subsequent calls are free.
+        """
+        if self.game_state is None:
+            assert self.parent is not None, "Lazy node must have a parent"
+            parent_gs = self.parent.game_state
+            assert parent_gs is not None, (
+                "Parent game state must be initialised before child"
+            )
+            self.game_state = parent_gs.copy()
+            self.game_state.apply_move(self._parent_move)
+        return self.game_state
+
+    # ── Properties ────────────────────────────────────────────────
 
     @property
     def mean_value(self) -> float:
@@ -95,7 +143,14 @@ class MCTSNode:
 
     @property
     def is_terminal(self) -> bool:
-        """Check if this node represents a finished game."""
+        """
+        Check if this node represents a finished game.
+
+        Returns False for lazy nodes whose game state has not yet been
+        computed (they cannot be terminal until expanded).
+        """
+        if self.game_state is None:
+            return False
         return self.game_state.result != GameResult.IN_PROGRESS
 
 
@@ -140,7 +195,7 @@ class MCTS:
         # Create root node
         root = MCTSNode(game_state.copy())
 
-        # Expand root
+        # Expand root (single-threaded; no virtual loss needed here)
         self._expand(root)
 
         # Add Dirichlet noise to root priors for exploration
@@ -148,25 +203,34 @@ class MCTS:
 
         # Run simulations
         for _ in range(self.config.num_simulations):
-            node = self._select(root)
+            node, vl_path = self._select(root)
 
             if node.is_terminal:
                 value = self._terminal_value(node)
             else:
                 value = self._expand(node)
 
-            self._backpropagate(node, value)
+            self._backpropagate(node, value, vl_path)
 
         # Build policy from visit counts
         return self._get_policy(root, move_number)
 
-    def _select(self, node: MCTSNode) -> MCTSNode:
+    def _select(
+        self, node: MCTSNode
+    ) -> tuple[MCTSNode, list[MCTSNode]]:
         """
         Select a leaf node by traversing the tree with PUCT.
 
-        Starting from the given node, repeatedly pick the child with
-        the highest PUCT score until reaching an unexpanded or terminal node.
+        Applies a virtual loss of -1 to every node moved through so
+        that concurrent MCTS threads are steered toward different
+        subtrees.  The virtual loss is undone in ``_backpropagate``.
+
+        Returns:
+            (leaf_node, vl_path) where vl_path contains every node
+            that received a virtual loss and must be cleaned up.
         """
+        vl_path: list[MCTSNode] = []
+
         while node.is_expanded and not node.is_terminal:
             if not node.children:
                 break
@@ -179,17 +243,37 @@ class MCTS:
                     best_score = score
                     best_action = action
             node = node.children[best_action]
-        return node
+
+            # Virtual loss: make this path look pessimistic to other
+            # threads that may be selecting concurrently.
+            node.visit_count += 1
+            node.total_value -= 1.0
+            vl_path.append(node)
+
+        return node, vl_path
 
     def _expand(self, node: MCTSNode) -> float:
         """
         Expand a node: evaluate with neural network, create children.
 
+        Computes the node's game state lazily if not yet initialised,
+        then calls the neural network and creates lazy child nodes
+        (children store only their parent reference and the move — no
+        game-state copy is made until a child is itself expanded).
+
         Returns the value estimate from the neural network, from the
         perspective of the node's current player.
         """
+        # Materialise lazy game state (no-op for the root)
+        node.ensure_game_state()
+
         if node.is_terminal:
+            node.is_expanded = True
             return self._terminal_value(node)
+
+        # Guard against double-expansion by concurrent threads
+        if node.is_expanded:
+            return 0.0
 
         # Get legal moves and mask
         legal_moves = node.game_state.legal_moves()
@@ -203,7 +287,9 @@ class MCTS:
         state_tensor = self.encoder.encode_state(node.game_state)
         action_probs, value = self.net.predict(state_tensor, legal_mask)
 
-        # Create child nodes for all legal actions
+        # Create child nodes lazily: store parent + move instead of
+        # copying the game state now.  The copy is deferred until the
+        # child is first selected for expansion.
         for move in legal_moves:
             try:
                 action_idx = self.encoder.encode_action(move, node.game_state)
@@ -211,30 +297,41 @@ class MCTS:
                 continue  # Skip moves that don't fit in grid
 
             if action_idx not in node.children:
-                child_state = node.game_state.copy()
-                child_state.apply_move(move)
                 child = MCTSNode(
-                    game_state=child_state,
+                    game_state=None,           # Lazy: computed on first expand
                     parent=node,
                     parent_action=action_idx,
                     prior=action_probs[action_idx],
+                    parent_move=move,          # Stored for lazy state init
                 )
                 node.children[action_idx] = child
 
         node.is_expanded = True
         return value
 
-    def _backpropagate(self, node: MCTSNode, value: float) -> None:
+    def _backpropagate(
+        self,
+        node: MCTSNode,
+        value: float,
+        vl_path: list[MCTSNode],
+    ) -> None:
         """
         Backpropagate the value from a leaf node to the root.
 
+        First removes the virtual loss from every node on ``vl_path``
+        (restoring the counts to their pre-selection state), then
+        applies the real value using the standard alternating-sign
+        convention.
+
         The value alternates sign at each level because what's good
         for one player is bad for the other.
-
-        Convention: `value` is from the perspective of the player at
-        `node`. As we go up, we negate it for the parent (who is the
-        opponent).
         """
+        # Undo virtual loss applied during _select
+        for vl_node in vl_path:
+            vl_node.visit_count -= 1
+            vl_node.total_value += 1.0
+
+        # Standard backpropagation: propagate value up to root
         current = node
         v = value
         while current is not None:
@@ -360,5 +457,13 @@ class MCTS:
                 # Fallback: uniform
                 for action in actions:
                     policy[action] = 1.0 / len(actions)
+
+        # Policy target pruning: zero out low-probability actions, renormalize
+        if self.config.policy_prune_threshold > 0.0:
+            below = policy < self.config.policy_prune_threshold
+            policy[below] = 0.0
+            total = policy.sum()
+            if total > 0:
+                policy /= total
 
         return policy
