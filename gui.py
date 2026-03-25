@@ -849,10 +849,12 @@ def load_checkpoint(
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     net_config = ckpt["net_config"]
     elo = ckpt.get("elo_rating", 0)
+    # GPU trainer saves as "model_state_dict"; CPU trainers use "net_state_dict"
+    state_dict_key = "model_state_dict" if "model_state_dict" in ckpt else "net_state_dict"
 
     if isinstance(net_config, NNUEConfig):
         net = HiveNNUE(net_config)
-        net.load_state_dict(ckpt["net_state_dict"])
+        net.load_state_dict(ckpt[state_dict_key])
         net = net.to(device)
         net.eval()
         encoder = NNUEEncoder()
@@ -861,7 +863,7 @@ def load_checkpoint(
         print(f"  Architecture: hidden_dims={net_config.hidden_dims}")
     elif isinstance(net_config, TransformerConfig):
         net = HiveTransformer(net_config)
-        net.load_state_dict(ckpt["net_state_dict"], strict=False)
+        net.load_state_dict(ckpt[state_dict_key], strict=False)
         net = net.to(device)
         net.eval()
         encoder = TransformerEncoder()
@@ -876,7 +878,7 @@ def load_checkpoint(
         )
     else:
         net = HiveGNN(net_config)
-        net.load_state_dict(ckpt["net_state_dict"])
+        net.load_state_dict(ckpt[state_dict_key])
         net = net.to(device)
         net.eval()
         encoder = GNNEncoder()

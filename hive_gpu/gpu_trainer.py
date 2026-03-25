@@ -6,9 +6,9 @@ train → arena → promote pipeline as hive_engine/trainer.py.
 
 Usage:
     from hive_gpu.gpu_trainer import GPUTrainer, GPUTrainConfig
-    from hive_gnn.gnn_net import GNNNetConfig, HiveGNN
+    from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
 
-    trainer = GPUTrainer(GPUTrainConfig(), GNNNetConfig.small())
+    trainer = GPUTrainer(GPUTrainConfig(), TransformerConfig.small(), HiveTransformer)
     trainer.run()
 """
 
@@ -31,11 +31,13 @@ from hive_engine.game_state import GameState, GameResult
 from hive_engine.neural_net import compute_gnn_loss, compute_transformer_loss
 from hive_engine.pieces import Color
 
-from hive_gnn.gnn_encoder import GNNEncoder
-from hive_gnn.gnn_replay_buffer import (
-    GNNTrainingExample,
-    GraphReplayBuffer,
-)
+try:
+    from hive_gnn.gnn_encoder import GNNEncoder
+    from hive_gnn.gnn_replay_buffer import GNNTrainingExample, GraphReplayBuffer
+except ImportError:
+    GNNEncoder = None          # type: ignore[assignment,misc]
+    GNNTrainingExample = None  # type: ignore[assignment,misc]
+    GraphReplayBuffer = None   # type: ignore[assignment,misc]
 from hive_transformer.transformer_replay_buffer import (
     TransformerTrainingExample,
     TokenReplayBuffer,
@@ -66,9 +68,9 @@ class GPUTrainConfig:
     dirichlet_epsilon: float = 0.25
 
     # Training
-    batch_size: int = 64
-    num_epochs: int = 5
-    learning_rate: float = 1e-3
+    batch_size: int = 256
+    num_epochs: int = 2
+    learning_rate: float = 2e-4
     weight_decay: float = 1e-4
 
     # Replay buffer
@@ -83,8 +85,8 @@ class GPUTrainConfig:
     checkpoint_dir: str = "checkpoints"
 
     # LR scheduling
-    lr_schedule: str = "constant"
-    lr_warmup_iterations: int = 0
+    lr_schedule: str = "cosine"
+    lr_warmup_iterations: int = 3
     lr_min: float = 1e-5
 
     # Gradient clipping
@@ -104,15 +106,30 @@ class GPUTrainConfig:
     nn_max_batch: int = 0      # max NN batch size per forward pass (0 = no limit)
 
     # Playout cap randomization (KataGo-style)
-    playout_cap_randomize: bool = False
+    playout_cap_randomize: bool = True
     playout_cap_randomize_prob: float = 0.25   # prob of full playouts; else fast
     playout_cap_fast_sims: int = 0             # 0 = auto (num_simulations // 8)
 
     # Arena / promotion
-    skip_arena: bool = False   # always accept new model, skip arena games
+    skip_arena: bool = True    # always accept new model, skip arena games
 
     # Policy softening (KataGo-style)
-    policy_softening: float = 0.0   # mix weight toward uniform over legal moves
+    policy_softening: float = 0.03  # mix weight toward uniform over legal moves
+
+    # Policy surprise weighting (KataGo-style)
+    policy_surprise_weight: float = 1.0  # scale for KL-based sample weighting (0=off)
+
+    # Monte Carlo Graph Search (DAG with transposition detection)
+    use_mcgs: bool = False  # use MCGS instead of tree MCTS (opt-in via --mcgs)
+
+    # Policy target pruning
+    policy_target_pruning: float = 0.02  # zero out visits below this fraction of max
+
+    # Root policy temperature (soften NN prior at root before Dirichlet noise)
+    root_policy_temp: float = 1.1  # >1 = softer prior distribution
+
+    # Shaped Dirichlet noise (scale alpha inversely with number of legal moves)
+    shaped_dirichlet: bool = True
 
 
 # ── GPU Trainer ────────────────────────────────────────────────────────
@@ -185,9 +202,24 @@ class GPUTrainer:
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
+    def _cuda_reset(self) -> None:
+        """Full CUDA reset after an error — re-initialize the device."""
+        if self.device.type == "cuda":
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+            gc.collect()
+            # Move model back to device to ensure clean state
+            self.best_net = self.best_net.cpu()
+            torch.cuda.empty_cache()
+            self.best_net = self.best_net.to(self.device)
+
     def run(self) -> None:
         """Run the full GPU training loop."""
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        max_cuda_retries = 2
 
         for iteration in range(
             self._start_iteration, self.config.num_iterations + 1
@@ -199,24 +231,58 @@ class GPUTrainer:
             print(f"Iteration {iteration}/{self.config.num_iterations}")
             print(f"{'='*60}")
 
-            # 1. Self-play
+            # 1. Self-play (with CUDA error recovery)
             t0 = time.time()
-            new_examples, sp_stats = self._self_play_phase()
+            new_examples = None
+            sp_stats = None
+            for cuda_attempt in range(max_cuda_retries + 1):
+                try:
+                    new_examples, sp_stats = self._self_play_phase()
+                    break
+                except (RuntimeError, torch.cuda.CudaError, torch.AcceleratorError) as e:
+                    err_msg = str(e).lower()
+                    if "cuda" not in err_msg and "illegal" not in err_msg:
+                        raise
+                    print(
+                        f"  [!] CUDA error in self-play (attempt "
+                        f"{cuda_attempt + 1}/{max_cuda_retries + 1}): {e}"
+                    )
+                    self._cuda_reset()
+                    if cuda_attempt >= max_cuda_retries:
+                        print("  [!] Skipping iteration due to CUDA errors.")
+                        break
+
+            if new_examples is None:
+                continue
+
             self.buffer.add_examples(new_examples)
             sp_time = time.time() - t0
-            print(
+            sp_line = (
                 f"  Self-play: {len(new_examples)} examples from "
                 f"{sp_stats['num_games']} games "
                 f"(W:{sp_stats['white_wins']} B:{sp_stats['black_wins']} "
                 f"D:{sp_stats['draws']}, {sp_time:.1f}s)"
             )
+            if "transposition_hits" in sp_stats:
+                sp_line += (
+                    f"\n  MCGS: {sp_stats['transposition_hits']} transpositions, "
+                    f"{sp_stats['nn_evals']} NN evals, "
+                    f"{sp_stats['dag_nodes']} DAG nodes"
+                )
+            print(sp_line)
             self._cuda_cleanup()
 
             # 2. Train
             t0 = time.time()
-            new_net, train_loss = self._train_phase(iteration)
+            new_net, train_loss, loss_components = self._train_phase(iteration)
             train_time = time.time() - t0
+            comp_str = " | ".join(
+                f"{k}={v:.4f}" for k, v in loss_components.items()
+                if k != "total_loss"
+            )
             print(f"  Training: loss={train_loss:.4f}, {train_time:.1f}s")
+            if comp_str:
+                print(f"    [{comp_str}]")
             self._cuda_cleanup()
 
             # 3. Arena / promotion
@@ -264,6 +330,9 @@ class GPUTrainer:
         """Run GPU-accelerated self-play, returning training examples."""
         cfg = self.config
 
+        # All games run in parallel from start to finish (no slot recycling).
+        parallel_slots = cfg.games_per_batch
+
         mcts_config = GPUMCTSConfig(
             num_simulations=cfg.mcts_simulations,
             c_puct=cfg.c_puct,
@@ -271,7 +340,8 @@ class GPUTrainer:
             dirichlet_epsilon=cfg.dirichlet_epsilon,
             temperature=cfg.temperature,
             temperature_drop_move=cfg.temperature_drop_move,
-            batch_size=cfg.games_per_batch,
+            batch_size=parallel_slots,
+            games_per_batch=cfg.games_per_batch,
             max_game_length=cfg.max_game_length,
             encoder_type=cfg.encoder_type,
             wave_size=cfg.wave_size,
@@ -279,10 +349,17 @@ class GPUTrainer:
             playout_cap_randomize=cfg.playout_cap_randomize,
             playout_cap_randomize_prob=cfg.playout_cap_randomize_prob,
             playout_cap_fast_sims=cfg.playout_cap_fast_sims,
+            policy_target_pruning=cfg.policy_target_pruning,
+            root_policy_temp=cfg.root_policy_temp,
+            shaped_dirichlet=cfg.shaped_dirichlet,
         )
 
         self.best_net.eval()
-        orchestrator = GPUMCTSOrchestrator(self.best_net, mcts_config)
+        if cfg.use_mcgs:
+            from hive_gpu.gpu_mcgs import MCGSOrchestrator
+            orchestrator = MCGSOrchestrator(self.best_net, mcts_config)
+        else:
+            orchestrator = GPUMCTSOrchestrator(self.best_net, mcts_config)
         is_transformer = cfg.encoder_type == "transformer"
 
         all_examples: list = []
@@ -298,6 +375,10 @@ class GPUTrainer:
 
             for game_examples in batch_examples:
                 for ex in game_examples:
+                    # Compute surprise weight from KL(MCTS || NN_prior)
+                    sw = self._compute_surprise_weight(
+                        ex.policy_target, ex.nn_prior, cfg.policy_surprise_weight
+                    )
                     if is_transformer:
                         converted = TransformerTrainingExample(
                             sequence=ex.sequence,
@@ -308,6 +389,7 @@ class GPUTrainer:
                             queen_surround_mask=ex.queen_surround_mask,
                             final_mobility_target=ex.final_mobility_target,
                             use_for_value=True,
+                            surprise_weight=sw,
                         )
                     else:
                         converted = GNNTrainingExample(
@@ -319,6 +401,7 @@ class GPUTrainer:
                             queen_surround_mask=ex.queen_surround_mask,
                             final_mobility_target=ex.final_mobility_target,
                             use_for_value=True,
+                            surprise_weight=sw,
                         )
                     all_examples.append(converted)
 
@@ -334,7 +417,43 @@ class GPUTrainer:
                 else:
                     stats["draws"] += 1
 
+        # Add MCGS stats if available
+        if hasattr(orchestrator, "total_transposition_hits"):
+            stats["transposition_hits"] = orchestrator.total_transposition_hits
+            stats["nn_evals"] = orchestrator.total_nn_evals
+            stats["dag_nodes"] = orchestrator.total_dag_nodes
+
         return all_examples, stats
+
+    @staticmethod
+    def _compute_surprise_weight(
+        mcts_policy: np.ndarray,
+        nn_prior: np.ndarray | None,
+        scale: float,
+    ) -> float:
+        """Compute KL-based surprise weight for a training example.
+
+        Returns max(0.1, 1.0 + scale * KL(mcts || nn_prior)) so that
+        positions where MCTS heavily disagrees with the NN get sampled
+        more frequently.  A floor of 0.1 ensures no position is fully
+        ignored.  If nn_prior is None or scale <= 0, returns 1.0.
+        """
+        if nn_prior is None or scale <= 0:
+            return 1.0
+
+        # Only consider actions with non-zero MCTS probability
+        mask = mcts_policy > 0
+        if not mask.any():
+            return 1.0
+
+        p = mcts_policy[mask]
+        q = nn_prior[mask]
+
+        # Clamp q to avoid log(0)
+        q = np.clip(q, 1e-8, 1.0)
+
+        kl = float(np.sum(p * np.log(p / q)))
+        return max(0.1, 1.0 + scale * kl)
 
     # ── Training ───────────────────────────────────────────────────────
 
@@ -353,10 +472,11 @@ class GPUTrainer:
         )
 
         if len(self.buffer) < self.config.batch_size:
-            return new_net, 0.0
+            return new_net, 0.0, {}
 
         is_transformer = self.config.encoder_type == "transformer"
         total_loss_sum = 0.0
+        component_sums: dict[str, float] = {}
         num_batches = 0
 
         for epoch in range(self.config.num_epochs):
@@ -446,9 +566,13 @@ class GPUTrainer:
                     optimizer.step()
 
                 total_loss_sum += total_loss.item()
+                for k, v in loss_dict.items():
+                    component_sums[k] = component_sums.get(k, 0.0) + v.item()
                 num_batches += 1
 
-        return new_net, total_loss_sum / max(num_batches, 1)
+        n = max(num_batches, 1)
+        avg_components = {k: v / n for k, v in component_sums.items()}
+        return new_net, total_loss_sum / n, avg_components
 
     # ── Arena ──────────────────────────────────────────────────────────
 
@@ -565,5 +689,8 @@ class GPUTrainer:
         trainer.best_net.load_state_dict(checkpoint["model_state_dict"])
         trainer.best_net = trainer.best_net.to(trainer.device)
         trainer._start_iteration = iteration + 1
+        # Treat num_iterations as additional iterations when resuming.
+        # e.g. --iterations 30 resumed from checkpoint 28 → runs iters 29-58.
+        trainer.config.num_iterations = iteration + train_config.num_iterations
 
         return trainer

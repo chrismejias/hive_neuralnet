@@ -23,7 +23,10 @@ import numpy as np
 import torch
 
 import hive_gpu
-from hive_gnn.graph_types import HiveGraph
+try:
+    from hive_gnn.graph_types import HiveGraph
+except ImportError:
+    HiveGraph = None  # type: ignore[assignment,misc]
 from hive_gpu.gpu_encoder import GPUGNNEncoder, GPUTransformerEncoder
 from hive_transformer.token_types import HiveTokenSequence
 
@@ -41,7 +44,8 @@ class GPUMCTSConfig:
     dirichlet_epsilon: float = 0.25
     temperature: float = 1.0
     temperature_drop_move: int = 20
-    batch_size: int = 64
+    batch_size: int = 64       # B: number of parallel GPU game slots
+    games_per_batch: int = 0   # target games per self-play call (0 = same as batch_size)
     max_game_length: int = 300
     encoder_type: str = "gnn"  # "gnn" or "transformer"
     expansion_mask: int = 0    # 3-bit: bit 0=Mosquito, 1=Ladybug, 2=Pillbug
@@ -49,9 +53,21 @@ class GPUMCTSConfig:
     nn_max_batch: int = 0      # max NN batch size (0 = no limit)
 
     # Playout cap randomization (KataGo-style)
-    playout_cap_randomize: bool = False
+    playout_cap_randomize: bool = True
     playout_cap_randomize_prob: float = 0.25   # prob of full playouts; else fast
     playout_cap_fast_sims: int = 0             # 0 = auto (num_simulations // 8)
+
+    # Policy target pruning (zero out visits below threshold fraction of max)
+    policy_target_pruning: float = 0.02
+
+    # Root policy temperature (soften NN prior before Dirichlet noise)
+    root_policy_temp: float = 1.1
+
+    # Shaped Dirichlet noise (scale alpha inversely with legal move count)
+    shaped_dirichlet: bool = True
+
+    # MCGS DAG node cap per game (prevents OOM from unbounded DAG growth)
+    max_dag_nodes: int = 50_000
 
 
 # ── Training Example ──────────────────────────────────────────────────
@@ -68,6 +84,7 @@ class GPUTrainingExample(NamedTuple):
     queen_surround_mask: np.ndarray      # (2,) float32
     final_mobility_target: np.ndarray    # (num_board_nodes,) float32
     sequence: HiveTokenSequence | None = None  # Transformer token sequence (None for GNN path)
+    nn_prior: np.ndarray | None = None   # NN policy prior for surprise weighting
 
 
 # ── MCTS Node (CPU-side, no GameState) ─────────────────────────────────
@@ -178,8 +195,8 @@ class GPUMCTSOrchestrator:
         # Game tracking
         active = [True] * B
         move_numbers = [0] * B
-        # Per-game history: list of (graph, policy, player_turn, mobility, seq_or_none) tuples
-        histories: list[list[tuple[HiveGraph, np.ndarray, int, np.ndarray, HiveTokenSequence | None]]] = [
+        # Per-game history: list of (graph, policy, turn, mobility, seq, nn_prior) tuples
+        histories: list[list[tuple[HiveGraph, np.ndarray, int, np.ndarray, HiveTokenSequence | None, np.ndarray | None]]] = [
             [] for _ in range(B)
         ]
 
@@ -202,7 +219,7 @@ class GPUMCTSOrchestrator:
             # _batched_mcts returns root graphs (from the _expand_roots encode call),
             # optional token sequences (transformer path only), and trees (for cached
             # action→move_bytes lookup).
-            policies, graphs, seqs, trees = self._batched_mcts(
+            policies, graphs, seqs, trees, nn_priors = self._batched_mcts(
                 root_states, B, active, move_numbers, num_sims=num_sims
             )
 
@@ -223,11 +240,11 @@ class GPUMCTSOrchestrator:
                 policy = policies[i]
                 turn = current_turns[i]
 
-                # Record (graph, policy, turn, mobility, seq_or_none).
+                # Record (graph, policy, turn, mobility, seq, nn_prior).
                 # With playout cap randomization, only record full-playout moves.
                 if use_full:
                     mob_i = mob_np[i, :mob_board_counts[i]].copy()
-                    histories[i].append((graphs[i], policy.copy(), turn, mob_i, seqs[i]))
+                    histories[i].append((graphs[i], policy.copy(), turn, mob_i, seqs[i], nn_priors[i]))
 
                 # Select action
                 if move_numbers[i] >= cfg.temperature_drop_move:
@@ -299,7 +316,7 @@ class GPUMCTSOrchestrator:
         active: list[bool],
         move_numbers: list[int],
         num_sims: int | None = None,
-    ) -> tuple[list[np.ndarray], list[HiveGraph], list[HiveTokenSequence | None], list[GPUMCTSNode | None]]:
+    ) -> tuple[list[np.ndarray], list[HiveGraph], list[HiveTokenSequence | None], list[GPUMCTSNode | None], list[np.ndarray | None]]:
         """
         Run num_simulations of batched MCTS.
 
@@ -310,9 +327,9 @@ class GPUMCTSOrchestrator:
             move_numbers: current move number per game
 
         Returns:
-            (policies, root_graphs, root_seqs, trees): List of B policy vectors,
-            list of B HiveGraph objects, list of B HiveTokenSequence (or None for
-            GNN path), and list of B MCTS trees (for cached action→move_bytes lookup).
+            (policies, root_graphs, root_seqs, trees, nn_priors): List of B
+            policy vectors, HiveGraph objects, HiveTokenSequence (or None for
+            GNN path), MCTS trees, and NN policy priors (for surprise weighting).
         """
         cfg = self.config
         if num_sims is None:
@@ -324,9 +341,19 @@ class GPUMCTSOrchestrator:
         # Expand all roots first; returns root-state graphs (and sequences for transformer)
         root_graphs, root_seqs = self._expand_roots(root_states, B, trees, active)
 
-        # Add Dirichlet noise to root priors
+        # Extract NN priors BEFORE temperature/noise modification (for surprise weighting)
+        nn_priors: list[np.ndarray | None] = [None] * B
+        for i in range(B):
+            if trees[i] is not None and trees[i].children:
+                prior = np.zeros(self._action_space_size, dtype=np.float32)
+                for action, child in trees[i].children.items():
+                    prior[action] = child.prior
+                nn_priors[i] = prior
+
+        # Soften root priors with temperature, then add Dirichlet noise
         for i in range(B):
             if trees[i] is not None:
+                self._apply_root_policy_temp(trees[i])
                 self._add_dirichlet_noise(trees[i])
 
         # Run simulations — wave-parallel or sequential
@@ -343,7 +370,7 @@ class GPUMCTSOrchestrator:
             else:
                 policies.append(np.zeros(self._action_space_size, dtype=np.float32))
 
-        return policies, root_graphs, root_seqs, trees
+        return policies, root_graphs, root_seqs, trees, nn_priors
 
     # ── Simulation loops ────────────────────────────────────────────────
 
@@ -378,18 +405,32 @@ class GPUMCTSOrchestrator:
             leaf_states.copy_(root_states)
             max_depth = max((len(p) for p in move_paths), default=0)
             for d in range(max_depth):
-                depth_moves = np.zeros((B, self._move_size), dtype=np.uint8)
-                has_move_at_depth = False
+                active_indices = []
+                active_moves = []
                 for i in range(B):
                     if d < len(move_paths[i]):
-                        depth_moves[i] = move_paths[i][d]
-                        has_move_at_depth = True
-                    else:
-                        depth_moves[i][0] = 2  # MOVE_PASS type
+                        active_indices.append(i)
+                        active_moves.append(move_paths[i][d])
 
-                if has_move_at_depth:
-                    dm_tensor = torch.from_numpy(depth_moves).cuda()
-                    self.ext.apply_moves_batch(leaf_states, dm_tensor, B)
+                if not active_indices:
+                    continue
+
+                idx_tensor = torch.tensor(
+                    active_indices, dtype=torch.long,
+                    device=leaf_states.device,
+                )
+                sub_states = leaf_states[idx_tensor].clone()
+                n_active = len(active_indices)
+
+                move_arr = np.zeros(
+                    (n_active, self._move_size), dtype=np.uint8
+                )
+                for j, mv in enumerate(active_moves):
+                    move_arr[j] = mv
+
+                dm_tensor = torch.from_numpy(move_arr).cuda()
+                self.ext.apply_moves_batch(sub_states, dm_tensor, n_active)
+                leaf_states[idx_tensor] = sub_states
 
             # Check which leaves are terminal
             leaf_results = self.ext.check_results_batch(leaf_states, B).cpu().numpy()
@@ -484,22 +525,38 @@ class GPUMCTSOrchestrator:
                         max_depth = md
 
             for d in range(max_depth):
-                depth_moves = np.zeros((total, self._move_size), dtype=np.uint8)
-                has_move = False
+                # Collect only slots that have a move at this depth
+                active_indices = []
+                active_moves = []
                 for w in range(actual_w):
                     for i in range(B):
                         flat_idx = w * B + i
                         if d < len(all_move_paths[w][i]):
-                            depth_moves[flat_idx] = all_move_paths[w][i][d]
-                            has_move = True
-                        else:
-                            depth_moves[flat_idx][0] = 2  # PASS
+                            active_indices.append(flat_idx)
+                            active_moves.append(all_move_paths[w][i][d])
 
-                if has_move:
-                    dm_tensor = torch.from_numpy(depth_moves).cuda()
-                    self.ext.apply_moves_batch(
-                        leaf_states_wb[:total], dm_tensor, total
-                    )
+                if not active_indices:
+                    continue
+
+                # Build contiguous sub-batch of only active states
+                idx_tensor = torch.tensor(
+                    active_indices, dtype=torch.long,
+                    device=leaf_states_wb.device,
+                )
+                sub_states = leaf_states_wb[idx_tensor].clone()
+                n_active = len(active_indices)
+
+                move_arr = np.zeros(
+                    (n_active, self._move_size), dtype=np.uint8
+                )
+                for j, mv in enumerate(active_moves):
+                    move_arr[j] = mv
+
+                dm_tensor = torch.from_numpy(move_arr).cuda()
+                self.ext.apply_moves_batch(sub_states, dm_tensor, n_active)
+
+                # Write back to leaf_states_wb
+                leaf_states_wb[idx_tensor] = sub_states
 
             # === PHASE 3: CHECK TERMINALS ===
             leaf_results = self.ext.check_results_batch(
@@ -816,15 +873,52 @@ class GPUMCTSOrchestrator:
             v = -v
             current = current.parent
 
+    def _apply_root_policy_temp(self, node: GPUMCTSNode) -> None:
+        """Soften root priors with temperature > 1.0 before Dirichlet noise.
+
+        Raises priors to power 1/T and renormalizes to prevent the NN's
+        policy from being too peaky early in training.
+        """
+        temp = self.config.root_policy_temp
+        if temp <= 1.0 or not node.children:
+            return
+
+        actions = list(node.children.keys())
+        priors = np.array([node.children[a].prior for a in actions], dtype=np.float64)
+
+        # Apply temperature: p^(1/T), then renormalize
+        priors = priors ** (1.0 / temp)
+        total = priors.sum()
+        if total > 0:
+            priors /= total
+        else:
+            priors[:] = 1.0 / len(priors)
+
+        for i, action in enumerate(actions):
+            node.children[action].prior = float(priors[i])
+
     def _add_dirichlet_noise(self, node: GPUMCTSNode) -> None:
-        """Add Dirichlet noise to root priors for exploration."""
+        """Add Dirichlet noise to root priors for exploration.
+
+        With shaped_dirichlet=True (default), alpha is scaled inversely
+        with the number of legal moves: alpha = max(0.03, 10/N_legal).
+        This concentrates noise on fewer moves in high-branching-factor
+        positions, similar to KataGo's approach for Go (alpha=0.03 for
+        N=361 legal moves ≈ 10/361).
+        """
         if not node.children:
             return
 
         actions = list(node.children.keys())
-        noise = np.random.dirichlet(
-            [self.config.dirichlet_alpha] * len(actions)
-        )
+        n_legal = len(actions)
+
+        # Shaped alpha: scale inversely with number of legal moves
+        if self.config.shaped_dirichlet:
+            alpha = max(0.03, 10.0 / n_legal)
+        else:
+            alpha = self.config.dirichlet_alpha
+
+        noise = np.random.dirichlet([alpha] * n_legal)
 
         eps = self.config.dirichlet_epsilon
         for i, action in enumerate(actions):
@@ -832,7 +926,12 @@ class GPUMCTSOrchestrator:
             child.prior = (1 - eps) * child.prior + eps * noise[i]
 
     def _get_policy(self, root: GPUMCTSNode, move_number: int) -> np.ndarray:
-        """Build policy vector from root's child visit counts."""
+        """Build policy vector from root's child visit counts.
+
+        Applies policy target pruning: children with visits below
+        ``policy_target_pruning`` fraction of the max are zeroed out
+        to reduce noise in the training signal.
+        """
         policy = np.zeros(self._action_space_size, dtype=np.float32)
 
         if not root.children:
@@ -849,11 +948,17 @@ class GPUMCTSOrchestrator:
             )
             policy[best_action] = 1.0
         else:
+            actions = sorted(root.children.keys())
             visits = np.array(
-                [root.children[a].visit_count for a in sorted(root.children.keys())],
+                [root.children[a].visit_count for a in actions],
                 dtype=np.float64,
             )
-            actions = sorted(root.children.keys())
+
+            # Policy target pruning: zero out low-visit children
+            pruning_threshold = self.config.policy_target_pruning
+            if pruning_threshold > 0 and visits.max() > 0:
+                cutoff = visits.max() * pruning_threshold
+                visits[visits < cutoff] = 0.0
 
             if temp != 1.0:
                 visits = visits ** (1.0 / temp)
@@ -1106,7 +1211,7 @@ class GPUMCTSOrchestrator:
 
     def _build_examples(
         self,
-        histories: list[list[tuple[HiveGraph, np.ndarray, int, np.ndarray, HiveTokenSequence | None]]],
+        histories: list[list[tuple[HiveGraph, np.ndarray, int, np.ndarray, HiveTokenSequence | None, np.ndarray | None]]],
         final_results: np.ndarray,
         final_mob_np: np.ndarray,
         final_mob_board_counts: np.ndarray,
@@ -1120,7 +1225,7 @@ class GPUMCTSOrchestrator:
             examples = []
             num_steps = len(history)
 
-            for step_idx, (graph, policy, turn, mobility, seq) in enumerate(history):
+            for step_idx, (graph, policy, turn, mobility, seq, nn_prior) in enumerate(history):
                 # Value from this player's perspective
                 if result == 0 or result == 3:  # IN_PROGRESS or DRAW
                     value = 0.0
@@ -1131,7 +1236,13 @@ class GPUMCTSOrchestrator:
                     else:  # BLACK_WINS
                         value = -1.0 if player_is_white else 1.0
 
-                n = graph.num_piece_nodes
+                # Use seq.num_board_tokens for transformer; fall back to graph for GNN
+                if seq is not None:
+                    n = seq.num_board_tokens
+                elif graph is not None:
+                    n = graph.num_piece_nodes
+                else:
+                    n = 0
                 is_final = (step_idx == num_steps - 1)
 
                 if is_final:
@@ -1160,6 +1271,7 @@ class GPUMCTSOrchestrator:
                     queen_surround_mask=qs_mask,
                     final_mobility_target=fm,
                     sequence=seq,
+                    nn_prior=nn_prior,
                 ))
 
             all_examples.append(examples)

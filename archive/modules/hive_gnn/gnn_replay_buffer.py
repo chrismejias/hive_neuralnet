@@ -33,6 +33,7 @@ class GNNTrainingExample(NamedTuple):
     queen_surround_mask: np.ndarray         # (2,) float32 — 1.0 if queen placed
     final_mobility_target: np.ndarray       # (num_piece_nodes,) float32 binary — end-of-game mobility
     use_for_value: bool                     # playout cap: only full-playout games train value
+    surprise_weight: float = 1.0            # KL-based sample weight for surprise weighting
 
 
 # ── Training Batch ────────────────────────────────────────────────
@@ -87,12 +88,26 @@ class GraphReplayBuffer:
 
     def sample_batch(self, batch_size: int) -> GNNTrainingBatch:
         """
-        Sample a random batch from the buffer.
+        Sample a batch from the buffer, weighted by surprise_weight.
+
+        Examples with higher policy surprise (KL divergence between NN
+        prior and MCTS result) are sampled more frequently.
 
         Returns:
             A GNNTrainingBatch with all tensors on CPU.
         """
-        samples = random.sample(list(self.buffer), min(batch_size, len(self.buffer)))
+        buf_list = list(self.buffer)
+        n = min(batch_size, len(buf_list))
+        weights = np.array([ex.surprise_weight for ex in buf_list], dtype=np.float64)
+        w_sum = weights.sum()
+        if w_sum > 0:
+            weights /= w_sum
+        else:
+            weights = np.ones(len(buf_list), dtype=np.float64) / len(buf_list)
+        # Fix floating-point rounding so probabilities sum to exactly 1
+        weights /= weights.sum()
+        indices = np.random.choice(len(buf_list), size=n, replace=False, p=weights)
+        samples = [buf_list[i] for i in indices]
 
         graphs = [s.graph for s in samples]
         policies = np.array([s.policy_target for s in samples], dtype=np.float32)

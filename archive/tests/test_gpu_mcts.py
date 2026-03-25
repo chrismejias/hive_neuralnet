@@ -444,6 +444,7 @@ class TestGPUMCTS:
             batch_size=2,          # 2 concurrent games
             max_game_length=10,    # Short games for testing
             encoder_type="gnn",
+            playout_cap_randomize=False,  # Ensure all moves recorded
         )
         orchestrator = GPUMCTSOrchestrator(net, config)
 

@@ -133,7 +133,8 @@ __device__ inline int gen_ant_moves(const HiveState& s, int cell,
             int16_t dest = SLIDE_FLANKS[cell][d][0];
             if (!visited.get(dest)) {
                 visited.set(dest);
-                frontier[front_write++] = (uint16_t)dest;
+                if (front_write < MAX_ANT_DESTS)
+                    frontier[front_write++] = (uint16_t)dest;
             }
         }
     }
@@ -464,7 +465,7 @@ __device__ inline int gen_mosquito_moves(const HiveState& s, int cell,
         for (int i = 0; i < n; i++) {
             if (!result_set.get(tmp[i])) {
                 result_set.set(tmp[i]);
-                out[count++] = tmp[i];
+                if (count < MAX_ANT_DESTS) out[count++] = tmp[i];
             }
         }
     }

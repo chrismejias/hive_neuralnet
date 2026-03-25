@@ -51,6 +51,10 @@ def main() -> None:
 
     base_cmd = [sys.executable, "-u", "-m", "hive_gpu"] + clean_argv
 
+    max_retries = 2
+    consecutive_failures = 0
+    last_checkpoint = None
+
     attempt = 0
     while True:
         attempt += 1
@@ -67,8 +71,27 @@ def main() -> None:
             print("\nTraining completed successfully.")
             break
 
-        print(f"\nProcess exited with code {result.returncode}. Restarting in 5s...", flush=True)
-        time.sleep(5)
+        # Track consecutive failures from the same checkpoint
+        if latest == last_checkpoint:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 1
+            last_checkpoint = latest
+
+        if consecutive_failures >= max_retries:
+            print(
+                f"\nFailed {consecutive_failures} times from checkpoint "
+                f"{latest}. Giving up.",
+                flush=True,
+            )
+            break
+
+        print(
+            f"\nProcess exited with code {result.returncode}. "
+            f"Retry {consecutive_failures}/{max_retries}. Restarting in 10s...",
+            flush=True,
+        )
+        time.sleep(10)
 
 
 if __name__ == "__main__":

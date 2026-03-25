@@ -10,7 +10,11 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from hive_gnn.graph_types import HiveGraph, HiveGraphBatch
+try:
+    from hive_gnn.graph_types import HiveGraph, HiveGraphBatch
+except ImportError:
+    HiveGraph = None       # type: ignore[assignment,misc]
+    HiveGraphBatch = None  # type: ignore[assignment,misc]
 from hive_transformer.token_types import (
     HiveTokenBatch,
     HiveTokenSequence,
@@ -114,7 +118,7 @@ class GPUGNNEncoder:
             piece_node_batch=cat_piece_batch,
         )
 
-    def _assemble_graphs(self, raw: _RawEncoded, batch_size: int) -> list[HiveGraph]:
+    def _assemble_graphs(self, raw: _RawEncoded, batch_size: int) -> list:  # list[HiveGraph]
         """Assemble individual HiveGraphs (CPU numpy) from raw kernel output."""
         (
             node_features, node_grid_pos, node_piece_types,
@@ -132,6 +136,8 @@ class GPUGNNEncoder:
         ei_cpu = edge_index_raw.cpu()
         ef_cpu = edge_features_raw.cpu()
 
+        if HiveGraph is None:
+            return [None] * batch_size
         graphs = []
         for i in range(batch_size):
             n_i = nn[i].item()

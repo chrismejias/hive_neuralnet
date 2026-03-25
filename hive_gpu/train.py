@@ -18,7 +18,11 @@ import sys
 
 from hive_engine.device import get_device, device_summary
 
-from hive_gnn.gnn_net import GNNNetConfig, HiveGNN
+try:
+    from hive_gnn.gnn_net import GNNNetConfig, HiveGNN
+except ImportError:
+    GNNNetConfig = None  # type: ignore[assignment,misc]
+    HiveGNN = None       # type: ignore[assignment,misc]
 from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
 from hive_gpu.gpu_trainer import GPUTrainConfig, GPUTrainer
 
@@ -51,7 +55,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Training batch size.",
     )
     parser.add_argument(
-        "--lr", type=float, default=1e-3,
+        "--lr", type=float, default=2e-4,
         help="Base learning rate.",
     )
     parser.add_argument(
@@ -61,11 +65,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # LR schedule
     parser.add_argument(
-        "--lr-schedule", choices=["constant", "cosine"], default="constant",
+        "--lr-schedule", choices=["constant", "cosine"], default="cosine",
         help="Learning rate schedule.",
     )
     parser.add_argument(
-        "--lr-warmup", type=int, default=0,
+        "--lr-warmup", type=int, default=3,
         help="Number of warmup iterations.",
     )
     parser.add_argument(
@@ -115,7 +119,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Max NN batch size per forward pass (0 = no limit).",
     )
 
-    # Arena
+    # Arena (disabled by default — always accept new model)
     parser.add_argument(
         "--arena-games", type=int, default=20,
         help="Number of arena evaluation games.",
@@ -129,15 +133,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Win rate threshold to accept new model.",
     )
     parser.add_argument(
-        "--skip-arena", action="store_true",
-        help="Skip arena evaluation and always accept new model.",
+        "--enable-arena", action="store_false", dest="skip_arena",
+        help="Enable arena evaluation (default: skipped, new model always accepted).",
     )
+    parser.set_defaults(skip_arena=True)
 
-    # Playout cap randomization (KataGo-style)
+    # Playout cap randomization (KataGo-style) — enabled by default
     parser.add_argument(
-        "--playout-cap-randomize", action="store_true",
-        help="Enable playout cap randomization: each move randomly uses full or fast sims.",
+        "--no-playout-cap-randomize", action="store_false", dest="playout_cap_randomize",
+        help="Disable playout cap randomization (default: enabled).",
     )
+    parser.set_defaults(playout_cap_randomize=True)
     parser.add_argument(
         "--playout-cap-prob", type=float, default=0.25,
         help="Probability of using full simulations per move (rest use fast sims).",
@@ -147,17 +153,51 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of fast sims (0 = auto: simulations // 8).",
     )
 
-    # Policy softening (KataGo-style)
+    # Policy softening (KataGo-style) — 0.03 by default
     parser.add_argument(
-        "--policy-softening", type=float, default=0.0,
-        help="Mix policy targets toward uniform over legal moves (0=off, 0.03 typical).",
+        "--policy-softening", type=float, default=0.03,
+        help="Mix policy targets toward uniform over legal moves (0=off, 0.03 default).",
     )
 
-    # Value head uncertainty
+    # Policy target pruning — zero out low-visit children
     parser.add_argument(
-        "--predict-uncertainty", action="store_true",
-        help="Add log-variance head to value head; use Gaussian NLL loss instead of MSE.",
+        "--policy-target-pruning", type=float, default=0.02,
+        help="Zero out policy targets below this fraction of max visits (0=off).",
     )
+
+    # Root policy temperature — soften NN prior before Dirichlet noise
+    parser.add_argument(
+        "--root-policy-temp", type=float, default=1.1,
+        help="Temperature for root NN prior (>1 = softer, 1 = off).",
+    )
+
+    # Shaped Dirichlet noise — scale alpha inversely with legal move count
+    parser.add_argument(
+        "--no-shaped-dirichlet", action="store_false", dest="shaped_dirichlet",
+        help="Disable shaped Dirichlet noise (default: enabled, alpha=10/N_legal).",
+    )
+    parser.set_defaults(shaped_dirichlet=True)
+
+    # Policy surprise weighting — KL-based sample prioritization
+    parser.add_argument(
+        "--policy-surprise-weight", type=float, default=1.0,
+        help="Scale for KL-based surprise weighting in replay buffer (0=off).",
+    )
+
+    # Value head uncertainty — enabled by default
+    parser.add_argument(
+        "--no-predict-uncertainty", action="store_false", dest="predict_uncertainty",
+        help="Disable value head uncertainty prediction (default: enabled).",
+    )
+    parser.set_defaults(predict_uncertainty=True)
+
+    # MCGS (Monte Carlo Graph Search) — opt-in, off by default
+    parser.add_argument(
+        "--mcgs", action="store_true", dest="use_mcgs",
+        help="Enable MCGS (DAG graph search with transposition detection). "
+             "Only beneficial at high sim counts (800+). Default: MCTS tree.",
+    )
+    parser.set_defaults(use_mcgs=False)
 
     # Network architecture
     parser.add_argument(
@@ -165,8 +205,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="GNN model size preset (small: ~8M params, large: ~12M params).",
     )
     parser.add_argument(
-        "--encoder-type", choices=["gnn", "transformer"], default="gnn",
-        help="Encoder type for GPU MCTS (gnn or transformer).",
+        "--encoder-type", choices=["gnn", "transformer"], default="transformer",
+        help="Encoder type for GPU MCTS (transformer recommended).",
     )
 
     # Replay buffer
@@ -234,12 +274,17 @@ def _build_train_config(args: argparse.Namespace) -> GPUTrainConfig:
         playout_cap_randomize_prob=args.playout_cap_prob,
         playout_cap_fast_sims=args.playout_cap_fast_sims,
         policy_softening=args.policy_softening,
+        policy_surprise_weight=args.policy_surprise_weight,
+        policy_target_pruning=args.policy_target_pruning,
+        root_policy_temp=args.root_policy_temp,
+        shaped_dirichlet=args.shaped_dirichlet,
+        use_mcgs=args.use_mcgs,
     )
 
 
 def _get_net_config_and_class(args: argparse.Namespace):
     """Return (net_config, net_class) preset based on --encoder-type and --model-size."""
-    predict_uncertainty = getattr(args, "predict_uncertainty", False)
+    predict_uncertainty = args.predict_uncertainty
     if args.encoder_type == "transformer":
         cfg = TransformerConfig.large() if args.model_size == "large" else TransformerConfig.small()
         cfg.predict_uncertainty = predict_uncertainty
@@ -294,7 +339,12 @@ def main(argv: list[str] | None = None) -> None:
     arena_str = "skipped (auto-accept)" if cfg.skip_arena else f"{cfg.arena_games} games @ {cfg.arena_mcts_simulations} sims"
     print(f"  Arena:        {arena_str}")
     print(f"  Policy soft:  {cfg.policy_softening}")
+    print(f"  Pol pruning:  {cfg.policy_target_pruning}")
+    print(f"  Root P temp:  {cfg.root_policy_temp}")
+    print(f"  Shaped Dir:   {cfg.shaped_dirichlet}")
+    print(f"  Surprise wt:  {cfg.policy_surprise_weight}")
     print(f"  Uncertainty:  {net_cfg.predict_uncertainty}")
+    print(f"  Search:       {'MCGS (DAG)' if cfg.use_mcgs else 'MCTS (tree)'}")
     print(f"  Checkpoints:  {cfg.checkpoint_dir}")
     print(f"{'='*60}\n")
 

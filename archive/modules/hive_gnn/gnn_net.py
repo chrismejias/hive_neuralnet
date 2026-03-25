@@ -393,7 +393,7 @@ class ValueHead(nn.Module):
 
         v = F.relu(self.fc1(combined))
         value = torch.tanh(self.fc2(v))  # (B, 1)
-        log_var = self.fc2_logvar(v).clamp(-10, 10) if self.predict_uncertainty else None
+        log_var = self.fc2_logvar(v).clamp(-4, 10) if self.predict_uncertainty else None
         return value, log_var
 
 

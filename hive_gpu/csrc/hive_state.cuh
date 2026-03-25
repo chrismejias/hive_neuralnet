@@ -325,6 +325,9 @@ __device__ inline void place_piece(HiveState& s, int cell, PieceType pt, Color c
     uint8_t packed = make_cell(pt, c);
     int h = s.height[cell];
 
+    // Bounds check: prevent stack overflow
+    if (h >= MAX_STACK || cell < 0 || cell >= NUM_CELLS) return;
+
     // Push onto stack
     s.pieces[h][cell] = packed;
     s.height[cell] = h + 1;
@@ -359,6 +362,7 @@ __device__ inline void place_piece(HiveState& s, int cell, PieceType pt, Color c
  */
 __device__ inline uint8_t remove_top(HiveState& s, int cell) {
     int h = s.height[cell];
+    if (h <= 0 || cell < 0 || cell >= NUM_CELLS) return CELL_EMPTY;
     uint8_t removed = s.pieces[h - 1][cell];
     s.pieces[h - 1][cell] = CELL_EMPTY;
     s.height[cell] = h - 1;
@@ -389,6 +393,10 @@ __device__ inline uint8_t remove_top(HiveState& s, int cell) {
  * Pops from source stack, pushes onto destination stack.
  */
 __device__ inline void move_piece(HiveState& s, int from_cell, int to_cell) {
+    if (from_cell < 0 || from_cell >= NUM_CELLS || to_cell < 0 || to_cell >= NUM_CELLS) return;
+    if (s.height[from_cell] <= 0) return;  // nothing to move
+    if (s.height[to_cell] >= MAX_STACK) return;  // check BEFORE removing
+
     uint8_t packed = remove_top(s, from_cell);
     PieceType pt = cell_piece_type(packed);
     Color c = cell_color(packed);
@@ -485,10 +493,17 @@ __device__ inline void init_state(HiveState& s, uint8_t expansion_mask = 0) {
  * Apply a move to the state and advance the turn.
  */
 __device__ inline void apply_move(HiveState& s, const GPUMove& m) {
+    // Validate move cells are in bounds before any state modification
     if (m.type == MOVE_PLACE) {
-        place_piece(s, m.to_cell, m.piece_type, current_player(s));
+        if (m.to_cell >= 0 && m.to_cell < NUM_CELLS &&
+            m.piece_type >= PT_QUEEN && m.piece_type <= PT_PILLBUG) {
+            place_piece(s, m.to_cell, m.piece_type, current_player(s));
+        }
     } else if (m.type == MOVE_MOVE) {
-        move_piece(s, m.from_cell, m.to_cell);
+        if (m.from_cell >= 0 && m.from_cell < NUM_CELLS &&
+            m.to_cell >= 0 && m.to_cell < NUM_CELLS) {
+            move_piece(s, m.from_cell, m.to_cell);
+        }
     }
     // MOVE_PASS: do nothing to the board
 
