@@ -44,6 +44,7 @@ from hive_transformer.transformer_replay_buffer import (
 )
 
 from hive_gpu.gpu_mcts import GPUMCTSOrchestrator, GPUMCTSConfig, GPUTrainingExample
+from hive_gpu.gpu_native_mcts import GPUNativeMCTSOrchestrator
 
 
 # ── Configuration ──────────────────────────────────────────────────────
@@ -130,6 +131,9 @@ class GPUTrainConfig:
 
     # Shaped Dirichlet noise (scale alpha inversely with number of legal moves)
     shaped_dirichlet: bool = True
+
+    # GPU-native MCTS (tree on GPU, CUDA kernels for select/expand/backprop)
+    use_gpu_native: bool = False
 
 
 # ── GPU Trainer ────────────────────────────────────────────────────────
@@ -358,6 +362,8 @@ class GPUTrainer:
         if cfg.use_mcgs:
             from hive_gpu.gpu_mcgs import MCGSOrchestrator
             orchestrator = MCGSOrchestrator(self.best_net, mcts_config)
+        elif cfg.use_gpu_native:
+            orchestrator = GPUNativeMCTSOrchestrator(self.best_net, mcts_config)
         else:
             orchestrator = GPUMCTSOrchestrator(self.best_net, mcts_config)
         is_transformer = cfg.encoder_type == "transformer"

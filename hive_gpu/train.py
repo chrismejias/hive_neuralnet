@@ -199,6 +199,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(use_mcgs=False)
 
+    # GPU-native MCTS — opt-in, off by default
+    parser.add_argument(
+        "--gpu-native", action="store_true", dest="use_gpu_native",
+        help="Use GPU-native MCTS (tree on GPU, CUDA kernels for select/expand/backprop). "
+             "~2x faster than CPU-tree MCTS.",
+    )
+    parser.set_defaults(use_gpu_native=False)
+
     # Network architecture
     parser.add_argument(
         "--model-size", choices=["small", "large"], default="small",
@@ -279,6 +287,7 @@ def _build_train_config(args: argparse.Namespace) -> GPUTrainConfig:
         root_policy_temp=args.root_policy_temp,
         shaped_dirichlet=args.shaped_dirichlet,
         use_mcgs=args.use_mcgs,
+        use_gpu_native=args.use_gpu_native,
     )
 
 
@@ -344,7 +353,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Shaped Dir:   {cfg.shaped_dirichlet}")
     print(f"  Surprise wt:  {cfg.policy_surprise_weight}")
     print(f"  Uncertainty:  {net_cfg.predict_uncertainty}")
-    print(f"  Search:       {'MCGS (DAG)' if cfg.use_mcgs else 'MCTS (tree)'}")
+    search_str = 'MCGS (DAG)' if cfg.use_mcgs else ('MCTS GPU-native' if cfg.use_gpu_native else 'MCTS (tree)')
+    print(f"  Search:       {search_str}")
     print(f"  Checkpoints:  {cfg.checkpoint_dir}")
     print(f"{'='*60}\n")
 

@@ -13,6 +13,7 @@
 #include <torch/extension.h>
 #include "hive_state.cuh"
 #include "state_encoder.cuh"  // for encoder constants (kernel guarded by __CUDACC__)
+#include "mcts_tree.cuh"     // for tree constants
 
 namespace hive_gpu {
 
@@ -33,6 +34,52 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mobility_batch(
     torch::Tensor states_tensor, int batch_size, bool both_players);
 torch::Tensor compute_centroids_batch(
     torch::Tensor states_tensor, int batch_size);
+
+// GPU-native MCTS
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mcts_select_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor game_active, float c_puct, int B, int W, int max_nodes);
+
+void mcts_replay_batch(
+    torch::Tensor root_states, torch::Tensor leaf_states,
+    torch::Tensor move_paths, torch::Tensor path_lengths, torch::Tensor leaf_indices,
+    int B, int total);
+
+torch::Tensor mcts_expand_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor leaf_indices, torch::Tensor leaf_states,
+    torch::Tensor legal_moves, torch::Tensor num_legal,
+    torch::Tensor action_probs, torch::Tensor results,
+    int B, int total, int max_nodes);
+
+void mcts_backprop_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor leaf_indices, torch::Tensor nn_values,
+    torch::Tensor vl_paths, torch::Tensor vl_lengths, torch::Tensor was_expanded,
+    int B, int total, int max_nodes);
+
+torch::Tensor mcts_extract_policy_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor move_numbers,
+    float temperature, int temp_drop_move, float pruning_threshold,
+    int B, int max_nodes);
+
+void mcts_apply_root_noise(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor noise, int max_children_pad,
+    float dir_eps, float root_policy_temp,
+    int B, int max_nodes);
 
 }  // namespace hive_gpu
 
@@ -74,6 +121,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Compute per-state centroids on GPU",
           py::arg("states"), py::arg("batch_size"));
 
+    // ── GPU-native MCTS ────────────────────────────────────────────
+    m.def("mcts_select_batch", &hive_gpu::mcts_select_batch,
+          "MCTS PUCT selection (GPU-native)");
+    m.def("mcts_replay_batch", &hive_gpu::mcts_replay_batch,
+          "MCTS move-path replay to compute leaf states");
+    m.def("mcts_expand_batch", &hive_gpu::mcts_expand_batch,
+          "MCTS expand non-terminal unexpanded leaves");
+    m.def("mcts_backprop_batch", &hive_gpu::mcts_backprop_batch,
+          "MCTS backpropagate values from leaf to root");
+    m.def("mcts_extract_policy_batch", &hive_gpu::mcts_extract_policy_batch,
+          "Extract MCTS policy from root visit counts");
+    m.def("mcts_apply_root_noise", &hive_gpu::mcts_apply_root_noise,
+          "Apply root policy temperature + Dirichlet noise");
+
     // Export constants for Python use
     m.attr("BOARD_SIZE") = hive_gpu::BOARD_SIZE;
     m.attr("NUM_CELLS") = hive_gpu::NUM_CELLS;
@@ -90,4 +151,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("ACTION_SPACE_SIZE") = hive_gpu::ACTION_SPACE_SIZE;
     m.attr("PASS_ACTION_INDEX") = hive_gpu::PASS_ACTION_INDEX;
     m.attr("MOVEMENT_OFFSET") = hive_gpu::MOVEMENT_OFFSET;
+    m.attr("DEFAULT_MAX_TREE_NODES") = hive_gpu::DEFAULT_MAX_TREE_NODES;
+    m.attr("MAX_TREE_DEPTH") = hive_gpu::MAX_TREE_DEPTH;
 }

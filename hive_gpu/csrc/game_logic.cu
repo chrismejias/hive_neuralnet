@@ -20,6 +20,7 @@
 #include "move_gen.cuh"
 #include "state_encoder.cuh"
 #include "mobility.cuh"
+#include "mcts_tree.cuh"
 
 namespace hive_gpu {
 
@@ -324,6 +325,202 @@ at::Tensor compute_centroids_batch(at::Tensor states_tensor, int batch_size) {
     cudaDeviceSynchronize();
 
     return centroids;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// GPU-native MCTS host wrappers
+// ═══════════════════════════════════════════════════════════════════
+
+namespace {
+MCTSTree build_tree(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt, int max_nodes
+) {
+    MCTSTree t;
+    t.visit_count    = static_cast<int*>(vc.data_ptr());
+    t.total_value    = static_cast<float*>(tv.data_ptr());
+    t.prior          = static_cast<float*>(pr.data_ptr());
+    t.parent_idx     = static_cast<int*>(pa.data_ptr());
+    t.move_bytes     = static_cast<uint8_t*>(mb.data_ptr());
+    t.action_idx     = static_cast<int*>(ai.data_ptr());
+    t.first_child    = static_cast<int*>(fc.data_ptr());
+    t.num_children   = static_cast<int*>(nc.data_ptr());
+    t.is_terminal    = static_cast<int8_t*>(it.data_ptr());
+    t.terminal_value = static_cast<float*>(tv2.data_ptr());
+    t.node_count     = static_cast<int*>(cnt.data_ptr());
+    t.max_nodes      = max_nodes;
+    return t;
+}
+}  // anon namespace
+
+/**
+ * MCTS select: PUCT walk from root to leaf for W*B simultaneous sims.
+ * Returns (leaf_indices, move_paths, path_lengths, vl_paths, vl_lengths).
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mcts_select_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor game_active, float c_puct, int B, int W, int max_nodes
+) {
+    int total = W * B;
+    auto oi = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto ou = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+
+    auto leaf_idx   = at::zeros({total}, oi);
+    auto move_paths = at::zeros({total, MAX_TREE_DEPTH, (int64_t)sizeof(GPUMove)}, ou);
+    auto path_lens  = at::zeros({total}, oi);
+    auto vl_paths   = at::zeros({total, MAX_TREE_DEPTH}, oi);
+    auto vl_lens    = at::zeros({total}, oi);
+
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    mcts_select_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<int*>(leaf_idx.data_ptr()),
+        static_cast<uint8_t*>(move_paths.data_ptr()),
+        static_cast<int*>(path_lens.data_ptr()),
+        static_cast<int*>(vl_paths.data_ptr()),
+        static_cast<int*>(vl_lens.data_ptr()),
+        static_cast<const int8_t*>(game_active.data_ptr()),
+        c_puct, B, total);
+    cudaDeviceSynchronize();
+
+    return std::make_tuple(leaf_idx, move_paths, path_lens, vl_paths, vl_lens);
+}
+
+/**
+ * MCTS replay: replay move paths to compute leaf states.
+ */
+void mcts_replay_batch(
+    at::Tensor root_states, at::Tensor leaf_states,
+    at::Tensor move_paths, at::Tensor path_lengths, at::Tensor leaf_indices,
+    int B, int total
+) {
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    mcts_replay_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const HiveState*>(root_states.data_ptr()),
+        reinterpret_cast<HiveState*>(leaf_states.data_ptr()),
+        static_cast<const uint8_t*>(move_paths.data_ptr()),
+        static_cast<const int*>(path_lengths.data_ptr()),
+        static_cast<const int*>(leaf_indices.data_ptr()),
+        B, total);
+    cudaDeviceSynchronize();
+}
+
+/**
+ * MCTS expand: create children for unexpanded, non-terminal leaves.
+ * Returns was_expanded [total_sims] int8.
+ */
+at::Tensor mcts_expand_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor leaf_indices, at::Tensor leaf_states,
+    at::Tensor legal_moves, at::Tensor num_legal,
+    at::Tensor action_probs, at::Tensor results,
+    int B, int total, int max_nodes
+) {
+    auto was_expanded = at::zeros({total}, at::TensorOptions().dtype(c10::kChar).device(c10::kCUDA));
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    mcts_expand_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<const int*>(leaf_indices.data_ptr()),
+        reinterpret_cast<const HiveState*>(leaf_states.data_ptr()),
+        reinterpret_cast<const GPUMove*>(legal_moves.data_ptr()),
+        static_cast<const int*>(num_legal.data_ptr()),
+        static_cast<const float*>(action_probs.data_ptr()),
+        static_cast<const int*>(results.data_ptr()),
+        static_cast<int8_t*>(was_expanded.data_ptr()),
+        B, total);
+    cudaDeviceSynchronize();
+
+    return was_expanded;
+}
+
+/**
+ * MCTS backprop: undo virtual loss, propagate values from leaf to root.
+ */
+void mcts_backprop_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor leaf_indices, at::Tensor nn_values,
+    at::Tensor vl_paths, at::Tensor vl_lengths, at::Tensor was_expanded,
+    int B, int total, int max_nodes
+) {
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    mcts_backprop_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<const int*>(leaf_indices.data_ptr()),
+        static_cast<const float*>(nn_values.data_ptr()),
+        static_cast<const int*>(vl_paths.data_ptr()),
+        static_cast<const int*>(vl_lengths.data_ptr()),
+        static_cast<const int8_t*>(was_expanded.data_ptr()),
+        B, total);
+    cudaDeviceSynchronize();
+}
+
+/**
+ * MCTS extract policy: build policy vectors from root visit counts.
+ * Returns [B, ACTION_SPACE_SIZE] float32.
+ */
+at::Tensor mcts_extract_policy_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor move_numbers,
+    float temperature, int temp_drop_move, float pruning_threshold,
+    int B, int max_nodes
+) {
+    auto policies = at::zeros(
+        {B, (int64_t)ACTION_SPACE_SIZE},
+        at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA));
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (B + threads - 1) / threads;
+    mcts_extract_policy_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<float*>(policies.data_ptr()),
+        static_cast<const int*>(move_numbers.data_ptr()),
+        temperature, temp_drop_move, pruning_threshold, B);
+    cudaDeviceSynchronize();
+
+    return policies;
+}
+
+/**
+ * MCTS root noise: apply root policy temperature + Dirichlet noise.
+ */
+void mcts_apply_root_noise(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor noise, int max_children_pad,
+    float dir_eps, float root_policy_temp,
+    int B, int max_nodes
+) {
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (B + threads - 1) / threads;
+    mcts_root_noise_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<const float*>(noise.data_ptr()),
+        max_children_pad, dir_eps, root_policy_temp, B);
+    cudaDeviceSynchronize();
 }
 
 }  // namespace hive_gpu
