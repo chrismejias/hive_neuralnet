@@ -163,8 +163,14 @@ __global__ void mcts_select_kernel(
         if (fc < 0 || tree.is_terminal[ni] || tree.num_children[ni] == 0)
             break;
 
+        // Depth limit: stop before descending further
+        if (path_len >= MAX_TREE_DEPTH)
+            break;
+
         // PUCT: pick child with highest score
         int nc = tree.num_children[ni];
+        // Guard against corrupted num_children
+        if (nc <= 0 || nc > tree.max_nodes) break;
         int best_child = fc;
         float best_score = -1e30f;
         for (int c = 0; c < nc; c++) {
@@ -183,15 +189,13 @@ __global__ void mcts_select_kernel(
         atomicAdd(&tree.total_value[ni2], -1.0f);
 
         // Record path
-        if (path_len < MAX_TREE_DEPTH) {
-            my_vl[path_len] = node;
-            // Copy move bytes from tree
-            int64_t mb_base = ((int64_t)game * tree.max_nodes + node) * MOVE_SZ;
-            uint8_t* dst = reinterpret_cast<uint8_t*>(&my_moves[path_len]);
-            for (int b = 0; b < MOVE_SZ; b++)
-                dst[b] = tree.move_bytes[mb_base + b];
-            path_len++;
-        }
+        my_vl[path_len] = node;
+        // Copy move bytes from tree
+        int64_t mb_base = ((int64_t)game * tree.max_nodes + node) * MOVE_SZ;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(&my_moves[path_len]);
+        for (int b = 0; b < MOVE_SZ; b++)
+            dst[b] = tree.move_bytes[mb_base + b];
+        path_len++;
     }
 
     leaf_indices[sim_idx] = node;
