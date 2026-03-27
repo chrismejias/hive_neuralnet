@@ -293,6 +293,10 @@ class GPUNativeMCTSOrchestrator:
             action_probs = torch.softmax(policy_logits, dim=-1)
             values_flat = values.squeeze(-1)
 
+            # Sync PyTorch async ops before launching custom CUDA kernels
+            # (torch.compile may use non-default streams)
+            torch.cuda.synchronize()
+
             # LEGAL MOVES
             legal_moves, num_legal = self.ext.generate_legal_moves_batch(
                 leaf_states[:total], total,
@@ -366,6 +370,9 @@ class GPUNativeMCTSOrchestrator:
         masks_bool = masks == 0
         policy_logits[masks_bool] = float("-inf")
         action_probs = torch.softmax(policy_logits, dim=-1)
+
+        # Sync PyTorch async ops before custom kernels
+        torch.cuda.synchronize()
 
         # Legal moves
         legal_moves, num_legal = self.ext.generate_legal_moves_batch(root_states, B)
