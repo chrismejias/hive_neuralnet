@@ -49,12 +49,10 @@ class GPUNativeMCTSOrchestrator:
         self.ext = hive_gpu.load_extension()
         self.config = config or GPUMCTSConfig()
 
+        # Don't use torch.compile with GPU-native MCTS — compiled kernels
+        # use non-default CUDA streams that race with custom CUDA kernels,
+        # causing intermittent hangs in the MCTS expand/backprop pipeline.
         self.net = net
-        try:
-            import triton  # noqa: F401
-            self.net = torch.compile(net)
-        except (ImportError, Exception):
-            pass
 
         if self.config.encoder_type == "gnn":
             self.encoder = GPUGNNEncoder()
