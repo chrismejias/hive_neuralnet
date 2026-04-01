@@ -20,13 +20,13 @@ import numpy as np
 import torch
 
 from hive_engine.device import get_device, device_summary
-from hive_engine.encoder import HiveEncoder
 from hive_engine.game_state import GameState, GameResult, Move, MoveType
-from hive_engine.mcts import MCTS, MCTSConfig
 from hive_engine.neural_net import HiveNet, NetConfig
 from hive_engine.pieces import Color, PieceType
 from hive_engine.hex_coord import HexCoord
-from hive_engine.trainer import Trainer
+from hive_engine.encoder import HiveEncoder
+from hive_engine.mcts import MCTS, MCTSConfig
+from archive.modules.hive_engine_cpu.trainer import Trainer
 
 
 # ── Display ────────────────────────────────────────────────────────

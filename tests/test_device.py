@@ -91,33 +91,4 @@ class TestDeviceSummary:
         assert "GB" in s
 
 
-class TestAMPIntegration:
-    """Test that mixed precision config propagates correctly."""
-
-    def test_amp_auto_false_on_cpu(self):
-        """AMP should auto-disable on CPU."""
-        from hive_engine.trainer import Trainer, TrainConfig
-        from hive_engine.neural_net import NetConfig
-        config = TrainConfig(device="cpu")
-        trainer = Trainer(config=config, net_config=NetConfig.small())
-        assert trainer.use_amp is False
-        assert trainer._grad_scaler is None
-
-    def test_amp_explicit_false(self):
-        """use_amp=False should disable AMP even on CUDA."""
-        from hive_engine.trainer import Trainer, TrainConfig
-        from hive_engine.neural_net import NetConfig
-        config = TrainConfig(use_amp=False)
-        trainer = Trainer(config=config, net_config=NetConfig.small())
-        assert trainer.use_amp is False
-
-    def test_amp_auto_true_on_cuda(self):
-        """AMP should auto-enable on CUDA."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA not available")
-        from hive_engine.trainer import Trainer, TrainConfig
-        from hive_engine.neural_net import NetConfig
-        config = TrainConfig(device="cuda")
-        trainer = Trainer(config=config, net_config=NetConfig.small())
-        assert trainer.use_amp is True
-        assert trainer._grad_scaler is not None
+# AMP integration tests archived (depend on CPU Trainer)

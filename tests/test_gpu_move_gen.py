@@ -136,8 +136,8 @@ def _play_random_game(max_moves: int = 30) -> list[GameState]:
 class TestGPUExtensionLoads:
     def test_extension_loads(self, ext):
         assert ext is not None
-        assert ext.BOARD_SIZE == 17
-        assert ext.NUM_CELLS == 289
+        assert ext.BOARD_SIZE == 23
+        assert ext.NUM_CELLS == 529
         assert ext.MAX_LEGAL_MOVES == 256
 
     def test_create_initial_states(self, ext):

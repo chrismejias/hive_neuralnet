@@ -72,11 +72,11 @@ class TestTransformerConfig:
         assert cfg.num_layers == 6
         assert cfg.action_space_size == 29914
 
-    def test_default_aux_heads_enabled(self):
+    def test_default_aux_heads(self):
         cfg = TransformerConfig()
-        assert cfg.aux_mobility_enabled is True
+        assert cfg.aux_mobility_enabled is False
         assert cfg.aux_queen_surround_enabled is True
-        assert cfg.aux_final_mobility_enabled is True
+        assert cfg.aux_final_mobility_enabled is False
 
     def test_small(self):
         cfg = TransformerConfig.small()
@@ -175,7 +175,13 @@ class TestAuxiliaryHeads:
         assert len(aux) == 0
 
     def test_heads_enabled_produce_outputs(self):
-        net = HiveTransformer(SMALL_CFG)
+        cfg = TransformerConfig(
+            d_model=32, num_heads=4, num_layers=2, dim_feedforward=64,
+            aux_mobility_enabled=True,
+            aux_queen_surround_enabled=True,
+            aux_final_mobility_enabled=True,
+        )
+        net = HiveTransformer(cfg)
         batch = _make_batch()
         policy, value, aux = net(batch)
 
@@ -184,7 +190,13 @@ class TestAuxiliaryHeads:
         assert "final_mobility_logits" in aux
 
     def test_aux_output_shapes(self):
-        net = HiveTransformer(SMALL_CFG)
+        cfg = TransformerConfig(
+            d_model=32, num_heads=4, num_layers=2, dim_feedforward=64,
+            aux_mobility_enabled=True,
+            aux_queen_surround_enabled=True,
+            aux_final_mobility_enabled=True,
+        )
+        net = HiveTransformer(cfg)
         s1 = _make_sequence(3, 2)
         s2 = _make_sequence(2, 1)
         batch = HiveTokenBatch.collate([s1, s2])
