@@ -112,7 +112,7 @@ __device__ inline int gen_grasshopper_moves(const HiveState& s, int cell,
 
 /**
  * Generate ant moves via BFS on slide-adjacent empty cells.
- * Uses a 289-bit visited set in local memory.
+ * Uses a 529-bit visited set in local memory.
  * @param out  Output array for destination cells (max MAX_ANT_DESTS)
  * @return     Number of valid destinations
  */

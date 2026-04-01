@@ -1,18 +1,22 @@
 """
-pygame GUI for playing Hive against the GNN AI.
+pygame GUI for playing Hive against a trained AI.
 
 Run from hive_neuralnet/:
     python gui.py
-    python gui.py --checkpoint checkpoints_gnn/hive_gnn_checkpoint_0020.pt
+    python gui.py --checkpoint checkpoints_gpu/hive_gpu_checkpoint_0068.pt
     python gui.py --color black --simulations 200
 
 Controls:
-    Click hand panel   → select piece type to place
-    Click board piece  → select piece to move
-    Click green hex    → confirm placement / movement
-    Click elsewhere    → cancel selection
-    R                  → restart game
-    Escape             → quit
+    Click hand panel       → select piece type to place
+    Click board piece      → select piece to move
+    Click green hex        → confirm placement / movement
+    Click elsewhere        → cancel selection
+    Right-click + drag     → pan the board
+    Middle-click + drag    → pan the board
+    Scroll wheel           → zoom in/out (future)
+    R                      → restart game
+    C                      → re-center camera
+    Escape                 → quit
 """
 
 from __future__ import annotations
@@ -34,11 +38,17 @@ from hive_engine.hex_coord import HexCoord
 
 import struct
 
-from hive_gnn.gnn_encoder import GNNEncoder
-from hive_gnn.gnn_net import GNNNetConfig, HiveGNN
+try:
+    from hive_gnn.gnn_encoder import GNNEncoder
+    from hive_gnn.gnn_net import GNNNetConfig, HiveGNN
+except ImportError:
+    GNNEncoder = HiveGNN = GNNNetConfig = None  # type: ignore
 
-from hive_nnue.nnue_encoder import NNUEEncoder
-from hive_nnue.nnue_net import NNUEConfig, HiveNNUE
+try:
+    from hive_nnue.nnue_encoder import NNUEEncoder
+    from hive_nnue.nnue_net import NNUEConfig, HiveNNUE
+except ImportError:
+    NNUEEncoder = HiveNNUE = NNUEConfig = None  # type: ignore
 
 from hive_transformer.transformer_encoder import TransformerEncoder
 from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
@@ -124,17 +134,17 @@ PIECE_ORDER = [
 
 # ── Hex geometry ────────────────────────────────────────────────────
 
-def axial_to_pixel(q: int, r: int) -> tuple[int, int]:
-    """Flat-top axial → pixel center."""
-    x = BOARD_CX + HEX_SIZE * 1.5 * q
-    y = BOARD_CY + HEX_SIZE * math.sqrt(3) * (r + q * 0.5)
+def axial_to_pixel(q: int, r: int, cam_x: float = 0, cam_y: float = 0) -> tuple[int, int]:
+    """Flat-top axial → pixel center, with camera offset."""
+    x = BOARD_CX + cam_x + HEX_SIZE * 1.5 * q
+    y = BOARD_CY + cam_y + HEX_SIZE * math.sqrt(3) * (r + q * 0.5)
     return int(x), int(y)
 
 
-def pixel_to_axial(px: int, py: int) -> tuple[float, float]:
-    """Pixel → fractional flat-top axial coords."""
-    dx = px - BOARD_CX
-    dy = py - BOARD_CY
+def pixel_to_axial(px: int, py: int, cam_x: float = 0, cam_y: float = 0) -> tuple[float, float]:
+    """Pixel → fractional flat-top axial coords, with camera offset."""
+    dx = px - BOARD_CX - cam_x
+    dy = py - BOARD_CY - cam_y
     q = (2 / 3 * dx) / HEX_SIZE
     r = (-1 / 3 * dx + math.sqrt(3) / 3 * dy) / HEX_SIZE
     return q, r
@@ -167,14 +177,84 @@ def flat_hex_corners(
     ]
 
 
-def in_board_area(q: int, r: int) -> bool:
-    """Return True if the hex center is within the board drawing area."""
-    x, y = axial_to_pixel(q, r)
+def in_board_viewport(x: int, y: int) -> bool:
+    """Return True if the pixel position is within the board viewport."""
     margin = HEX_SIZE
     return (
-        BOARD_X + margin < x < BOARD_X + BOARD_W - margin
-        and BOARD_Y + margin < y < BOARD_Y + BOARD_H - margin
+        BOARD_X - margin < x < BOARD_X + BOARD_W + margin
+        and BOARD_Y - margin < y < BOARD_Y + BOARD_H + margin
     )
+
+
+# ── Win-in-one detection ────────────────────────────────────────────
+
+def find_immediate_win(game: GameState) -> Move | None:
+    """Return an immediately winning move if one exists, else None.
+
+    Only considers moves that could plausibly complete a queen surround:
+      - Any move whose destination is adjacent to the enemy queen
+      - Any pillbug move that relocates the enemy queen itself
+    Handles enemy queens buried under beetles (queen position still matters).
+    """
+    current = game.current_player
+    enemy = Color.BLACK if current == Color.WHITE else Color.WHITE
+
+    if not game._queen_placed[enemy]:
+        return None  # Enemy queen not on board yet
+
+    # Find enemy queen position — it may be buried under a beetle stack
+    enemy_queen_pos: HexCoord | None = None
+    for pos, stack in game.board.grid.items():
+        for piece in stack:
+            if piece.piece_type == PieceType.QUEEN and piece.color == enemy:
+                enemy_queen_pos = pos
+                break
+        if enemy_queen_pos is not None:
+            break
+
+    if enemy_queen_pos is None:
+        return None
+
+    enemy_queen_neighbors = set(enemy_queen_pos.neighbors())
+    current_surrounding = game.board.num_occupied_neighbors(enemy_queen_pos)
+
+    for move in game.legal_moves():
+        if move.move_type == MoveType.PASS:
+            continue
+
+        should_check = False
+
+        if move.to in enemy_queen_neighbors:
+            # Moving FROM another queen-neighbor to a queen-neighbor: net change = 0,
+            # can never complete the surround in one step → skip.
+            from_is_queen_nbr = (
+                move.move_type == MoveType.MOVE
+                and move.from_pos in enemy_queen_neighbors
+            )
+            if from_is_queen_nbr:
+                continue
+            # Otherwise this adds one more piece adjacent to enemy queen.
+            # We need exactly 5 already surrounding to win with this one move.
+            if current_surrounding >= 5:
+                should_check = True
+
+        elif (
+            move.move_type == MoveType.MOVE
+            and move.piece is not None
+            and move.piece.piece_type == PieceType.QUEEN
+            and move.piece.color == enemy
+        ):
+            # Pillbug relocating the enemy queen — check if new position is surrounded
+            should_check = True
+
+        if should_check:
+            test = game.copy()
+            test.apply_move(move)
+            r = test.result
+            if r in (GameResult.WHITE_WINS, GameResult.BLACK_WINS):
+                return move
+
+    return None
 
 
 # ── Selection state ─────────────────────────────────────────────────
@@ -319,6 +399,12 @@ class HiveGUI:
         self._ai_result: tuple[Move, int] | None = None   # (move, game_gen)
         self._ai_lock = threading.Lock()
 
+        # Camera (pan offset in pixels)
+        self.cam_x: float = 0.0
+        self.cam_y: float = 0.0
+        self._panning = False
+        self._pan_start: tuple[int, int] | None = None
+
         # Hover
         self.hover_hex: HexCoord | None = None
 
@@ -340,6 +426,14 @@ class HiveGUI:
         gen = self._game_gen
 
         def worker() -> None:
+            # Check for immediate win before running MCTS
+            immediate = find_immediate_win(self.game)
+            if immediate is not None:
+                with self._ai_lock:
+                    self._ai_result = (immediate, gen)
+                self.ai_thinking = False
+                return
+
             mcts = MCTS(self.net, self.encoder, self.mcts_config)
             policy = mcts.search(self.game, move_number=self.move_number)
             action = int(np.argmax(policy))
@@ -384,7 +478,9 @@ class HiveGUI:
         border: tuple,
         border_w: int = 1,
     ) -> None:
-        cx, cy = axial_to_pixel(q, r)
+        cx, cy = axial_to_pixel(q, r, self.cam_x, self.cam_y)
+        if not in_board_viewport(cx, cy):
+            return
         pts = flat_hex_corners(cx, cy, HEX_SIZE - 1)
         pygame.draw.polygon(surf, fill, pts)
         if border_w > 0:
@@ -399,7 +495,9 @@ class HiveGUI:
         height: int = 1,
         fill_override: tuple | None = None,
     ) -> None:
-        cx, cy = axial_to_pixel(q, r)
+        cx, cy = axial_to_pixel(q, r, self.cam_x, self.cam_y)
+        if not in_board_viewport(cx, cy):
+            return
 
         # Draw stack shadow layers
         for layer in range(height - 1, 0, -1):
@@ -422,7 +520,9 @@ class HiveGUI:
     # ── Board rendering ────────────────────────────────────────────
 
     def _draw_board(self, surf: pygame.Surface) -> None:
+        # Draw board background and set clip rect to prevent drawing over panels
         pygame.draw.rect(surf, C_BOARD_BG, (BOARD_X, BOARD_Y, BOARD_W, BOARD_H))
+        surf.set_clip(pygame.Rect(BOARD_X, BOARD_Y, BOARD_W, BOARD_H))
 
         grid = self.game.board.grid
 
@@ -439,8 +539,6 @@ class HiveGUI:
         for pos in context:
             if pos in grid:
                 continue
-            if not in_board_area(pos.q, pos.r):
-                continue
             if pos in self.legal_destinations:
                 fill = C_LEGAL
             elif pos == self.hover_hex:
@@ -451,7 +549,7 @@ class HiveGUI:
 
         # Pieces
         for pos, stack in grid.items():
-            if not stack or not in_board_area(pos.q, pos.r):
+            if not stack:
                 continue
             top = stack[-1]
             height = len(stack)
@@ -485,6 +583,9 @@ class HiveGUI:
                 surf, pos.q, pos.r, top.color,
                 PIECE_SYM[top.piece_type], height, fill
             )
+
+        # Remove clip rect so panels/status bar draw normally
+        surf.set_clip(None)
 
     # ── Hand panel ─────────────────────────────────────────────────
 
@@ -657,7 +758,7 @@ class HiveGUI:
 
         # Board area click
         if BOARD_X <= px <= BOARD_X + BOARD_W and BOARD_Y <= py <= BOARD_Y + BOARD_H:
-            fq, fr = pixel_to_axial(px, py)
+            fq, fr = pixel_to_axial(px, py, self.cam_x, self.cam_y)
             q, r = hex_round(fq, fr)
             self._handle_board_click(HexCoord(q, r))
 
@@ -748,10 +849,34 @@ class HiveGUI:
 
     def handle_mouse_motion(self, px: int, py: int) -> None:
         if BOARD_X <= px <= BOARD_X + BOARD_W and BOARD_Y <= py <= BOARD_Y + BOARD_H:
-            fq, fr = pixel_to_axial(px, py)
+            fq, fr = pixel_to_axial(px, py, self.cam_x, self.cam_y)
             self.hover_hex = HexCoord(*hex_round(fq, fr))
         else:
             self.hover_hex = None
+
+    def handle_pan_start(self, px: int, py: int) -> None:
+        """Begin panning (right or middle mouse button)."""
+        self._panning = True
+        self._pan_start = (px, py)
+
+    def handle_pan_motion(self, px: int, py: int) -> None:
+        """Update camera offset during pan drag."""
+        if self._panning and self._pan_start is not None:
+            dx = px - self._pan_start[0]
+            dy = py - self._pan_start[1]
+            self.cam_x += dx
+            self.cam_y += dy
+            self._pan_start = (px, py)
+
+    def handle_pan_end(self) -> None:
+        """Stop panning."""
+        self._panning = False
+        self._pan_start = None
+
+    def center_camera(self) -> None:
+        """Reset camera to center on the current pieces."""
+        self.cam_x = 0.0
+        self.cam_y = 0.0
 
     # ── Restart ────────────────────────────────────────────────────
 
@@ -762,6 +887,8 @@ class HiveGUI:
         self.last_move = None
         self._clear_selection()
         self.hover_hex = None
+        self.cam_x = 0.0
+        self.cam_y = 0.0
         with self._ai_lock:
             self._ai_result = None
         if self.gpu_validator:
@@ -798,10 +925,19 @@ class HiveGUI:
                         running = False
                     elif event.key == pygame.K_r:
                         self._restart()
+                    elif event.key == pygame.K_c:
+                        self.center_camera()
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self.handle_click(*event.pos)
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (2, 3):
+                    self.handle_pan_start(*event.pos)
+                elif event.type == pygame.MOUSEBUTTONUP and event.button in (2, 3):
+                    self.handle_pan_end()
                 elif event.type == pygame.MOUSEMOTION:
-                    self.handle_mouse_motion(*event.pos)
+                    if self._panning:
+                        self.handle_pan_motion(*event.pos)
+                    else:
+                        self.handle_mouse_motion(*event.pos)
 
             # Collect AI result (if ready and from current game generation)
             with self._ai_lock:
@@ -852,7 +988,7 @@ def load_checkpoint(
     # GPU trainer saves as "model_state_dict"; CPU trainers use "net_state_dict"
     state_dict_key = "model_state_dict" if "model_state_dict" in ckpt else "net_state_dict"
 
-    if isinstance(net_config, NNUEConfig):
+    if NNUEConfig is not None and isinstance(net_config, NNUEConfig):
         net = HiveNNUE(net_config)
         net.load_state_dict(ckpt[state_dict_key])
         net = net.to(device)
@@ -876,7 +1012,7 @@ def load_checkpoint(
             f"  Architecture: d_model={net_config.d_model}, "
             f"num_heads={net_config.num_heads}, num_layers={net_config.num_layers}"
         )
-    else:
+    elif HiveGNN is not None:
         net = HiveGNN(net_config)
         net.load_state_dict(ckpt[state_dict_key])
         net = net.to(device)
@@ -890,6 +1026,8 @@ def load_checkpoint(
             f"  Architecture: hidden_dim={net_config.hidden_dim}, "
             f"mp_layers={net_config.num_mp_layers}"
         )
+    else:
+        raise ValueError(f"Unsupported checkpoint type: {type(net_config)}")
 
     print(f"  ELO rating:   {elo:.0f}")
     return net, encoder, model_name
@@ -907,8 +1045,8 @@ def main() -> None:
     parser.add_argument(
         "--simulations",
         type=int,
-        default=100,
-        help="MCTS simulations per AI move (default: 100)",
+        default=200,
+        help="MCTS simulations per AI move (default: 200)",
     )
     parser.add_argument(
         "--color",

@@ -56,9 +56,9 @@ class TransformerConfig:
     board_size: int = HiveEncoder.BOARD_SIZE                # 13
 
     # Auxiliary heads
-    aux_mobility_enabled: bool = True
+    aux_mobility_enabled: bool = False
     aux_queen_surround_enabled: bool = True
-    aux_final_mobility_enabled: bool = True
+    aux_final_mobility_enabled: bool = False
     aux_mobility_hidden: int = 64
     aux_queen_surround_hidden: int = 64
     aux_final_mobility_hidden: int = 64

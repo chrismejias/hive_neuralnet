@@ -2,7 +2,7 @@
  * hive_state.cuh — Compact Hive game state for GPU.
  *
  * Designed for efficient GPU storage and manipulation:
- * - Fixed 17×17 grid (289 cells)
+ * - Fixed 23×23 grid (529 cells)
  * - Full stack tracking: up to MAX_STACK=5 pieces per cell (for beetle play)
  * - Bitboard occupancy for fast neighbor/placement queries
  * - ~1700 bytes total per state
@@ -110,7 +110,7 @@ inline Color cell_color(uint8_t cell_val) {
 // ── Bitboard helpers (289 bits in BB_WORDS × uint64) ─────────────────
 
 struct Bitboard {
-    uint64_t w[BB_WORDS];  // w[0]=bits 0-63, w[1]=64-127, ..., w[4]=256-288
+    uint64_t w[BB_WORDS];  // w[0]=bits 0-63, w[1]=64-127, ..., w[8]=512-528
 
 #ifdef __CUDACC__
     __device__ __host__
@@ -190,7 +190,7 @@ struct Bitboard {
         Bitboard r;
         for (int i = 0; i < BB_WORDS; i++) r.w[i] = ~w[i];
         // Mask off unused bits in the last word
-        constexpr int tail_bits = NUM_CELLS & 63;  // 289 % 64 = 33
+        constexpr int tail_bits = NUM_CELLS & 63;  // 529 % 64 = 17
         if (tail_bits > 0) {
             r.w[BB_WORDS - 1] &= (1ULL << tail_bits) - 1;
         }
@@ -241,10 +241,10 @@ struct HiveState {
     // pieces[level][cell] = packed piece byte (type|color), 0 = empty
     // Level 0 = ground, level 1 = first beetle on top, etc.
     // This preserves ALL pieces including those covered by beetles.
-    uint8_t pieces[MAX_STACK][NUM_CELLS];  // 5 × 289 = 1445 bytes
+    uint8_t pieces[MAX_STACK][NUM_CELLS];  // 5 × 529 = 2645 bytes
 
     // height[cell] = number of pieces stacked at this cell (0 = empty)
-    uint8_t height[NUM_CELLS];             // 289 bytes
+    uint8_t height[NUM_CELLS];             // 529 bytes
 
     // ── Bitboards ───────────────────────────────────────────────
     Bitboard occupied;    // cells with at least one piece
@@ -269,7 +269,7 @@ struct HiveState {
     // Padding to align to 8 bytes (optional, for perf)
     uint8_t _pad[2];
 };
-// Total: ~1445 + 289 + 3*40 + 14 + 10 + 8 ≈ ~1886 bytes
+// Total: ~2645 + 529 + 3*72 + 14 + 10 + 8 ≈ ~3422 bytes
 
 // ── Device functions for HiveState manipulation ────────────────────
 

@@ -15,6 +15,33 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import sys
+import io
+import os
+
+
+class _Tee(io.TextIOBase):
+    """Write to both a stream and a file simultaneously."""
+
+    def __init__(self, stream: io.TextIOBase, path: str) -> None:
+        self._stream = stream
+        self._file = open(path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, s: str) -> int:
+        self._stream.write(s)
+        self._file.write(s)
+        return len(s)
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._file.flush()
+
+    def fileno(self) -> int:
+        return self._stream.fileno()
+
+    @property
+    def encoding(self) -> str:
+        return self._stream.encoding or "utf-8"  # type: ignore[union-attr]
+
 
 from hive_engine.device import get_device, device_summary
 
@@ -138,12 +165,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(skip_arena=True)
 
-    # Playout cap randomization (KataGo-style) — enabled by default
+    # Playout cap randomization (KataGo-style) — disabled by default
     parser.add_argument(
-        "--no-playout-cap-randomize", action="store_false", dest="playout_cap_randomize",
-        help="Disable playout cap randomization (default: enabled).",
+        "--playout-cap-randomize", action="store_true", dest="playout_cap_randomize",
+        help="Enable playout cap randomization (default: disabled).",
     )
-    parser.set_defaults(playout_cap_randomize=True)
+    parser.set_defaults(playout_cap_randomize=False)
     parser.add_argument(
         "--playout-cap-prob", type=float, default=0.25,
         help="Probability of using full simulations per move (rest use fast sims).",
@@ -199,6 +226,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(use_mcgs=False)
 
+    # Draw downsampling — keep only a fraction of drawn games
+    parser.add_argument(
+        "--draw-keep-rate", type=float, default=1.0,
+        help="Fraction of drawn games to keep for training (0.25 = discard 75%% of draws). "
+             "Decisive games are always kept. Default: 1.0 (keep all).",
+    )
+
+    # Queen pressure value shaping — soft value targets for drawn games
+    parser.add_argument(
+        "--queen-pressure-scale", type=float, default=0.4,
+        help="For drawn games, use queen surround differential as a soft value target. "
+             "value = scale * (opp_queen_surrounded - own_queen_surrounded) / 6. "
+             "0.0 = disabled. Default: 0.4.",
+    )
+
+    # Expansion pieces
+    parser.add_argument(
+        "--expansion", type=int, default=0,
+        help="Expansion mask: 3-bit (1=Mosquito, 2=Ladybug, 4=Pillbug, 7=all). "
+             "-1 = random each iteration. Default: 0 (base game only).",
+    )
+
+    # Endgame curriculum learning
+    parser.add_argument(
+        "--endgame-frac", type=float, default=0.0,
+        help="Fraction of games per iteration to start from near-endgame positions "
+             "(both queens ~surrounded).  0.0 = disabled, 1.0 = all games. "
+             "Only active with --gpu-native. Default: 0.0.",
+    )
+    parser.add_argument(
+        "--endgame-surround", type=int, default=5,
+        help="Target neighbor count for both queens in endgame positions "
+             "(4 or 5; 5 = one move from losing). Default: 5.",
+    )
+
     # GPU-native MCTS — opt-in, off by default
     parser.add_argument(
         "--gpu-native", action="store_true", dest="use_gpu_native",
@@ -241,6 +303,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--resume", type=str, default=None,
         help="Resume from checkpoint file.",
+    )
+
+    # Logging
+    parser.add_argument(
+        "--log-file", type=str, default=None,
+        help="Append all stdout/stderr output to this file (in addition to the terminal).",
     )
 
     return parser.parse_args(argv)
@@ -288,6 +356,11 @@ def _build_train_config(args: argparse.Namespace) -> GPUTrainConfig:
         shaped_dirichlet=args.shaped_dirichlet,
         use_mcgs=args.use_mcgs,
         use_gpu_native=args.use_gpu_native,
+        draw_keep_rate=args.draw_keep_rate,
+        queen_pressure_scale=args.queen_pressure_scale,
+        expansion_mask=args.expansion,
+        endgame_frac=args.endgame_frac,
+        endgame_surround=args.endgame_surround,
     )
 
 
@@ -307,12 +380,30 @@ def _get_net_config_and_class(args: argparse.Namespace):
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
+    # Tee stdout/stderr to log file in append mode before any other output
+    if args.log_file:
+        log_dir = os.path.dirname(args.log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        sys.stdout = _Tee(sys.stdout, args.log_file)
+        sys.stderr = _Tee(sys.stderr, args.log_file)
+
     if args.resume:
         train_config = _build_train_config(args)
         overrides = dataclasses.asdict(train_config)
         net_config, net_class = _get_net_config_and_class(args)
+        # Pass overridable net_config fields so CLI flags (e.g. disabling aux
+        # heads) take effect when resuming from an older checkpoint.
+        net_cfg_overrides = {
+            "aux_mobility_enabled": net_config.aux_mobility_enabled,
+            "aux_final_mobility_enabled": net_config.aux_final_mobility_enabled,
+            "predict_uncertainty": net_config.predict_uncertainty,
+        }
         trainer = GPUTrainer.from_checkpoint(
-            args.resume, net_class=net_class, config_overrides=GPUTrainConfig(**overrides)
+            args.resume,
+            net_class=net_class,
+            config_overrides=GPUTrainConfig(**overrides),
+            net_config_overrides=net_cfg_overrides,
         )
         print(f"Resuming from checkpoint: {args.resume}")
     else:
@@ -352,10 +443,29 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Root P temp:  {cfg.root_policy_temp}")
     print(f"  Shaped Dir:   {cfg.shaped_dirichlet}")
     print(f"  Surprise wt:  {cfg.policy_surprise_weight}")
+    print(f"  Draw keep:    {cfg.draw_keep_rate:.0%} of draws kept")
+    qp_str = f"{cfg.queen_pressure_scale}" if cfg.queen_pressure_scale > 0 else "disabled"
+    print(f"  Q-pressure:   {qp_str}")
     print(f"  Uncertainty:  {net_cfg.predict_uncertainty}")
     search_str = 'MCGS (DAG)' if cfg.use_mcgs else ('MCTS GPU-native' if cfg.use_gpu_native else 'MCTS (tree)')
     print(f"  Search:       {search_str}")
     print(f"  Checkpoints:  {cfg.checkpoint_dir}")
+    if cfg.expansion_mask < 0:
+        exp_str = "random per game (all 8 subsets, split across sub-batches)"
+    elif cfg.expansion_mask == 0:
+        exp_str = "base game only"
+    else:
+        pieces = []
+        if cfg.expansion_mask & 1: pieces.append("Mosquito")
+        if cfg.expansion_mask & 2: pieces.append("Ladybug")
+        if cfg.expansion_mask & 4: pieces.append("Pillbug")
+        exp_str = "+".join(pieces)
+    print(f"  Expansions:   {exp_str}")
+    if cfg.endgame_frac > 0.0:
+        print(f"  Endgame:      {cfg.endgame_frac:.0%} of games from endgame "
+              f"(surround={cfg.endgame_surround})")
+    else:
+        print(f"  Endgame:      disabled (all games from start)")
     print(f"{'='*60}\n")
 
     trainer.run()

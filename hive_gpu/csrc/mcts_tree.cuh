@@ -155,29 +155,35 @@ __global__ void mcts_select_kernel(
     int node = 0;   // start at root
     int path_len = 0;
 
-    while (true) {
+    // Hard-bounded loop: MAX_TREE_DEPTH iterations max.
+    // The inner checks should break earlier, but this prevents any hang.
+    for (int _loop_iter = 0; _loop_iter < MAX_TREE_DEPTH; _loop_iter++) {
         int ni = tree_idx(tree, game, node);
 
         // Stop at unexpanded, terminal, or childless nodes
         int fc = tree.first_child[ni];
-        if (fc < 0 || tree.is_terminal[ni] || tree.num_children[ni] == 0)
+        int nc_raw = tree.num_children[ni];
+        if (fc < 0 || tree.is_terminal[ni] || nc_raw == 0)
             break;
 
-        // Depth limit: stop before descending further
-        if (path_len >= MAX_TREE_DEPTH)
+        // Guard against corrupted num_children
+        int nc = nc_raw;
+        if (nc <= 0 || nc > 1024) {
+            // nc should never exceed MAX_LEGAL_MOVES (~256), 1024 is generous
             break;
+        }
 
         // PUCT: pick child with highest score
-        int nc = tree.num_children[ni];
-        // Guard against corrupted num_children
-        if (nc <= 0 || nc > tree.max_nodes) break;
         int best_child = fc;
         float best_score = -1e30f;
         for (int c = 0; c < nc; c++) {
-            float score = puct_score(tree, game, node, fc + c, c_puct);
+            int child_node = fc + c;
+            // Bounds-check child node index
+            if (child_node < 0 || child_node >= tree.max_nodes) break;
+            float score = puct_score(tree, game, node, child_node, c_puct);
             if (score > best_score) {
                 best_score = score;
-                best_child = fc + c;
+                best_child = child_node;
             }
         }
 
@@ -189,13 +195,15 @@ __global__ void mcts_select_kernel(
         atomicAdd(&tree.total_value[ni2], -1.0f);
 
         // Record path
-        my_vl[path_len] = node;
-        // Copy move bytes from tree
-        int64_t mb_base = ((int64_t)game * tree.max_nodes + node) * MOVE_SZ;
-        uint8_t* dst = reinterpret_cast<uint8_t*>(&my_moves[path_len]);
-        for (int b = 0; b < MOVE_SZ; b++)
-            dst[b] = tree.move_bytes[mb_base + b];
-        path_len++;
+        if (path_len < MAX_TREE_DEPTH) {
+            my_vl[path_len] = node;
+            // Copy move bytes from tree
+            int64_t mb_base = ((int64_t)game * tree.max_nodes + node) * MOVE_SZ;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(&my_moves[path_len]);
+            for (int b = 0; b < MOVE_SZ; b++)
+                dst[b] = tree.move_bytes[mb_base + b];
+            path_len++;
+        }
     }
 
     leaf_indices[sim_idx] = node;
@@ -379,10 +387,11 @@ __global__ void mcts_backprop_kernel(
         atomicAdd(&tree.total_value[ni],  1.0f);
     }
 
-    // Normal backpropagation with alternating signs
+    // Normal backpropagation with alternating signs.
+    // Bounded to MAX_TREE_DEPTH to prevent hangs from corrupted parent chains.
     int node = leaf;
     float v  = value;
-    while (node >= 0) {
+    for (int _bp = 0; _bp < MAX_TREE_DEPTH + 1 && node >= 0; _bp++) {
         int ni = tree_idx(tree, game, node);
         atomicAdd(&tree.visit_count[ni], 1);
         atomicAdd(&tree.total_value[ni], v);

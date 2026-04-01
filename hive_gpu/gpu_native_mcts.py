@@ -109,12 +109,25 @@ class GPUNativeMCTSOrchestrator:
 
     # ── Public API ────────────────────────────────────────────────
 
-    def self_play_batch(self) -> list[list[GPUTrainingExample]]:
-        """Play B games in parallel with GPU-native MCTS."""
+    def self_play_batch(
+        self,
+        start_states: "torch.Tensor | None" = None,
+    ) -> list[list[GPUTrainingExample]]:
+        """Play B games in parallel with GPU-native MCTS.
+
+        Args:
+            start_states: Optional [B, SIZEOF_HIVE_STATE] uint8 tensor of
+                pre-built starting positions (e.g. endgame positions for
+                curriculum learning).  If None, fresh initial states are
+                created via create_initial_states().
+        """
         B = self.config.batch_size
         cfg = self.config
 
-        root_states = self.ext.create_initial_states(B, cfg.expansion_mask)
+        if start_states is not None:
+            root_states = start_states.cuda()
+        else:
+            root_states = self.ext.create_initial_states(B, cfg.expansion_mask)
         tree = self._alloc_tree(B)
 
         active = [True] * B
@@ -143,6 +156,11 @@ class GPUNativeMCTSOrchestrator:
             mob_np = mob_tensor.cpu().numpy()
             mob_board_counts = mob_counts.cpu().numpy()
 
+            # Override policies for any game with an immediate winning move
+            self._check_immediate_wins(
+                root_states, B, active, current_turns, tree, policies,
+            )
+
             # Record history & select actions
             action_move_bytes = np.zeros((B, self._move_size), dtype=np.uint8)
 
@@ -163,6 +181,17 @@ class GPUNativeMCTSOrchestrator:
                 if move_numbers[i] >= cfg.temperature_drop_move:
                     action = int(np.argmax(policy))
                 else:
+                    psum = policy.sum()
+                    if psum > 0 and np.isfinite(psum):
+                        policy = policy / psum
+                    else:
+                        # Fallback: uniform over legal actions
+                        mask = policy > 0
+                        policy = np.zeros_like(policy)
+                        if mask.any():
+                            policy[mask] = 1.0 / mask.sum()
+                        else:
+                            policy[:] = 1.0 / len(policy)
                     action = int(np.random.choice(len(policy), p=policy))
 
                 # Look up move bytes from tree
@@ -290,10 +319,6 @@ class GPUNativeMCTSOrchestrator:
             policy_logits[masks_bool] = float("-inf")
             action_probs = torch.softmax(policy_logits, dim=-1)
             values_flat = values.squeeze(-1)
-
-            # Sync PyTorch async ops before launching custom CUDA kernels
-            # (torch.compile may use non-default streams)
-            torch.cuda.synchronize()
 
             # LEGAL MOVES
             legal_moves, num_legal = self.ext.generate_legal_moves_batch(
@@ -439,6 +464,88 @@ class GPUNativeMCTSOrchestrator:
             cfg.dirichlet_epsilon, cfg.root_policy_temp,
             B, self._max_nodes,
         )
+
+    # ── Win-in-one override ───────────────────────────────────────
+
+    def _check_immediate_wins(
+        self,
+        root_states: torch.Tensor,
+        B: int,
+        active: list[bool],
+        current_turns: list[int],
+        tree: dict[str, torch.Tensor],
+        policies: list[np.ndarray],
+    ) -> None:
+        """Override policies with probability 1 for any game with an immediate win.
+
+        Applies every root child's move to a cloned batch of GPU states and
+        checks results in one vectorised call.  This catches winning moves even
+        when their policy prior is too low for MCTS to have explored them.
+
+        Sign convention: terminal_value at a root child is from the *child's*
+        player perspective (the opponent).  From the PUCT formula
+            Q = -total_value[child] / visits
+        a terminal_value < 0 at the child means Q > 0 from the root player's
+        perspective → winning for the root player.  We confirm by checking the
+        raw GPU result code:  WHITE_WINS=1, BLACK_WINS=2.
+        """
+        # Gather per-game root-child metadata (one CPU read per tensor)
+        fc_np  = tree["first_child"][:, 0].cpu().numpy()   # [B]
+        nc_np  = tree["num_children"][:, 0].cpu().numpy()  # [B]
+        ai_np  = tree["action_idx"].cpu().numpy()           # [B, max_nodes]
+        mb_np  = tree["move_bytes"].cpu().numpy()           # [B, max_nodes, move_sz]
+
+        # Build a flat batch: one entry per (game, root-child) pair
+        game_indices:  list[int] = []
+        child_indices: list[int] = []
+
+        for i in range(B):
+            if not active[i]:
+                continue
+            fc = int(fc_np[i])
+            nc = int(nc_np[i])
+            if fc < 0 or nc == 0:
+                continue
+            for c in range(nc):
+                game_indices.append(i)
+                child_indices.append(fc + c)
+
+        if not game_indices:
+            return
+
+        total = len(game_indices)
+        gi_t  = torch.tensor(game_indices, dtype=torch.int64, device="cuda")
+
+        # Clone root states (fancy-index creates a copy, not a view)
+        states_test = root_states[gi_t].clone()
+
+        # Build corresponding move bytes tensor
+        moves_np = np.stack(
+            [mb_np[game_indices[k], child_indices[k]] for k in range(total)],
+            axis=0,
+        ).astype(np.uint8)
+        moves_t = torch.from_numpy(moves_np).cuda()
+
+        # Apply all moves and check results in one GPU call
+        self.ext.apply_moves_batch(states_test, moves_t, total)
+        results_np = self.ext.check_results_batch(states_test, total).cpu().numpy()
+
+        # Map results back; WHITE_WINS=1, BLACK_WINS=2
+        # win_result for current player: turn%2==0 → White → 1, else → 2
+        already_overridden: set[int] = set()
+        for k in range(total):
+            if results_np[k] == 0:
+                continue  # IN_PROGRESS — not a win
+            i = game_indices[k]
+            if i in already_overridden:
+                continue  # already found a win for this game
+            win_result = 1 if (current_turns[i] % 2 == 0) else 2
+            if results_np[k] == win_result:
+                win_action = int(ai_np[i, child_indices[k]])
+                if 0 <= win_action < len(policies[i]):
+                    policies[i][:] = 0.0
+                    policies[i][win_action] = 1.0
+                    already_overridden.add(i)
 
     # ── Action → move bytes lookup ────────────────────────────────
 
@@ -623,14 +730,31 @@ class GPUNativeMCTSOrchestrator:
         final_mob_board_counts: np.ndarray,
         final_qs_data: list[tuple[np.ndarray, np.ndarray]],
     ) -> list[list[GPUTrainingExample]]:
+        qp_scale = self.config.queen_pressure_scale
         all_examples = []
         for i, history in enumerate(histories):
             result = int(final_results[i])
             examples = []
             num_steps = len(history)
+
+            # Queen pressure value shaping for drawn games:
+            # Compute surround differential from final position.
+            draw_value_white = 0.0
+            if (result == 0 or result == 3) and qp_scale > 0.0:
+                qs_target_final, qs_mask_final = final_qs_data[i]
+                # Count pieces adjacent to each queen
+                white_q_surrounded = float(qs_target_final[:, 0].sum()) if qs_mask_final[0] > 0 else 0.0
+                black_q_surrounded = float(qs_target_final[:, 1].sum()) if qs_mask_final[1] > 0 else 0.0
+                # Positive = white is winning (more pieces around black's queen)
+                draw_value_white = qp_scale * (black_q_surrounded - white_q_surrounded) / 6.0
+
             for step_idx, (graph, policy, turn, mobility, seq, nn_prior) in enumerate(history):
                 if result == 0 or result == 3:
-                    value = 0.0
+                    if draw_value_white != 0.0:
+                        player_is_white = (turn % 2 == 0)
+                        value = draw_value_white if player_is_white else -draw_value_white
+                    else:
+                        value = 0.0
                 else:
                     player_is_white = (turn % 2 == 0)
                     if result == 1:

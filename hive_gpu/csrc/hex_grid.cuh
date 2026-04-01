@@ -6,8 +6,8 @@
  *
  * Flat-top hex orientation with 6 directions: E, NE, NW, W, SW, SE.
  * Axial coordinates (q, r) map to grid as:
- *   col = q - center_q + 8
- *   row = r - center_r + 8
+ *   col = q - center_q + 11
+ *   row = r - center_r + 11
  *
  * Direction offsets in (dq, dr):
  *   E=(+1,0), NE=(+1,-1), NW=(0,-1), W=(-1,0), SW=(-1,+1), SE=(0,+1)
@@ -21,13 +21,13 @@
 
 namespace hive_gpu {
 
-constexpr int BOARD_SIZE = 17;
-constexpr int HALF_BOARD = 8;
-constexpr int NUM_CELLS  = BOARD_SIZE * BOARD_SIZE;  // 289
+constexpr int BOARD_SIZE = 23;
+constexpr int HALF_BOARD = 11;
+constexpr int NUM_CELLS  = BOARD_SIZE * BOARD_SIZE;  // 529
 constexpr int NUM_DIRS   = 6;
 
 // Number of uint64_t words needed for a NUM_CELLS bitboard
-constexpr int BB_WORDS = (NUM_CELLS + 63) / 64;  // 5
+constexpr int BB_WORDS = (NUM_CELLS + 63) / 64;  // 9
 
 // Direction indices
 constexpr int DIR_E  = 0;

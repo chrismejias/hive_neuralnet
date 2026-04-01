@@ -107,7 +107,7 @@ class GPUTrainConfig:
     nn_max_batch: int = 0      # max NN batch size per forward pass (0 = no limit)
 
     # Playout cap randomization (KataGo-style)
-    playout_cap_randomize: bool = True
+    playout_cap_randomize: bool = False
     playout_cap_randomize_prob: float = 0.25   # prob of full playouts; else fast
     playout_cap_fast_sims: int = 0             # 0 = auto (num_simulations // 8)
 
@@ -134,6 +134,26 @@ class GPUTrainConfig:
 
     # GPU-native MCTS (tree on GPU, CUDA kernels for select/expand/backprop)
     use_gpu_native: bool = False
+
+    # Draw downsampling: keep only this fraction of drawn games (1.0 = keep all)
+    draw_keep_rate: float = 1.0
+
+    # Queen pressure value shaping: for drawn games, use queen surround
+    # differential as a soft value target instead of 0.0.
+    # value = scale * (pieces_around_opp_queen - pieces_around_own_queen) / 6
+    # 0.0 = disabled (draws always get value 0.0)
+    queen_pressure_scale: float = 0.0
+
+    # Expansion pieces: 3-bit mask (bit 0=Mosquito, 1=Ladybug, 2=Pillbug)
+    # -1 = random each iteration (uniform over 0-7), 0-7 = fixed mask
+    expansion_mask: int = 0
+
+    # Endgame curriculum: fraction of games to start from near-endgame positions.
+    # 0.0 = disabled (all games start from scratch).
+    # 1.0 = all games start from endgame positions.
+    # Endgame positions have both queens surrounded by endgame_surround pieces.
+    endgame_frac: float = 0.0
+    endgame_surround: int = 5   # target neighbor count for both queens
 
 
 # ── GPU Trainer ────────────────────────────────────────────────────────
@@ -261,11 +281,21 @@ class GPUTrainer:
 
             self.buffer.add_examples(new_examples)
             sp_time = time.time() - t0
+            exp_mask = sp_stats.get('expansion_mask', 0)
+            exp_str = ""
+            if exp_mask < 0:
+                exp_str = " [rand]"
+            elif exp_mask > 0:
+                pieces = []
+                if exp_mask & 1: pieces.append("M")
+                if exp_mask & 2: pieces.append("L")
+                if exp_mask & 4: pieces.append("P")
+                exp_str = f" [{'+'.join(pieces)}]"
             sp_line = (
                 f"  Self-play: {len(new_examples)} examples from "
                 f"{sp_stats['num_games']} games "
                 f"(W:{sp_stats['white_wins']} B:{sp_stats['black_wins']} "
-                f"D:{sp_stats['draws']}, {sp_time:.1f}s)"
+                f"D:{sp_stats['draws']}, {sp_time:.1f}s){exp_str}"
             )
             if "transposition_hits" in sp_stats:
                 sp_line += (
@@ -331,42 +361,32 @@ class GPUTrainer:
     def _self_play_phase(
         self,
     ) -> tuple[list, dict]:
-        """Run GPU-accelerated self-play, returning training examples."""
+        """Run GPU-accelerated self-play, returning training examples.
+
+        When expansion_mask < 0 (random-per-game mode), the total games are
+        split evenly across all 8 possible expansion masks (0-7).  Each group
+        is run as a separate, smaller orchestrator call so every game sees a
+        different expansion subset.  When expansion_mask >= 0 all games share
+        that fixed mask (original behaviour).
+        """
         cfg = self.config
-
-        # All games run in parallel from start to finish (no slot recycling).
-        parallel_slots = cfg.games_per_batch
-
-        mcts_config = GPUMCTSConfig(
-            num_simulations=cfg.mcts_simulations,
-            c_puct=cfg.c_puct,
-            dirichlet_alpha=cfg.dirichlet_alpha,
-            dirichlet_epsilon=cfg.dirichlet_epsilon,
-            temperature=cfg.temperature,
-            temperature_drop_move=cfg.temperature_drop_move,
-            batch_size=parallel_slots,
-            games_per_batch=cfg.games_per_batch,
-            max_game_length=cfg.max_game_length,
-            encoder_type=cfg.encoder_type,
-            wave_size=cfg.wave_size,
-            nn_max_batch=cfg.nn_max_batch,
-            playout_cap_randomize=cfg.playout_cap_randomize,
-            playout_cap_randomize_prob=cfg.playout_cap_randomize_prob,
-            playout_cap_fast_sims=cfg.playout_cap_fast_sims,
-            policy_target_pruning=cfg.policy_target_pruning,
-            root_policy_temp=cfg.root_policy_temp,
-            shaped_dirichlet=cfg.shaped_dirichlet,
-        )
+        is_transformer = cfg.encoder_type == "transformer"
 
         self.best_net.eval()
-        if cfg.use_mcgs:
-            from hive_gpu.gpu_mcgs import MCGSOrchestrator
-            orchestrator = MCGSOrchestrator(self.best_net, mcts_config)
-        elif cfg.use_gpu_native:
-            orchestrator = GPUNativeMCTSOrchestrator(self.best_net, mcts_config)
+
+        # Build the list of (mask, sub_batch_size) pairs to execute.
+        if cfg.expansion_mask < 0:
+            # Per-game randomisation: cover all 8 masks equally.
+            num_masks = 8
+            total_games = cfg.games_per_batch * cfg.batches_per_iteration
+            sub_size = max(1, total_games // num_masks)
+            run_list = [(mask, sub_size) for mask in range(num_masks)]
         else:
-            orchestrator = GPUMCTSOrchestrator(self.best_net, mcts_config)
-        is_transformer = cfg.encoder_type == "transformer"
+            # Fixed mask: original loop over batches_per_iteration.
+            run_list = [
+                (cfg.expansion_mask, cfg.games_per_batch)
+                for _ in range(cfg.batches_per_iteration)
+            ]
 
         all_examples: list = []
         stats = {
@@ -374,12 +394,101 @@ class GPUTrainer:
             "white_wins": 0,
             "black_wins": 0,
             "draws": 0,
+            "expansion_mask": cfg.expansion_mask,  # -1 = random per game
         }
+        last_orchestrator = None
 
-        for batch_idx in range(cfg.batches_per_iteration):
-            batch_examples = orchestrator.self_play_batch()
+        # Pre-generate endgame positions for curriculum learning.
+        # We build a pool large enough to cover the whole iteration, then
+        # hand out sub_size positions per sub-batch.
+        endgame_pool: list[bytes] | None = None
+        endgame_pool_idx = 0
+        if cfg.endgame_frac > 0.0 and cfg.use_gpu_native:
+            from hive_gpu.endgame_generator import (
+                generate_endgame_positions, positions_to_tensor, SIZEOF_HIVE_STATE,
+            )
+            total_games = sum(sz for _, sz in run_list)
+            n_endgame = max(1, int(total_games * cfg.endgame_frac))
+            t0 = time.time()
+            endgame_pool = generate_endgame_positions(
+                n_positions=n_endgame,
+                expansion_mask=cfg.expansion_mask,
+                min_surround=max(1, cfg.endgame_surround - 1),
+                max_surround=cfg.endgame_surround,
+                verbose=True,
+            )
+            print(f"  [endgame] pool={len(endgame_pool)} positions "
+                  f"in {time.time()-t0:.1f}s")
+
+        for mask, sub_size in run_list:
+            mcts_config = GPUMCTSConfig(
+                num_simulations=cfg.mcts_simulations,
+                c_puct=cfg.c_puct,
+                dirichlet_alpha=cfg.dirichlet_alpha,
+                dirichlet_epsilon=cfg.dirichlet_epsilon,
+                temperature=cfg.temperature,
+                temperature_drop_move=cfg.temperature_drop_move,
+                batch_size=sub_size,
+                games_per_batch=sub_size,
+                max_game_length=cfg.max_game_length,
+                encoder_type=cfg.encoder_type,
+                wave_size=cfg.wave_size,
+                nn_max_batch=cfg.nn_max_batch,
+                playout_cap_randomize=cfg.playout_cap_randomize,
+                playout_cap_randomize_prob=cfg.playout_cap_randomize_prob,
+                playout_cap_fast_sims=cfg.playout_cap_fast_sims,
+                policy_target_pruning=cfg.policy_target_pruning,
+                root_policy_temp=cfg.root_policy_temp,
+                shaped_dirichlet=cfg.shaped_dirichlet,
+                queen_pressure_scale=cfg.queen_pressure_scale,
+                expansion_mask=mask,
+            )
+
+            if cfg.use_mcgs:
+                from hive_gpu.gpu_mcgs import MCGSOrchestrator
+                orchestrator = MCGSOrchestrator(self.best_net, mcts_config)
+            elif cfg.use_gpu_native:
+                orchestrator = GPUNativeMCTSOrchestrator(self.best_net, mcts_config)
+            else:
+                orchestrator = GPUMCTSOrchestrator(self.best_net, mcts_config)
+            last_orchestrator = orchestrator
+
+            # Build start_states tensor for GPU-native MCTS if endgame pool available.
+            start_states_t = None
+            if (endgame_pool is not None
+                    and cfg.use_gpu_native
+                    and len(endgame_pool) > 0):
+                n_eg = int(sub_size * cfg.endgame_frac)
+                n_fresh = sub_size - n_eg
+                eg_tensors = []
+                if n_eg > 0:
+                    # Draw from pool (cycling if needed)
+                    idxs = [endgame_pool_idx % len(endgame_pool) + i
+                            for i in range(n_eg)]
+                    endgame_pool_idx += n_eg
+                    eg_bytes = [endgame_pool[j % len(endgame_pool)] for j in idxs]
+                    eg_tensors.append(positions_to_tensor(eg_bytes, device="cuda"))
+                if n_fresh > 0:
+                    fresh = orchestrator.ext.create_initial_states(n_fresh, mask)
+                    eg_tensors.append(fresh)
+                start_states_t = torch.cat(eg_tensors, dim=0) if eg_tensors else None
+
+            if cfg.use_gpu_native and start_states_t is not None:
+                batch_examples = orchestrator.self_play_batch(
+                    start_states=start_states_t
+                )
+            else:
+                batch_examples = orchestrator.self_play_batch()
 
             for game_examples in batch_examples:
+                # Draw downsampling: skip drawn games at rate (1 - draw_keep_rate)
+                if game_examples and cfg.draw_keep_rate < 1.0:
+                    v = game_examples[0].value_target
+                    if v == 0.0 and np.random.random() > cfg.draw_keep_rate:
+                        stats["num_games"] += 1
+                        stats["draws"] += 1
+                        continue
+
                 for ex in game_examples:
                     # Compute surprise weight from KL(MCTS || NN_prior)
                     sw = self._compute_surprise_weight(
@@ -423,11 +532,11 @@ class GPUTrainer:
                 else:
                     stats["draws"] += 1
 
-        # Add MCGS stats if available
-        if hasattr(orchestrator, "total_transposition_hits"):
-            stats["transposition_hits"] = orchestrator.total_transposition_hits
-            stats["nn_evals"] = orchestrator.total_nn_evals
-            stats["dag_nodes"] = orchestrator.total_dag_nodes
+        # Add MCGS stats if available (from last orchestrator)
+        if last_orchestrator is not None and hasattr(last_orchestrator, "total_transposition_hits"):
+            stats["transposition_hits"] = last_orchestrator.total_transposition_hits
+            stats["nn_evals"] = last_orchestrator.total_nn_evals
+            stats["dag_nodes"] = last_orchestrator.total_dag_nodes
 
         return all_examples, stats
 
@@ -677,11 +786,24 @@ class GPUTrainer:
         path: str,
         net_class=None,
         config_overrides: GPUTrainConfig | None = None,
+        net_config_overrides: dict | None = None,
     ) -> GPUTrainer:
-        """Restore a trainer from a checkpoint."""
+        """Restore a trainer from a checkpoint.
+
+        Args:
+            net_config_overrides: Optional dict of fields to override on the
+                saved net_config (e.g. ``{"aux_mobility_enabled": False}``).
+                When provided, ``strict=False`` is used for state_dict loading
+                so that removed or added heads are silently skipped.
+        """
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
 
         net_config = checkpoint["net_config"]
+        # Apply architecture overrides (e.g. enable/disable auxiliary heads).
+        if net_config_overrides:
+            for key, val in net_config_overrides.items():
+                setattr(net_config, key, val)
+
         train_config = config_overrides or checkpoint.get(
             "train_config", GPUTrainConfig()
         )
@@ -692,7 +814,10 @@ class GPUTrainer:
             net_config=net_config,
             net_class=net_class,
         )
-        trainer.best_net.load_state_dict(checkpoint["model_state_dict"])
+        # Use strict=False when architecture overrides are present so that
+        # extra weights (e.g. removed heads) are silently discarded.
+        strict = net_config_overrides is None
+        trainer.best_net.load_state_dict(checkpoint["model_state_dict"], strict=strict)
         trainer.best_net = trainer.best_net.to(trainer.device)
         trainer._start_iteration = iteration + 1
         # Treat num_iterations as additional iterations when resuming.

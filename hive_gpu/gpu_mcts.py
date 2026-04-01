@@ -66,6 +66,9 @@ class GPUMCTSConfig:
     # Shaped Dirichlet noise (scale alpha inversely with legal move count)
     shaped_dirichlet: bool = True
 
+    # Queen pressure value shaping for drawn games
+    queen_pressure_scale: float = 0.0
+
     # MCGS DAG node cap per game (prevents OOM from unbounded DAG growth)
     max_dag_nodes: int = 50_000
 
@@ -1087,9 +1090,13 @@ class GPUMCTSOrchestrator:
         BOARD_SIZE = self.ext.BOARD_SIZE
         NUM_CELLS = BOARD_SIZE * BOARD_SIZE
 
-        # HiveState layout: turn at offset 1876 (empirically verified;
-        # 2 bytes padding between height[289] and occupied Bitboard for alignment)
-        turn_offset = 1876
+        # HiveState layout: turn offset depends on BOARD_SIZE.
+        # 2 bytes padding between height[NUM_CELLS] and occupied Bitboard for alignment.
+        _nc = BOARD_SIZE * BOARD_SIZE
+        _bb_sz = (((_nc + 63) // 64) * 8)  # Bitboard size in bytes
+        _off_height = 5 * _nc  # pieces[5][NUM_CELLS]
+        _off_occupied = ((_off_height + _nc + 7) // 8) * 8  # align to 8 bytes
+        turn_offset = _off_occupied + 3 * _bb_sz + 4 + 16  # 3 bitboards + queen_cell + hands
         turn = int(state_bytes[turn_offset]) | (int(state_bytes[turn_offset + 1]) << 8)
         return turn
 
@@ -1111,25 +1118,25 @@ class GPUMCTSOrchestrator:
 
     # ── HiveState byte parsing constants ───────────────────────────────
 
-    # Hex grid: 17×17, direction offsets (dcol, drow)
-    _BOARD_SIZE = 17
-    _NUM_CELLS = _BOARD_SIZE * _BOARD_SIZE  # 289
+    # Hex grid: 23×23, direction offsets (dcol, drow)
+    _BOARD_SIZE = 23
+    _NUM_CELLS = _BOARD_SIZE * _BOARD_SIZE  # 529
     _DIR_DCOL = [+1, +1,  0, -1, -1,  0]
     _DIR_DROW = [ 0, -1, -1,  0, +1, +1]
     _MAX_STACK = 5
 
     # HiveState struct byte offsets (empirically verified).
-    # Bitboard (uint64_t[5]) requires 8-byte alignment, adding 2 bytes padding
-    # after height[289] at offset 1734 → occupied starts at 1736.
-    _OFF_PIECES = 0                        # uint8[5][289] = 1445
-    _OFF_HEIGHT = _MAX_STACK * _NUM_CELLS  # 1445
-    _BB_SIZE = 5 * 8                       # 40 bytes per Bitboard
-    _OFF_OCCUPIED = 1736                   # Bitboard, 40 bytes
-    _OFF_WHITE_TOP = 1776                  # Bitboard, 40 bytes
-    _OFF_BLACK_TOP = 1816                  # Bitboard, 40 bytes
-    _OFF_QUEEN_CELL = 1856                 # uint16[2] = 4 bytes
-    _OFF_HANDS = 1860                      # uint8[2][8] = 16 bytes
-    _OFF_TURN = 1876                       # uint16
+    # Bitboard (uint64_t[9]) requires 8-byte alignment, adding 2 bytes padding
+    # after height[529] at offset 3174 → occupied starts at 3176.
+    _OFF_PIECES = 0                        # uint8[5][529] = 2645
+    _OFF_HEIGHT = _MAX_STACK * _NUM_CELLS  # 2645
+    _BB_SIZE = 9 * 8                       # 72 bytes per Bitboard
+    _OFF_OCCUPIED = 3176                   # Bitboard, 72 bytes
+    _OFF_WHITE_TOP = 3248                  # Bitboard, 72 bytes
+    _OFF_BLACK_TOP = 3320                  # Bitboard, 72 bytes
+    _OFF_QUEEN_CELL = 3392                 # uint16[2] = 4 bytes
+    _OFF_HANDS = 3396                      # uint8[2][8] = 16 bytes
+    _OFF_TURN = 3412                       # uint16
 
     def _hex_neighbors(self, cell: int) -> list[int]:
         """Get valid hex neighbor cells (matching GPU hex_grid.cuh layout)."""
@@ -1218,6 +1225,7 @@ class GPUMCTSOrchestrator:
         final_qs_data: list[tuple[np.ndarray, np.ndarray]],
     ) -> list[list[GPUTrainingExample]]:
         """Build training examples from game histories and final results."""
+        qp_scale = self.config.queen_pressure_scale
         all_examples = []
 
         for i, history in enumerate(histories):
@@ -1225,10 +1233,23 @@ class GPUMCTSOrchestrator:
             examples = []
             num_steps = len(history)
 
+            # Queen pressure value shaping for drawn games:
+            # Compute surround differential from final position.
+            draw_value_white = 0.0
+            if (result == 0 or result == 3) and qp_scale > 0.0:
+                qs_target_final, qs_mask_final = final_qs_data[i]
+                white_q_surrounded = float(qs_target_final[:, 0].sum()) if qs_mask_final[0] > 0 else 0.0
+                black_q_surrounded = float(qs_target_final[:, 1].sum()) if qs_mask_final[1] > 0 else 0.0
+                draw_value_white = qp_scale * (black_q_surrounded - white_q_surrounded) / 6.0
+
             for step_idx, (graph, policy, turn, mobility, seq, nn_prior) in enumerate(history):
                 # Value from this player's perspective
                 if result == 0 or result == 3:  # IN_PROGRESS or DRAW
-                    value = 0.0
+                    if draw_value_white != 0.0:
+                        player_is_white = (turn % 2 == 0)
+                        value = draw_value_white if player_is_white else -draw_value_white
+                    else:
+                        value = 0.0
                 else:
                     player_is_white = (turn % 2 == 0)
                     if result == 1:  # WHITE_WINS
