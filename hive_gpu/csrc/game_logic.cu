@@ -130,7 +130,8 @@ std::tuple<at::Tensor, at::Tensor> generate_legal_moves_batch(
     int blocks = (batch_size + threads - 1) / threads;
     generate_legal_moves_kernel<<<blocks, threads>>>(
         states_ptr, moves_ptr, num_legal_ptr, batch_size);
-    cudaDeviceSynchronize();
+    // No cudaDeviceSynchronize: null-stream ordering guarantees correctness
+    // for GPU-to-GPU passes; PyTorch syncs automatically on .cpu() readback.
 
     return std::make_tuple(moves_tensor, num_legal);
 }
@@ -150,7 +151,7 @@ void apply_moves_batch(
     int threads = 256;
     int blocks = (batch_size + threads - 1) / threads;
     apply_moves_kernel<<<blocks, threads>>>(states_ptr, moves_ptr, batch_size);
-    cudaDeviceSynchronize();
+    // No cudaDeviceSynchronize: null-stream ordering is sufficient.
 }
 
 /**
@@ -167,7 +168,8 @@ at::Tensor check_results_batch(at::Tensor states_tensor, int batch_size) {
     int threads = 256;
     int blocks = (batch_size + threads - 1) / threads;
     check_results_kernel<<<blocks, threads>>>(states_ptr, results_ptr, batch_size);
-    cudaDeviceSynchronize();
+    // No cudaDeviceSynchronize: null-stream ordering handles GPU-to-GPU;
+    // PyTorch syncs on .cpu() when callers read back to host.
 
     return results;
 }
@@ -245,7 +247,7 @@ std::tuple<at::Tensor, at::Tensor> generate_legal_mask_batch(
     int blocks = (batch_size + threads - 1) / threads;
     generate_legal_moves_kernel<<<blocks, threads>>>(
         states_ptr, moves_ptr, num_legal_ptr, batch_size);
-    cudaDeviceSynchronize();
+    // No sync: legal_mask_kernel on the same stream reads the result correctly.
 
     // Step 2: Map moves to action mask
     auto masks = at::zeros({batch_size, (int64_t)ACTION_SPACE_SIZE}, opts_f);
@@ -253,9 +255,49 @@ std::tuple<at::Tensor, at::Tensor> generate_legal_mask_batch(
 
     legal_mask_kernel<<<blocks, threads>>>(
         states_ptr, moves_ptr, num_legal_ptr, masks_ptr, batch_size);
-    cudaDeviceSynchronize();
+    // No sync: null-stream ordering; PyTorch syncs on .cpu() when needed.
 
     return std::make_tuple(masks, num_legal);
+}
+
+/**
+ * Fused legal-moves + mask generation.
+ * Runs generate_legal_moves_kernel once and legal_mask_kernel once,
+ * returning all three outputs. Replaces separate calls to
+ * generate_legal_moves_batch + generate_legal_mask_batch in the MCTS
+ * wave loop, halving move-generation kernel launches per wave.
+ *
+ * Returns: (moves_tensor [B, MAX_LEGAL_MOVES, sizeof(GPUMove)] uint8,
+ *           num_legal    [B] int32,
+ *           masks        [B, ACTION_SPACE_SIZE] float32)
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor> generate_legal_moves_and_mask_batch(
+    at::Tensor states_tensor, int batch_size
+) {
+    auto opts_u8 = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+    auto opts_f  = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto opts_i  = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+
+    auto moves_tensor = at::zeros(
+        {batch_size, MAX_LEGAL_MOVES, (int64_t)sizeof(GPUMove)}, opts_u8);
+    auto num_legal = at::zeros({batch_size}, opts_i);
+    auto masks     = at::zeros({batch_size, (int64_t)ACTION_SPACE_SIZE}, opts_f);
+
+    HiveState* states_ptr  = reinterpret_cast<HiveState*>(states_tensor.data_ptr());
+    GPUMove*   moves_ptr   = reinterpret_cast<GPUMove*>(moves_tensor.data_ptr());
+    int*       nl_ptr      = static_cast<int*>(num_legal.data_ptr());
+    float*     masks_ptr   = static_cast<float*>(masks.data_ptr());
+
+    int threads = 256;
+    int blocks  = (batch_size + threads - 1) / threads;
+
+    generate_legal_moves_kernel<<<blocks, threads>>>(
+        states_ptr, moves_ptr, nl_ptr, batch_size);
+    // Same-stream ordering: legal_mask_kernel starts after generate completes.
+    legal_mask_kernel<<<blocks, threads>>>(
+        states_ptr, moves_ptr, nl_ptr, masks_ptr, batch_size);
+
+    return std::make_tuple(moves_tensor, num_legal, masks);
 }
 
 // ── Kernel: compute per-piece mobility for a batch of states ────────
@@ -388,7 +430,7 @@ mcts_select_batch(
         static_cast<int*>(vl_lens.data_ptr()),
         static_cast<const int8_t*>(game_active.data_ptr()),
         c_puct, B, total);
-    cudaDeviceSynchronize();
+    // No sync: next kernel on same stream reads outputs after this completes.
 
     return std::make_tuple(leaf_idx, move_paths, path_lens, vl_paths, vl_lens);
 }
@@ -410,7 +452,7 @@ void mcts_replay_batch(
         static_cast<const int*>(path_lengths.data_ptr()),
         static_cast<const int*>(leaf_indices.data_ptr()),
         B, total);
-    cudaDeviceSynchronize();
+    // No sync: downstream kernels on same stream see leaf_states correctly.
 }
 
 /**
@@ -441,9 +483,44 @@ at::Tensor mcts_expand_batch(
         static_cast<const int*>(results.data_ptr()),
         static_cast<int8_t*>(was_expanded.data_ptr()),
         B, total);
-    cudaDeviceSynchronize();
+    // No sync: backprop kernel on same stream reads was_expanded after this completes.
 
     return was_expanded;
+}
+
+/**
+ * Fused MCTS expand + backprop.
+ * Combines mcts_expand_kernel and mcts_backprop_kernel into a single kernel
+ * launch: was_expanded lives in a register rather than global memory,
+ * eliminating one kernel launch and the associated global memory traffic.
+ */
+void mcts_expand_and_backprop_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor leaf_indices, at::Tensor leaf_states,
+    at::Tensor legal_moves, at::Tensor num_legal,
+    at::Tensor action_probs, at::Tensor results,
+    at::Tensor nn_values, at::Tensor vl_paths, at::Tensor vl_lengths,
+    int B, int total, int max_nodes
+) {
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    mcts_expand_and_backprop_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<const int*>(leaf_indices.data_ptr()),
+        reinterpret_cast<const HiveState*>(leaf_states.data_ptr()),
+        reinterpret_cast<const GPUMove*>(legal_moves.data_ptr()),
+        static_cast<const int*>(num_legal.data_ptr()),
+        static_cast<const float*>(action_probs.data_ptr()),
+        static_cast<const int*>(results.data_ptr()),
+        static_cast<const float*>(nn_values.data_ptr()),
+        static_cast<const int*>(vl_paths.data_ptr()),
+        static_cast<const int*>(vl_lengths.data_ptr()),
+        B, total);
+    // No sync: next wave's select runs on same stream after this completes.
 }
 
 /**
@@ -469,7 +546,7 @@ void mcts_backprop_batch(
         static_cast<const int*>(vl_lengths.data_ptr()),
         static_cast<const int8_t*>(was_expanded.data_ptr()),
         B, total);
-    cudaDeviceSynchronize();
+    // No sync: next operation on same stream executes after backprop completes.
 }
 
 /**
@@ -496,7 +573,7 @@ at::Tensor mcts_extract_policy_batch(
         static_cast<float*>(policies.data_ptr()),
         static_cast<const int*>(move_numbers.data_ptr()),
         temperature, temp_drop_move, pruning_threshold, B);
-    cudaDeviceSynchronize();
+    // No sync: PyTorch syncs on .cpu() when Python reads the result.
 
     return policies;
 }
@@ -520,7 +597,7 @@ void mcts_apply_root_noise(
         tree,
         static_cast<const float*>(noise.data_ptr()),
         max_children_pad, dir_eps, root_policy_temp, B);
-    cudaDeviceSynchronize();
+    // No sync: same-stream ordering; next op sees updated priors correctly.
 }
 
 }  // namespace hive_gpu

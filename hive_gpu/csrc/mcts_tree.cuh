@@ -347,6 +347,128 @@ __global__ void mcts_expand_kernel(
 }
 
 /**
+ * EXPAND+BACKPROP fused kernel — expand leaf then immediately backpropagate.
+ *
+ * Combines mcts_expand_kernel and mcts_backprop_kernel into a single pass.
+ * was_expanded lives in a register rather than global memory, eliminating
+ * one kernel launch and the global write+read of the was_expanded tensor.
+ */
+__global__ void mcts_expand_and_backprop_kernel(
+    MCTSTree          tree,
+    const int*        leaf_indices,   // [total_sims]
+    const HiveState*  leaf_states,    // [total_sims]
+    const GPUMove*    legal_moves,    // [total_sims, MAX_LEGAL_MOVES]
+    const int*        num_legal,      // [total_sims]
+    const float*      action_probs,   // [total_sims, ACTION_SPACE_SIZE]
+    const int*        results,        // [total_sims]
+    const float*      nn_values,      // [total_sims]
+    const int*        vl_paths,       // [total_sims, MAX_TREE_DEPTH]
+    const int*        vl_lengths,     // [total_sims]
+    int B, int total_sims
+) {
+    int sim_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sim_idx >= total_sims) return;
+
+    int leaf = leaf_indices[sim_idx];
+    if (leaf < 0) return;
+
+    int game = sim_idx % B;
+    int li   = tree_idx(tree, game, leaf);
+
+    // ── EXPAND PHASE ──────────────────────────────────────────────
+    int8_t was_expanded = 0;
+
+    if (results[sim_idx] != 0) {
+        tree.is_terminal[li]    = 1;
+        tree.terminal_value[li] = result_to_value(
+            results[sim_idx], leaf_states[sim_idx].turn);
+    } else {
+        int old_fc = atomicCAS(&tree.first_child[li], -1, -2);
+        if (old_fc == -1) {
+            int n_legal = num_legal[sim_idx];
+            if (n_legal > 0) {
+                int cq, cr;
+                compute_centroid(leaf_states[sim_idx], cq, cr);
+
+                int base = atomicAdd(&tree.node_count[game], n_legal);
+                if (base + n_legal <= tree.max_nodes) {
+                    const GPUMove* my_moves = legal_moves + (int64_t)sim_idx * MAX_LEGAL_MOVES;
+                    const float*   probs    = action_probs + (int64_t)sim_idx * ACTION_SPACE_SIZE;
+                    constexpr int  MOVE_SZ  = (int)sizeof(GPUMove);
+
+                    int created = 0;
+                    for (int m = 0; m < n_legal; m++) {
+                        const GPUMove& mv = my_moves[m];
+                        int action = gpu_move_to_action(mv, cq, cr);
+                        if (action < 0) continue;
+
+                        int child_node = base + created;
+                        int ci = tree_idx(tree, game, child_node);
+
+                        tree.visit_count[ci]    = 0;
+                        tree.total_value[ci]    = 0.0f;
+                        tree.prior[ci]          = probs[action];
+                        tree.parent_idx[ci]     = leaf;
+                        tree.action_idx[ci]     = action;
+                        tree.first_child[ci]    = -1;
+                        tree.num_children[ci]   = 0;
+                        tree.is_terminal[ci]    = 0;
+                        tree.terminal_value[ci] = 0.0f;
+
+                        int64_t mb_base = ((int64_t)game * tree.max_nodes + child_node) * MOVE_SZ;
+                        const uint8_t* src = reinterpret_cast<const uint8_t*>(&mv);
+                        for (int b = 0; b < MOVE_SZ; b++)
+                            tree.move_bytes[mb_base + b] = src[b];
+
+                        created++;
+                    }
+
+                    tree.num_children[li] = created;
+                    if (created < n_legal)
+                        atomicAdd(&tree.node_count[game], -(n_legal - created));
+
+                    __threadfence();
+                    tree.first_child[li] = base;
+                    was_expanded = 1;
+                } else {
+                    atomicAdd(&tree.node_count[game], -n_legal);
+                    tree.first_child[li] = -1;
+                }
+            } else {
+                tree.first_child[li] = -1;
+            }
+        }
+    }
+
+    // ── BACKPROP PHASE ────────────────────────────────────────────
+    float value;
+    if (tree.is_terminal[li])
+        value = tree.terminal_value[li];
+    else if (was_expanded)
+        value = nn_values[sim_idx];
+    else
+        value = 0.0f;
+
+    int vl_len    = vl_lengths[sim_idx];
+    const int* vl = vl_paths + (int64_t)sim_idx * MAX_TREE_DEPTH;
+    for (int k = 0; k < vl_len; k++) {
+        int ni = tree_idx(tree, game, vl[k]);
+        atomicAdd(&tree.visit_count[ni], -1);
+        atomicAdd(&tree.total_value[ni],  1.0f);
+    }
+
+    int node = leaf;
+    float v  = value;
+    for (int _bp = 0; _bp < MAX_TREE_DEPTH + 1 && node >= 0; _bp++) {
+        int ni = tree_idx(tree, game, node);
+        atomicAdd(&tree.visit_count[ni], 1);
+        atomicAdd(&tree.total_value[ni], v);
+        v    = -v;
+        node = tree.parent_idx[ni];
+    }
+}
+
+/**
  * BACKPROP kernel — undo virtual loss, propagate value from leaf to root.
  *
  * Value alternates sign at each tree level (two-player zero-sum).

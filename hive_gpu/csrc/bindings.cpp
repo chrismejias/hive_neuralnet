@@ -30,6 +30,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
 encode_states_batch(torch::Tensor states_tensor, int batch_size);
 std::tuple<torch::Tensor, torch::Tensor> generate_legal_mask_batch(
     torch::Tensor states_tensor, int batch_size);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> generate_legal_moves_and_mask_batch(
+    torch::Tensor states_tensor, int batch_size);
 std::tuple<torch::Tensor, torch::Tensor> compute_mobility_batch(
     torch::Tensor states_tensor, int batch_size, bool both_players);
 torch::Tensor compute_centroids_batch(
@@ -63,6 +65,16 @@ void mcts_backprop_batch(
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
     torch::Tensor leaf_indices, torch::Tensor nn_values,
     torch::Tensor vl_paths, torch::Tensor vl_lengths, torch::Tensor was_expanded,
+    int B, int total, int max_nodes);
+
+void mcts_expand_and_backprop_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor leaf_indices, torch::Tensor leaf_states,
+    torch::Tensor legal_moves, torch::Tensor num_legal,
+    torch::Tensor action_probs, torch::Tensor results,
+    torch::Tensor nn_values, torch::Tensor vl_paths, torch::Tensor vl_lengths,
     int B, int total, int max_nodes);
 
 torch::Tensor mcts_extract_policy_batch(
@@ -113,6 +125,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Generate legal action masks (29407-dim) for a batch of states",
           py::arg("states"), py::arg("batch_size"));
 
+    m.def("generate_legal_moves_and_mask_batch", &hive_gpu::generate_legal_moves_and_mask_batch,
+          "Generate legal moves and action masks in one fused kernel pass",
+          py::arg("states"), py::arg("batch_size"));
+
     m.def("compute_mobility_batch", &hive_gpu::compute_mobility_batch,
           "Compute per-piece mobility targets for a batch of states",
           py::arg("states"), py::arg("batch_size"), py::arg("both_players") = false);
@@ -130,6 +146,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "MCTS expand non-terminal unexpanded leaves");
     m.def("mcts_backprop_batch", &hive_gpu::mcts_backprop_batch,
           "MCTS backpropagate values from leaf to root");
+    m.def("mcts_expand_and_backprop_batch", &hive_gpu::mcts_expand_and_backprop_batch,
+          "Fused MCTS expand + backprop in one kernel launch");
     m.def("mcts_extract_policy_batch", &hive_gpu::mcts_extract_policy_batch,
           "Extract MCTS policy from root visit counts");
     m.def("mcts_apply_root_noise", &hive_gpu::mcts_apply_root_noise,

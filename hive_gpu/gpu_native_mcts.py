@@ -307,7 +307,11 @@ class GPUNativeMCTSOrchestrator:
 
             # ENCODE + NN
             encoded = self.encoder.encode_batch(leaf_states[:total], total)
-            masks, _ = self.ext.generate_legal_mask_batch(leaf_states[:total], total)
+
+            # Fused legal-moves + mask: one move-gen kernel instead of two
+            legal_moves, num_legal, masks = self.ext.generate_legal_moves_and_mask_batch(
+                leaf_states[:total], total,
+            )
 
             with torch.no_grad():
                 if cfg.nn_max_batch > 0 and total > cfg.nn_max_batch:
@@ -320,24 +324,12 @@ class GPUNativeMCTSOrchestrator:
             action_probs = torch.softmax(policy_logits, dim=-1)
             values_flat = values.squeeze(-1)
 
-            # LEGAL MOVES
-            legal_moves, num_legal = self.ext.generate_legal_moves_batch(
-                leaf_states[:total], total,
-            )
-
-            # EXPAND
-            was_expanded = self.ext.mcts_expand_batch(
+            # Fused EXPAND + BACKPROP: was_expanded stays in registers
+            self.ext.mcts_expand_and_backprop_batch(
                 *self._tree_args(tree),
                 leaf_idx[:total], leaf_states[:total],
                 legal_moves, num_legal, action_probs, results,
-                B, total, self._max_nodes,
-            )
-
-            # BACKPROP
-            self.ext.mcts_backprop_batch(
-                *self._tree_args(tree),
-                leaf_idx[:total], values_flat,
-                vl_paths[:total], vl_lens[:total], was_expanded,
+                values_flat, vl_paths[:total], vl_lens[:total],
                 B, total, self._max_nodes,
             )
 
