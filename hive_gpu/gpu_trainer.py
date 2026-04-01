@@ -38,12 +38,12 @@ except ImportError:
     GNNEncoder = None          # type: ignore[assignment,misc]
     GNNTrainingExample = None  # type: ignore[assignment,misc]
     GraphReplayBuffer = None   # type: ignore[assignment,misc]
-from hive_transformer.transformer_replay_buffer import (
+from archive.modules.hive_transformer_cpu.transformer_replay_buffer import (
     TransformerTrainingExample,
     TokenReplayBuffer,
 )
 
-from hive_gpu.gpu_mcts import GPUMCTSOrchestrator, GPUMCTSConfig, GPUTrainingExample
+from archive.modules.hive_gpu_hybrid.gpu_mcts import GPUMCTSOrchestrator, GPUMCTSConfig, GPUTrainingExample
 from hive_gpu.gpu_native_mcts import GPUNativeMCTSOrchestrator
 
 

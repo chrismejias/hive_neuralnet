@@ -28,7 +28,7 @@ try:
 except ImportError:
     HiveGraph = None  # type: ignore[assignment,misc]
 from hive_gpu.gpu_encoder import GPUGNNEncoder, GPUTransformerEncoder
-from hive_gpu.gpu_mcts import GPUMCTSConfig, GPUTrainingExample
+from archive.modules.hive_gpu_hybrid.gpu_mcts import GPUMCTSConfig, GPUTrainingExample
 from hive_transformer.token_types import HiveTokenSequence
 
 
