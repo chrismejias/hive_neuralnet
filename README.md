@@ -10,24 +10,40 @@ AlphaZero-style self-play training for the board game [Hive](https://en.wikipedi
 - **Expansion pieces**: Supports Mosquito, Ladybug, Pillbug (configurable or random)
 - **Endgame curriculum**: Optionally start games from near-decided positions to sharpen tactical play
 
+## Requirements
+
+- Python 3.14
+- PyTorch 2.10.0
+- CUDA 12.8 / cuDNN 9.1.0
+
 ## Setup
 
-Requires Python 3.14, CUDA, and PyTorch. The CUDA extension must be compiled once:
+### Option A: Docker (recommended for cloud/RunPod)
 
 ```bash
-cd hive_gpu
-pip install -e .
-cd ..
+docker build -t hive-neuralnet .
 ```
 
-Or if a prebuilt `.pyd`/`.so` is present in `hive_gpu/`, it is loaded automatically.
+The image compiles the CUDA extension automatically at build time.
+
+### Option B: Local
+
+```bash
+pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+pip install numpy ninja pytest
+
+# Compile the CUDA extension
+pip install -e hive_gpu/
+```
+
+Or if a prebuilt `.pyd`/`.so` is already present in `hive_gpu/`, it loads automatically.
 
 ## Running Training
 
-### Fresh start
+### Fresh start (local)
 
 ```bash
-.venv/Scripts/python -m hive_gpu \
+python -m hive_gpu \
   --encoder-type transformer \
   --gpu-native \
   --games 256 \
@@ -35,14 +51,14 @@ Or if a prebuilt `.pyd`/`.so` is present in `hive_gpu/`, it is loaded automatica
   --iterations 100 \
   --wave-size 8 \
   --expansion -1 \
-  --checkpoint-dir checkpoints_gpu \
+  --checkpoint-dir checkpoints \
   --log-file training.log
 ```
 
-### Resume from checkpoint
+### Resume from checkpoint (local)
 
 ```bash
-.venv/Scripts/python -m hive_gpu \
+python -m hive_gpu \
   --encoder-type transformer \
   --gpu-native \
   --games 256 \
@@ -50,19 +66,42 @@ Or if a prebuilt `.pyd`/`.so` is present in `hive_gpu/`, it is loaded automatica
   --iterations 100 \
   --wave-size 8 \
   --expansion -1 \
-  --resume checkpoints_gpu/hive_gpu_checkpoint_0050.pt \
-  --checkpoint-dir checkpoints_gpu \
+  --resume checkpoints/hive_gpu_checkpoint_0124.pt \
+  --checkpoint-dir checkpoints \
   --log-file training.log
 ```
 
 The `--resume` flag loads network weights, optimizer state, and learning rate schedule. The replay buffer is not saved and resets on restart.
+
+### Docker (RunPod)
+
+Mount a local directory for checkpoints so they persist if the container stops:
+
+```bash
+docker run --gpus all \
+  -v $(pwd)/checkpoints:/workspace/checkpoints \
+  hive-neuralnet \
+  python -m hive_gpu \
+    --encoder-type transformer \
+    --gpu-native \
+    --games 512 \
+    --simulations 200 \
+    --iterations 500 \
+    --wave-size 8 \
+    --expansion -1 \
+    --endgame-frac 1.0 \
+    --endgame-surround 5 \
+    --resume checkpoints/hive_gpu_checkpoint_0124.pt \
+    --checkpoint-dir checkpoints \
+    --log-file checkpoints/training.log
+```
 
 ### With endgame curriculum
 
 Start a fraction of games from positions where both queens are nearly surrounded (4–5 neighbors), giving the network strong gradient signal on tactical decisions:
 
 ```bash
-.venv/Scripts/python -m hive_gpu \
+python -m hive_gpu \
   --encoder-type transformer \
   --gpu-native \
   --games 512 \
@@ -73,8 +112,8 @@ Start a fraction of games from positions where both queens are nearly surrounded
   --endgame-frac 1.0 \
   --endgame-surround 5 \
   --draw-keep-rate 0.10 \
-  --resume checkpoints_gpu/hive_gpu_checkpoint_XXXX.pt \
-  --checkpoint-dir checkpoints_gpu \
+  --resume checkpoints/hive_gpu_checkpoint_0124.pt \
+  --checkpoint-dir checkpoints \
   --log-file training.log
 ```
 
@@ -102,9 +141,9 @@ Start a fraction of games from positions where both queens are nearly surrounded
 Measures whether the network correctly identifies forced wins. Tests across all 8 expansion subsets:
 
 ```bash
-.venv/Scripts/python probe_win_in_one.py
+python probe_win_in_one.py
 # or target a specific checkpoint:
-.venv/Scripts/python probe_win_in_one.py --checkpoint checkpoints_gpu/hive_gpu_checkpoint_0050.pt
+python probe_win_in_one.py --checkpoint checkpoints/hive_gpu_checkpoint_0124.pt
 ```
 
 Output shows per-subset results and aggregate statistics (win move rank, top-3 rate, mean policy probability on the winning move).
@@ -112,19 +151,19 @@ Output shows per-subset results and aggregate statistics (win move rank, top-3 r
 ### Value head evaluation
 
 ```bash
-.venv/Scripts/python eval_value_head.py
+python eval_value_head.py
 ```
 
 ## GUI
 
-Play against the trained AI using pygame:
+Play against the trained AI using pygame (local only):
 
 ```bash
 # vs AI
-.venv/Scripts/python gui.py --checkpoint checkpoints_gpu/hive_gpu_checkpoint_0050.pt
+python gui.py --checkpoint checkpoints/hive_gpu_checkpoint_0124.pt
 
 # AI self-play
-.venv/Scripts/python gui.py --self-play
+python gui.py --self-play
 ```
 
 Requires `pygame-ce`: `pip install pygame-ce`
@@ -133,15 +172,17 @@ Controls: click hand panel to select piece, click highlighted hex to place/move,
 
 ## Checkpoints
 
-Saved to `checkpoints_gpu/` after every iteration as `hive_gpu_checkpoint_NNNN.pt`. Each checkpoint contains:
+Saved after every iteration as `hive_gpu_checkpoint_NNNN.pt`. Each checkpoint contains:
 - Network weights and config
 - Optimizer state
 - Iteration number and training metrics
 
+A pretrained checkpoint (iteration 124) is included in `checkpoints/`.
+
 ## Running Tests
 
 ```bash
-.venv/Scripts/python -m pytest tests/
+python -m pytest tests/
 ```
 
 241 tests covering the game engine, transformer network, and GPU move generation validation.
@@ -154,6 +195,7 @@ hive_transformer/  # Transformer network and token encoder
 hive_gpu/          # CUDA extension, GPU-native MCTS, trainer, CLI
   csrc/            # CUDA C++ source (move gen, MCTS tree, state encoder)
 tests/             # Test suite
-checkpoints_gpu/   # Saved checkpoints (not in git)
+checkpoints/       # Pretrained checkpoints
 archive/           # Archived CPU training code (GNN, NNUE, CPU MCTS)
+Dockerfile         # Container for cloud/RunPod deployment
 ```
