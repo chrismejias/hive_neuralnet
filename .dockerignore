@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environment
+.venv/
+
+# Compiled Windows extension (will be rebuilt for Linux inside container)
+hive_gpu/*.pyd
+hive_gpu/build/
+build/
+
+# Checkpoints (mount at runtime instead)
+checkpoints/
+checkpoints_*/
+
+# Logs
+*.log
+*.jsonl
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Git
+.git/
+.claude/
