@@ -269,6 +269,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(use_gpu_native=False)
 
+    # Gumbel AlphaZero search — opt-in, off by default
+    parser.add_argument(
+        "--gumbel", action="store_true", dest="use_gumbel",
+        help="Use Gumbel AlphaZero search (sequential halving, no MCTS tree). "
+             "Better GPU utilization than MCTS at equivalent sim budgets.",
+    )
+    parser.set_defaults(use_gumbel=False)
+    parser.add_argument(
+        "--gumbel-considered", type=int, default=32,
+        help="Max actions to consider in Gumbel sequential halving (top-k before halving).",
+    )
+    parser.add_argument(
+        "--gumbel-c-visit", type=float, default=50.0,
+        help="Gumbel Q-transform c_visit parameter.",
+    )
+    parser.add_argument(
+        "--gumbel-c-scale", type=float, default=1.0,
+        help="Gumbel Q-transform c_scale parameter.",
+    )
+
     # Network architecture
     parser.add_argument(
         "--model-size", choices=["small", "large"], default="small",
@@ -356,6 +376,10 @@ def _build_train_config(args: argparse.Namespace) -> GPUTrainConfig:
         shaped_dirichlet=args.shaped_dirichlet,
         use_mcgs=args.use_mcgs,
         use_gpu_native=args.use_gpu_native,
+        use_gumbel=args.use_gumbel,
+        gumbel_max_considered=args.gumbel_considered,
+        gumbel_c_visit=args.gumbel_c_visit,
+        gumbel_c_scale=args.gumbel_c_scale,
         draw_keep_rate=args.draw_keep_rate,
         queen_pressure_scale=args.queen_pressure_scale,
         expansion_mask=args.expansion,
@@ -447,7 +471,14 @@ def main(argv: list[str] | None = None) -> None:
     qp_str = f"{cfg.queen_pressure_scale}" if cfg.queen_pressure_scale > 0 else "disabled"
     print(f"  Q-pressure:   {qp_str}")
     print(f"  Uncertainty:  {net_cfg.predict_uncertainty}")
-    search_str = 'MCGS (DAG)' if cfg.use_mcgs else ('MCTS GPU-native' if cfg.use_gpu_native else 'MCTS (tree)')
+    if cfg.use_gumbel:
+        search_str = f'Gumbel AlphaZero (k={cfg.gumbel_max_considered})'
+    elif cfg.use_mcgs:
+        search_str = 'MCGS (DAG)'
+    elif cfg.use_gpu_native:
+        search_str = 'MCTS GPU-native'
+    else:
+        search_str = 'MCTS (tree)'
     print(f"  Search:       {search_str}")
     print(f"  Checkpoints:  {cfg.checkpoint_dir}")
     if cfg.expansion_mask < 0:

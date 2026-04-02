@@ -1,0 +1,850 @@
+"""
+Gumbel AlphaZero search with batched GPU inference.
+
+Replaces iterative MCTS tree traversals with Sequential Halving + Gumbel
+noise (Danihelka et al., 2022).  All NN evaluations within a halving round
+are independent and batched together, eliminating the serial tree-traversal
+bottleneck of standard MCTS.
+
+Key differences from GPU-native MCTS:
+  - No tree data structure — flat tensors for Q-values and visit counts
+  - Fixed number of sequential rounds (log2 of considered actions)
+  - Much better GPU utilization at equivalent simulation budgets
+  - Designed for large-VRAM GPUs (24–80 GB)
+
+Usage:
+    from hive_gpu.gumbel_mcts import GumbelAlphaZeroOrchestrator, GumbelConfig
+
+    orchestrator = GumbelAlphaZeroOrchestrator(net, config)
+    examples = orchestrator.self_play_batch()
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+import hive_gpu
+
+try:
+    from hive_gnn.graph_types import HiveGraph
+except ImportError:
+    HiveGraph = None  # type: ignore[assignment,misc]
+from hive_gpu.gpu_encoder import GPUGNNEncoder, GPUTransformerEncoder
+from archive.modules.hive_gpu_hybrid.gpu_mcts import GPUMCTSConfig, GPUTrainingExample
+from hive_transformer.token_types import HiveTokenSequence
+
+
+# ── Configuration ─────────────────────────────────────────────────────
+
+
+@dataclass
+class GumbelConfig:
+    """Configuration for Gumbel AlphaZero search."""
+
+    # Simulation budget (total NN evals per move, excluding root eval)
+    num_simulations: int = 128
+
+    # Maximum actions to consider after initial top-k selection.
+    # Paper uses 16 or 32.  Lower = fewer rounds, faster; higher = broader.
+    max_num_considered_actions: int = 32
+
+    # Q-transform parameters: sigma(q) = (c_visit + max_n) * c_scale * q
+    c_visit: float = 50.0
+    c_scale: float = 1.0
+
+    # Game parameters
+    temperature: float = 1.0
+    temperature_drop_move: int = 20
+    batch_size: int = 256
+    max_game_length: int = 300
+    encoder_type: str = "transformer"
+    expansion_mask: int = 0
+
+    # NN batching
+    nn_max_batch: int = 0  # 0 = no limit
+
+    # Policy target pruning
+    policy_target_pruning: float = 0.02
+
+    # Queen pressure value shaping for draws
+    queen_pressure_scale: float = 0.4
+
+
+# ── Orchestrator ──────────────────────────────────────────────────────
+
+
+class GumbelAlphaZeroOrchestrator:
+    """
+    GPU-native Gumbel AlphaZero search for batched self-play.
+
+    No MCTS tree.  Sequential halving with Gumbel noise selects actions.
+    All NN evaluations within a halving round are independent and batched.
+    """
+
+    def __init__(
+        self,
+        net: torch.nn.Module,
+        config: GumbelConfig | None = None,
+    ) -> None:
+        self.ext = hive_gpu.load_extension()
+        self.config = config or GumbelConfig()
+        self.net = net
+
+        if self.config.encoder_type == "gnn":
+            self.encoder = GPUGNNEncoder()
+        else:
+            self.encoder = GPUTransformerEncoder()
+
+        self._action_space_size = self.ext.ACTION_SPACE_SIZE
+        self._move_size = self.ext.SIZEOF_GPU_MOVE
+
+    # ── Public API ────────────────────────────────────────────────
+
+    def self_play_batch(
+        self,
+        start_states: "torch.Tensor | None" = None,
+    ) -> list[list[GPUTrainingExample]]:
+        """Play B games in parallel using Gumbel AlphaZero search."""
+        B = self.config.batch_size
+        cfg = self.config
+
+        if start_states is not None:
+            states = start_states.cuda()
+        else:
+            states = self.ext.create_initial_states(B, cfg.expansion_mask)
+
+        active = [True] * B
+        move_numbers = [0] * B
+        histories: list[list[tuple]] = [[] for _ in range(B)]
+
+        while any(active):
+            current_turns = self._get_turns(states, B)
+
+            # ── Gumbel search for all active games ──
+            policies, graphs, seqs, nn_priors = self._gumbel_search(
+                states, B, active, move_numbers,
+            )
+
+            # Compute per-piece mobility for history
+            mob_tensor, mob_counts = self.ext.compute_mobility_batch(states, B, False)
+            mob_np = mob_tensor.cpu().numpy()
+            mob_board_counts = mob_counts.cpu().numpy()
+
+            # Override policies for immediate wins
+            self._check_immediate_wins(states, B, active, current_turns, policies)
+
+            # Record history and select actions
+            action_move_bytes = np.zeros((B, self._move_size), dtype=np.uint8)
+
+            for i in range(B):
+                if not active[i]:
+                    continue
+
+                policy = policies[i]
+                turn = current_turns[i]
+
+                mob_i = mob_np[i, :mob_board_counts[i]].copy()
+                histories[i].append(
+                    (graphs[i], policy.copy(), turn, mob_i, seqs[i], nn_priors[i])
+                )
+
+                # Action selection: greedy after temp_drop, else sample
+                if move_numbers[i] >= cfg.temperature_drop_move:
+                    action = int(np.argmax(policy))
+                else:
+                    psum = policy.sum()
+                    if psum > 0 and np.isfinite(psum):
+                        p = policy / psum
+                    else:
+                        mask = policy > 0
+                        p = np.zeros_like(policy)
+                        if mask.any():
+                            p[mask] = 1.0 / mask.sum()
+                        else:
+                            p[:] = 1.0 / len(p)
+                    action = int(np.random.choice(len(p), p=p))
+
+                # Look up move bytes for selected action
+                fb = self._action_to_gpu_move(states, i, action)
+                if fb is not None:
+                    action_move_bytes[i] = fb
+
+            # Apply moves
+            moves_t = torch.from_numpy(action_move_bytes).cuda()
+            self.ext.apply_moves_batch(states, moves_t, B)
+
+            for i in range(B):
+                if active[i]:
+                    move_numbers[i] += 1
+
+            # Check game over
+            results = self.ext.check_results_batch(states, B).cpu().numpy()
+            for i in range(B):
+                if not active[i]:
+                    continue
+                if results[i] != 0 or move_numbers[i] >= cfg.max_game_length:
+                    active[i] = False
+
+        # Build training examples
+        final_results = self.ext.check_results_batch(states, B).cpu().numpy()
+        final_mob_tensor, final_mob_counts = self.ext.compute_mobility_batch(
+            states, B, True,
+        )
+        final_mob_np = final_mob_tensor.cpu().numpy()
+        final_mob_board_counts = final_mob_counts.cpu().numpy()
+        final_qs_data = self._compute_queen_surround_batch(states, B)
+
+        return self._build_examples(
+            histories, final_results,
+            final_mob_np, final_mob_board_counts,
+            final_qs_data,
+        )
+
+    # ── Gumbel search core ────────────────────────────────────────
+
+    def _gumbel_search(
+        self,
+        root_states: torch.Tensor,
+        B: int,
+        active: list[bool],
+        move_numbers: list[int],
+    ) -> tuple[
+        list[np.ndarray],
+        list,
+        list[HiveTokenSequence | None],
+        list[np.ndarray | None],
+    ]:
+        """Run Gumbel AlphaZero search.  Returns (policies, graphs, seqs, nn_priors)."""
+        cfg = self.config
+        A = self._action_space_size
+
+        # ── Step 1: Root NN evaluation ──
+        # Encode root states for NN + history
+        root_seqs: list[HiveTokenSequence | None] = [None] * B
+        if hasattr(self.encoder, "encode_batch_with_graphs_and_seqs"):
+            encoded, root_graphs, root_seqs = (
+                self.encoder.encode_batch_with_graphs_and_seqs(root_states, B)
+            )
+        elif hasattr(self.encoder, "encode_batch_with_graphs"):
+            encoded, root_graphs = self.encoder.encode_batch_with_graphs(root_states, B)
+        else:
+            encoded = self.encoder.encode_batch(root_states, B)
+            root_graphs = [None] * B
+
+        # Legal mask
+        legal_mask_int, _ = self.ext.generate_legal_mask_batch(root_states, B)
+        legal_mask = legal_mask_int.bool()  # [B, A]  True = legal
+
+        # NN forward pass on roots
+        with torch.no_grad():
+            if cfg.nn_max_batch > 0 and B > cfg.nn_max_batch:
+                policy_logits, root_values = self._nn_forward_subbatched(encoded, B)
+            else:
+                policy_logits, root_values, *_ = self.net(encoded)
+
+        root_values = root_values.squeeze(-1)  # [B]
+
+        # Mask illegal actions
+        policy_logits[~legal_mask] = float("-inf")
+
+        # Store NN priors (for surprise weighting)
+        nn_prior_probs = torch.softmax(policy_logits, dim=-1)  # [B, A]
+
+        # ── Step 2: Gumbel noise ──
+        # Sample Gumbel(0) noise: g = -log(-log(u)), u ~ Uniform(0,1)
+        u = torch.rand(B, A, device="cuda").clamp(1e-10, 1.0 - 1e-7)
+        gumbel = -torch.log(-torch.log(u))
+        gumbel[~legal_mask] = float("-inf")
+
+        # Perturbed logits
+        perturbed = gumbel + policy_logits  # [B, A]
+
+        # ── Step 3: Top-k action selection ──
+        num_legal = legal_mask.sum(dim=1)  # [B]
+        k = cfg.max_num_considered_actions
+        # For games with fewer legal moves than k, we consider all of them
+        effective_k = torch.clamp(num_legal, max=k)  # [B]
+        max_k = min(k, int(num_legal.max().item()))
+
+        if max_k == 0:
+            # No legal moves at all — return uniform policies
+            policies = [np.zeros(A, dtype=np.float32) for _ in range(B)]
+            nn_priors = [nn_prior_probs[i].cpu().numpy() for i in range(B)]
+            return policies, root_graphs, root_seqs, nn_priors
+
+        # Select top max_k actions per game
+        topk_scores, topk_actions = torch.topk(perturbed, max_k, dim=1)  # [B, max_k]
+
+        # ── Step 4: Sequential halving ──
+        q_sums = torch.zeros(B, max_k, device="cuda")   # accumulated child values
+        visit_counts = torch.zeros(B, max_k, dtype=torch.int32, device="cuda")
+        candidate_mask = torch.ones(B, max_k, dtype=torch.bool, device="cuda")
+
+        # Mask out padding for games with fewer than max_k legal moves
+        for i in range(B):
+            ek = int(effective_k[i].item())
+            if ek < max_k:
+                candidate_mask[i, ek:] = False
+
+        # Number of halving rounds
+        num_candidates_initial = int(candidate_mask.sum(dim=1).max().item())
+        num_rounds = max(1, math.ceil(math.log2(num_candidates_initial)))
+
+        # Get legal moves + centroids upfront for child state construction
+        legal_moves, num_legal_moves = self.ext.generate_legal_moves_batch(root_states, B)
+        centroids = self.ext.compute_centroids_batch(root_states, B).cpu().numpy()  # [B, 2]
+
+        # Build action_idx -> move_idx mapping per game
+        action_to_move = self._build_action_to_move_map(
+            root_states, B, legal_moves, num_legal_moves, centroids,
+        )
+
+        for round_idx in range(num_rounds):
+            n_remaining = candidate_mask.sum(dim=1).float()  # [B]
+            max_remaining = int(n_remaining.max().item())
+            if max_remaining == 0:
+                break
+
+            # Allocate visits per candidate this round
+            # Total budget spread across rounds; each candidate gets equal share
+            visits_this_round = max(1, cfg.num_simulations // (max_remaining * num_rounds))
+
+            # ── Build child states for all candidates × visits ──
+            child_values = self._evaluate_candidates(
+                root_states, B, topk_actions, candidate_mask,
+                visits_this_round, legal_moves, num_legal_moves,
+                action_to_move,
+            )  # [B, max_k] mean child values (negated = from root player perspective)
+
+            # Update Q-values
+            old_n = visit_counts.float()
+            new_n = old_n + visits_this_round * candidate_mask.float()
+            # Incremental mean update
+            q_sums += child_values * visits_this_round * candidate_mask.float()
+            visit_counts += visits_this_round * candidate_mask.int()
+
+            # ── Score candidates and halve ──
+            if round_idx < num_rounds - 1:
+                max_n = visit_counts.max(dim=1, keepdim=True).values.float().clamp(min=1)
+                q_mean = torch.where(
+                    visit_counts > 0,
+                    q_sums / visit_counts.float(),
+                    torch.zeros_like(q_sums),
+                )
+                qtransform = (cfg.c_visit + max_n) * cfg.c_scale * q_mean
+
+                # Gumbel scores: g(a) + logit(a) + qtransform(Q(a))
+                # Gather the original logits for the topk actions
+                topk_logits = policy_logits.gather(1, topk_actions)  # [B, max_k]
+                topk_gumbel = gumbel.gather(1, topk_actions)  # [B, max_k]
+                sigma = topk_gumbel + topk_logits + qtransform
+                sigma[~candidate_mask] = float("-inf")
+
+                # Keep top half
+                n_keep = (n_remaining / 2).ceil().int().clamp(min=1)
+                max_keep = int(n_keep.max().item())
+
+                # For each game, keep the top n_keep[i] candidates
+                sorted_idx = sigma.argsort(dim=1, descending=True)  # [B, max_k]
+                new_candidate_mask = torch.zeros_like(candidate_mask)
+                for i in range(B):
+                    if not active[i]:
+                        continue
+                    nk = int(n_keep[i].item())
+                    keep_indices = sorted_idx[i, :nk]
+                    new_candidate_mask[i, keep_indices] = True
+                candidate_mask = new_candidate_mask
+
+        # ── Step 5: Compute improved policy ──
+        policies_np, nn_priors_list = self._compute_improved_policy(
+            policy_logits, topk_actions, q_sums, visit_counts,
+            legal_mask, root_values, nn_prior_probs, B, max_k, active,
+        )
+
+        return policies_np, root_graphs, root_seqs, nn_priors_list
+
+    # ── Child state evaluation ────────────────────────────────────
+
+    def _evaluate_candidates(
+        self,
+        root_states: torch.Tensor,
+        B: int,
+        topk_actions: torch.Tensor,   # [B, max_k]
+        candidate_mask: torch.Tensor,  # [B, max_k]
+        visits_per_action: int,
+        legal_moves: torch.Tensor,
+        num_legal_moves: torch.Tensor,
+        action_to_move: dict[int, dict[int, int]],
+    ) -> torch.Tensor:
+        """Evaluate candidate actions by applying them and running NN on child states.
+
+        For each active candidate, clone root → apply action → NN eval.
+        Returns [B, max_k] tensor of mean child values (negated for root perspective).
+
+        When visits_per_action > 1, we re-evaluate the same child state multiple
+        times — but since the child is deterministic, we just do one eval per
+        candidate and multiply.  (Future: could do deeper search from child.)
+        """
+        max_k = topk_actions.shape[1]
+        state_size = root_states.shape[1]
+
+        # Collect all (game_idx, candidate_idx) pairs that need evaluation
+        game_indices = []
+        cand_indices = []
+        move_indices = []  # index into legal_moves[game_idx]
+
+        topk_np = topk_actions.cpu().numpy()
+        cand_np = candidate_mask.cpu().numpy()
+        nlegal_np = num_legal_moves.cpu().numpy()
+
+        for i in range(B):
+            if not cand_np[i].any():
+                continue
+            a2m = action_to_move.get(i, {})
+            for j in range(max_k):
+                if not cand_np[i, j]:
+                    continue
+                action = int(topk_np[i, j])
+                mi = a2m.get(action, -1)
+                if mi >= 0 and mi < nlegal_np[i]:
+                    game_indices.append(i)
+                    cand_indices.append(j)
+                    move_indices.append(mi)
+
+        if not game_indices:
+            return torch.zeros(B, max_k, device="cuda")
+
+        total = len(game_indices)
+        gi_t = torch.tensor(game_indices, dtype=torch.int64, device="cuda")
+        mi_t = torch.tensor(move_indices, dtype=torch.int64, device="cuda")
+
+        # Clone root states for each candidate
+        child_states = root_states[gi_t].clone()  # [total, state_size]
+
+        # Gather move bytes
+        moves = legal_moves[gi_t, mi_t]  # [total, move_size]
+
+        # Apply moves
+        self.ext.apply_moves_batch(child_states, moves, total)
+
+        # Check for terminal states
+        results = self.ext.check_results_batch(child_states, total).cpu().numpy()
+
+        # Encode child states and run NN
+        encoded = self.encoder.encode_batch(child_states, total)
+        with torch.no_grad():
+            cfg = self.config
+            if cfg.nn_max_batch > 0 and total > cfg.nn_max_batch:
+                child_logits, child_values = self._nn_forward_subbatched(encoded, total)
+            else:
+                child_logits, child_values, *_ = self.net(encoded)
+
+        child_values = child_values.squeeze(-1)  # [total]
+
+        # For terminal states, use the game result instead of NN value
+        # Results: 0=in_progress, 1=white_wins, 2=black_wins, 3=draw
+        for k in range(total):
+            r = results[k]
+            if r == 0:
+                continue
+            elif r == 3:
+                child_values[k] = 0.0
+            else:
+                # Terminal value from child's perspective:
+                # The child state is after root player moved.
+                # We need to read whose turn it is in the child state.
+                # Simpler: r==1 means white won, r==2 means black won.
+                # The root player just moved, so if it's now opponent's turn,
+                # result favoring root player → child_value = -1 (bad for child).
+                gi = game_indices[k]
+                root_turn_byte = root_states[gi, self._OFF_TURN].item()
+                root_is_white = (root_turn_byte % 2 == 0)
+                root_won = (r == 1 and root_is_white) or (r == 2 and not root_is_white)
+                child_values[k] = -1.0 if root_won else 1.0
+
+        # Negate: Q(a) from root's perspective = -V(child)
+        neg_child_values = -child_values
+
+        # Scatter back to [B, max_k]
+        result_tensor = torch.zeros(B, max_k, device="cuda")
+        for k in range(total):
+            result_tensor[game_indices[k], cand_indices[k]] = neg_child_values[k]
+
+        return result_tensor
+
+    # ── Action-to-move mapping ────────────────────────────────────
+
+    def _build_action_to_move_map(
+        self,
+        root_states: torch.Tensor,
+        B: int,
+        legal_moves: torch.Tensor,   # [B, max_legal, move_size]
+        num_legal: torch.Tensor,      # [B]
+        centroids: np.ndarray,        # [B, 2]
+    ) -> dict[int, dict[int, int]]:
+        """Build per-game mapping from action_index -> legal_move_index.
+
+        Returns dict[game_idx, dict[action_idx, move_idx]].
+        """
+        moves_np = legal_moves.cpu().numpy()
+        nlegal_np = num_legal.cpu().numpy()
+        result: dict[int, dict[int, int]] = {}
+
+        for i in range(B):
+            nl = int(nlegal_np[i])
+            if nl == 0:
+                continue
+            cq, cr = int(centroids[i, 0]), int(centroids[i, 1])
+            a2m: dict[int, int] = {}
+            for mi in range(nl):
+                action = self._gpu_move_to_action(moves_np[i, mi], cq, cr)
+                if action is not None:
+                    a2m[action] = mi
+            result[i] = a2m
+
+        return result
+
+    # ── Improved policy computation ───────────────────────────────
+
+    def _compute_improved_policy(
+        self,
+        logits: torch.Tensor,         # [B, A]
+        topk_actions: torch.Tensor,    # [B, max_k]
+        q_sums: torch.Tensor,         # [B, max_k]
+        visit_counts: torch.Tensor,   # [B, max_k]
+        legal_mask: torch.Tensor,     # [B, A] bool
+        root_values: torch.Tensor,    # [B]
+        nn_prior_probs: torch.Tensor, # [B, A]
+        B: int,
+        max_k: int,
+        active: list[bool],
+    ) -> tuple[list[np.ndarray], list[np.ndarray | None]]:
+        """Compute improved policy targets from completed Q-values.
+
+        pi_improved(a) = softmax(logit(a) + qtransform(Q_completed(a)))
+
+        For actions that were never visited, Q_completed = -root_value
+        (the root value from the opponent's perspective = default expectation).
+        """
+        cfg = self.config
+        A = self._action_space_size
+
+        # Compute Q-mean for visited candidates
+        q_mean = torch.where(
+            visit_counts > 0,
+            q_sums / visit_counts.float(),
+            torch.zeros_like(q_sums),
+        )  # [B, max_k]
+
+        max_n = visit_counts.max(dim=1, keepdim=True).values.float().clamp(min=1)
+
+        # Q-completion: unvisited actions get -root_value (opponent's perspective)
+        # For the full action space, default Q = -root_value
+        q_completed_full = (-root_values).unsqueeze(1).expand(B, A).clone()  # [B, A]
+
+        # Fill in visited actions
+        topk_q = torch.where(visit_counts > 0, q_mean, (-root_values).unsqueeze(1).expand_as(q_mean))
+        q_completed_full.scatter_(1, topk_actions, topk_q)
+
+        # Q-transform on full action space
+        qtransform_full = (cfg.c_visit + max_n) * cfg.c_scale * q_completed_full  # [B, A]
+
+        # Improved logits
+        improved_logits = logits + qtransform_full
+        improved_logits[~legal_mask] = float("-inf")
+
+        # Softmax → improved policy
+        improved_policy = torch.softmax(improved_logits, dim=-1)  # [B, A]
+
+        # Apply policy target pruning
+        if cfg.policy_target_pruning > 0:
+            max_prob = improved_policy.max(dim=1, keepdim=True).values
+            threshold = cfg.policy_target_pruning * max_prob
+            improved_policy[improved_policy < threshold] = 0.0
+            # Renormalize
+            sums = improved_policy.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            improved_policy = improved_policy / sums
+
+        # Convert to numpy
+        improved_np = improved_policy.cpu().numpy()
+        nn_prior_np = nn_prior_probs.cpu().numpy()
+
+        policies = []
+        nn_priors = []
+        for i in range(B):
+            policies.append(improved_np[i].copy())
+            if active[i]:
+                nn_priors.append(nn_prior_np[i].copy())
+            else:
+                nn_priors.append(None)
+
+        return policies, nn_priors
+
+    # ── Win-in-one override ───────────────────────────────────────
+
+    def _check_immediate_wins(
+        self,
+        root_states: torch.Tensor,
+        B: int,
+        active: list[bool],
+        current_turns: list[int],
+        policies: list[np.ndarray],
+    ) -> None:
+        """Override policies with probability 1 for any immediate win.
+
+        Generates all legal moves, applies each, checks for wins.
+        """
+        legal_moves, num_legal = self.ext.generate_legal_moves_batch(root_states, B)
+        masks, _ = self.ext.generate_legal_mask_batch(root_states, B)
+        centroids = self.ext.compute_centroids_batch(root_states, B).cpu().numpy()
+        nlegal_np = num_legal.cpu().numpy()
+
+        for i in range(B):
+            if not active[i]:
+                continue
+            nl = int(nlegal_np[i])
+            if nl == 0:
+                continue
+
+            # Clone state for each legal move
+            gi_t = torch.full((nl,), i, dtype=torch.int64, device="cuda")
+            test_states = root_states[gi_t].clone()
+            moves = legal_moves[i, :nl]
+            self.ext.apply_moves_batch(test_states, moves, nl)
+            results = self.ext.check_results_batch(test_states, nl).cpu().numpy()
+
+            win_result = 1 if (current_turns[i] % 2 == 0) else 2
+            for mi in range(nl):
+                if results[mi] == win_result:
+                    cq, cr = int(centroids[i, 0]), int(centroids[i, 1])
+                    action = self._gpu_move_to_action(
+                        legal_moves[i, mi].cpu().numpy(), cq, cr,
+                    )
+                    if action is not None and 0 <= action < len(policies[i]):
+                        policies[i][:] = 0.0
+                        policies[i][action] = 1.0
+                        break
+
+    # ── Action → move bytes lookup ────────────────────────────────
+
+    def _action_to_gpu_move(
+        self,
+        states: torch.Tensor,
+        game_idx: int,
+        action: int,
+    ) -> np.ndarray | None:
+        """Find the GPU move bytes for a given action index."""
+        single = states[game_idx:game_idx + 1]
+        moves_t, num_legal = self.ext.generate_legal_moves_batch(single, 1)
+        nl = num_legal[0].item()
+        centroids = self.ext.compute_centroids_batch(single, 1).cpu().numpy()
+        cq, cr = int(centroids[0, 0]), int(centroids[0, 1])
+        raw = moves_t[0].cpu().numpy()
+
+        for mi in range(nl):
+            a = self._gpu_move_to_action(raw[mi], cq, cr)
+            if a == action:
+                return raw[mi].copy()
+        if nl > 0:
+            return raw[0].copy()
+        return None
+
+    def _gpu_move_to_action(
+        self, move_raw: np.ndarray, center_q: int, center_r: int,
+    ) -> int | None:
+        """Map raw GPU move bytes to action index."""
+        m_type = int(move_raw[0])
+        m_pt = int(move_raw[1])
+        m_from = int(move_raw[2]) | (int(move_raw[3]) << 8)
+        m_to = int(move_raw[4]) | (int(move_raw[5]) << 8)
+
+        if m_type == 2:
+            return self.ext.PASS_ACTION_INDEX
+
+        BOARD_SIZE = self.ext.BOARD_SIZE
+        HALF = BOARD_SIZE // 2
+        ENC_GRID = self.ext.ENC_GRID
+        ENC_HALF = ENC_GRID // 2
+        NUM_ENC = ENC_GRID * ENC_GRID
+
+        if m_type == 0:  # PLACE
+            to_q = m_to % BOARD_SIZE - HALF
+            to_r = m_to // BOARD_SIZE - HALF
+            ec = to_q - center_q + ENC_HALF
+            er = to_r - center_r + ENC_HALF
+            if ec < 0 or ec >= ENC_GRID or er < 0 or er >= ENC_GRID:
+                return None
+            return (m_pt - 1) * NUM_ENC + er * ENC_GRID + ec
+        else:  # MOVE
+            fq = m_from % BOARD_SIZE - HALF
+            fr = m_from // BOARD_SIZE - HALF
+            tq = m_to % BOARD_SIZE - HALF
+            tr = m_to // BOARD_SIZE - HALF
+            sc = fq - center_q + ENC_HALF
+            sr = fr - center_r + ENC_HALF
+            dc = tq - center_q + ENC_HALF
+            dr = tr - center_r + ENC_HALF
+            if (sc < 0 or sc >= ENC_GRID or sr < 0 or sr >= ENC_GRID or
+                dc < 0 or dc >= ENC_GRID or dr < 0 or dr >= ENC_GRID):
+                return None
+            return self.ext.MOVEMENT_OFFSET + (sr * ENC_GRID + sc) * NUM_ENC + (dr * ENC_GRID + dc)
+
+    # ── NN sub-batching ───────────────────────────────────────────
+
+    def _nn_forward_subbatched(
+        self, encoded, total: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run NN forward in sub-batches, concatenating results."""
+        max_batch = self.config.nn_max_batch
+        all_policy, all_values = [], []
+        for start in range(0, total, max_batch):
+            end = min(start + max_batch, total)
+            chunk = encoded.slice_batch(start, end) if hasattr(encoded, 'slice_batch') else encoded
+            policy_logits, values, *_ = self.net(chunk)
+            all_policy.append(policy_logits)
+            all_values.append(values)
+        return torch.cat(all_policy, dim=0), torch.cat(all_values, dim=0)
+
+    # ── Utility methods ───────────────────────────────────────────
+
+    _BOARD_SIZE = 23
+    _NUM_CELLS = _BOARD_SIZE * _BOARD_SIZE  # 529
+    _DIR_DCOL = [+1, +1, 0, -1, -1, 0]
+    _DIR_DROW = [0, -1, -1, 0, +1, +1]
+    _MAX_STACK = 5
+    _OFF_HEIGHT = _MAX_STACK * _NUM_CELLS   # 2645
+    _OFF_QUEEN_CELL = 3392
+    _OFF_TURN = 3412
+
+    def _get_turns(self, states: torch.Tensor, B: int) -> list[int]:
+        all_bytes = states.cpu().numpy()
+        off = self._OFF_TURN
+        return [
+            int(all_bytes[i, off]) | (int(all_bytes[i, off + 1]) << 8)
+            for i in range(B)
+        ]
+
+    def _hex_neighbors(self, cell: int) -> list[int]:
+        row = cell // self._BOARD_SIZE
+        col = cell % self._BOARD_SIZE
+        neighbors = []
+        for d in range(6):
+            nr = row + self._DIR_DROW[d]
+            nc = col + self._DIR_DCOL[d]
+            if 0 <= nr < self._BOARD_SIZE and 0 <= nc < self._BOARD_SIZE:
+                neighbors.append(nr * self._BOARD_SIZE + nc)
+            else:
+                neighbors.append(-1)
+        return neighbors
+
+    def _compute_queen_surround_batch(
+        self, states_tensor: torch.Tensor, B: int,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        states_np = states_tensor.cpu().numpy()
+        results = []
+        for i in range(B):
+            sb = states_np[i]
+            qc_off = self._OFF_QUEEN_CELL
+            queen_cells = [
+                int(sb[qc_off]) | (int(sb[qc_off + 1]) << 8),
+                int(sb[qc_off + 2]) | (int(sb[qc_off + 3]) << 8),
+            ]
+            heights = sb[self._OFF_HEIGHT:self._OFF_HEIGHT + self._NUM_CELLS]
+            top_node_at: dict[int, int] = {}
+            node_count = 0
+            for cell in range(self._NUM_CELLS):
+                h = int(heights[cell])
+                if h == 0:
+                    continue
+                for level in range(h):
+                    if level == h - 1:
+                        top_node_at[cell] = node_count
+                    node_count += 1
+            num_board_nodes = node_count
+            qs_mask = np.zeros(2, dtype=np.float32)
+            qs_target = np.zeros((num_board_nodes, 2), dtype=np.float32)
+            for c in range(2):
+                qc = queen_cells[c]
+                if qc == 0xFFFF:
+                    continue
+                qs_mask[c] = 1.0
+                neighbors = self._hex_neighbors(qc)
+                for nb in neighbors:
+                    if nb < 0:
+                        continue
+                    if int(heights[nb]) > 0 and nb in top_node_at:
+                        qs_target[top_node_at[nb], c] = 1.0
+            results.append((qs_target, qs_mask))
+        return results
+
+    def _build_examples(
+        self,
+        histories,
+        final_results: np.ndarray,
+        final_mob_np: np.ndarray,
+        final_mob_board_counts: np.ndarray,
+        final_qs_data: list[tuple[np.ndarray, np.ndarray]],
+    ) -> list[list[GPUTrainingExample]]:
+        qp_scale = self.config.queen_pressure_scale
+        all_examples = []
+        for i, history in enumerate(histories):
+            result = int(final_results[i])
+            examples = []
+            num_steps = len(history)
+
+            draw_value_white = 0.0
+            if (result == 0 or result == 3) and qp_scale > 0.0:
+                qs_target_final, qs_mask_final = final_qs_data[i]
+                white_q_surrounded = float(qs_target_final[:, 0].sum()) if qs_mask_final[0] > 0 else 0.0
+                black_q_surrounded = float(qs_target_final[:, 1].sum()) if qs_mask_final[1] > 0 else 0.0
+                draw_value_white = qp_scale * (black_q_surrounded - white_q_surrounded) / 6.0
+
+            for step_idx, (graph, policy, turn, mobility, seq, nn_prior) in enumerate(history):
+                if result == 0 or result == 3:
+                    if draw_value_white != 0.0:
+                        player_is_white = (turn % 2 == 0)
+                        value = draw_value_white if player_is_white else -draw_value_white
+                    else:
+                        value = 0.0
+                else:
+                    player_is_white = (turn % 2 == 0)
+                    if result == 1:
+                        value = 1.0 if player_is_white else -1.0
+                    else:
+                        value = -1.0 if player_is_white else 1.0
+                if seq is not None:
+                    n = seq.num_board_tokens
+                elif graph is not None:
+                    n = graph.num_piece_nodes
+                else:
+                    n = 0
+                is_final = (step_idx == num_steps - 1)
+                if is_final:
+                    final_n = int(final_mob_board_counts[i])
+                    fm = final_mob_np[i, :final_n].copy()
+                    qs_target, qs_mask = final_qs_data[i]
+                    if len(fm) != n:
+                        fm = np.zeros(n, dtype=np.float32)
+                    if qs_target.shape[0] != n:
+                        qs_target = np.zeros((n, 2), dtype=np.float32)
+                else:
+                    fm = np.zeros(n, dtype=np.float32)
+                    qs_target = np.zeros((n, 2), dtype=np.float32)
+                    qs_mask = np.zeros(2, dtype=np.float32)
+                examples.append(GPUTrainingExample(
+                    graph=graph,
+                    policy_target=policy,
+                    value_target=value,
+                    mobility_target=mobility,
+                    queen_surround_target=qs_target,
+                    queen_surround_mask=qs_mask,
+                    final_mobility_target=fm,
+                    sequence=seq,
+                    nn_prior=nn_prior,
+                ))
+            all_examples.append(examples)
+        return all_examples

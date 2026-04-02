@@ -759,14 +759,14 @@ class GPUNativeMCTSOrchestrator:
 
     # ── Utility methods (shared with GPUMCTSOrchestrator) ─────────
 
-    _BOARD_SIZE = 17
-    _NUM_CELLS = _BOARD_SIZE * _BOARD_SIZE
+    _BOARD_SIZE = 23
+    _NUM_CELLS = _BOARD_SIZE * _BOARD_SIZE  # 529
     _DIR_DCOL = [+1, +1, 0, -1, -1, 0]
     _DIR_DROW = [0, -1, -1, 0, +1, +1]
     _MAX_STACK = 5
-    _OFF_HEIGHT = _MAX_STACK * _NUM_CELLS
-    _OFF_QUEEN_CELL = 1856
-    _OFF_TURN = 1876
+    _OFF_HEIGHT = _MAX_STACK * _NUM_CELLS   # 2645
+    _OFF_QUEEN_CELL = 3392
+    _OFF_TURN = 3412
 
     def _get_turns(self, states: torch.Tensor, B: int) -> list[int]:
         all_bytes = states.cpu().numpy()

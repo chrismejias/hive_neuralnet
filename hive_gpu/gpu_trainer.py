@@ -136,6 +136,12 @@ class GPUTrainConfig:
     # GPU-native MCTS (tree on GPU, CUDA kernels for select/expand/backprop)
     use_gpu_native: bool = False
 
+    # Gumbel AlphaZero search (sequential halving, no MCTS tree)
+    use_gumbel: bool = False
+    gumbel_max_considered: int = 32  # top-k actions before halving
+    gumbel_c_visit: float = 50.0
+    gumbel_c_scale: float = 1.0
+
     # Draw downsampling: keep only this fraction of drawn games (1.0 = keep all)
     draw_keep_rate: float = 1.0
 
@@ -410,7 +416,7 @@ class GPUTrainer:
         # hand out sub_size positions per sub-batch.
         endgame_pool: list[bytes] | None = None
         endgame_pool_idx = 0
-        if cfg.endgame_frac > 0.0 and cfg.use_gpu_native:
+        if cfg.endgame_frac > 0.0 and (cfg.use_gpu_native or cfg.use_gumbel):
             from hive_gpu.endgame_generator import (
                 generate_endgame_positions, positions_to_tensor, SIZEOF_HIVE_STATE,
             )
@@ -451,7 +457,25 @@ class GPUTrainer:
                 expansion_mask=mask,
             )
 
-            if cfg.use_mcgs:
+            if cfg.use_gumbel:
+                from hive_gpu.gumbel_mcts import GumbelAlphaZeroOrchestrator, GumbelConfig
+                gumbel_config = GumbelConfig(
+                    num_simulations=cfg.mcts_simulations,
+                    max_num_considered_actions=cfg.gumbel_max_considered,
+                    c_visit=cfg.gumbel_c_visit,
+                    c_scale=cfg.gumbel_c_scale,
+                    temperature=cfg.temperature,
+                    temperature_drop_move=cfg.temperature_drop_move,
+                    batch_size=sub_size,
+                    max_game_length=cfg.max_game_length,
+                    encoder_type=cfg.encoder_type,
+                    expansion_mask=mask,
+                    nn_max_batch=cfg.nn_max_batch,
+                    policy_target_pruning=cfg.policy_target_pruning,
+                    queen_pressure_scale=cfg.queen_pressure_scale,
+                )
+                orchestrator = GumbelAlphaZeroOrchestrator(self.best_net, gumbel_config)
+            elif cfg.use_mcgs:
                 from hive_gpu.gpu_mcgs import MCGSOrchestrator
                 orchestrator = MCGSOrchestrator(self.best_net, mcts_config)
             elif cfg.use_gpu_native:
@@ -463,7 +487,7 @@ class GPUTrainer:
             # Build start_states tensor for GPU-native MCTS if endgame pool available.
             start_states_t = None
             if (endgame_pool is not None
-                    and cfg.use_gpu_native
+                    and (cfg.use_gpu_native or cfg.use_gumbel)
                     and len(endgame_pool) > 0):
                 n_eg = int(sub_size * cfg.endgame_frac)
                 n_fresh = sub_size - n_eg
@@ -480,7 +504,7 @@ class GPUTrainer:
                     eg_tensors.append(fresh)
                 start_states_t = torch.cat(eg_tensors, dim=0) if eg_tensors else None
 
-            if cfg.use_gpu_native and start_states_t is not None:
+            if (cfg.use_gpu_native or cfg.use_gumbel) and start_states_t is not None:
                 batch_examples = orchestrator.self_play_batch(
                     start_states=start_states_t
                 )

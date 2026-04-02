@@ -38,6 +38,23 @@ pip install -e hive_gpu/
 
 Or if a prebuilt `.pyd`/`.so` is already present in `hive_gpu/`, it loads automatically.
 
+## Search Algorithms
+
+Two search algorithms are available:
+
+### Wave-parallel MCTS (default)
+
+GPU-native tree search with W simulations per wave. Virtual loss diversifies selections within each wave. Use `--wave-size` to control parallelism (higher = more GPU utilization, slightly lower quality).
+
+### Gumbel AlphaZero
+
+An alternative to MCTS based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). Instead of tree traversals, uses Sequential Halving with Gumbel noise to select and evaluate a fixed budget of candidate actions. All NN evaluations within a round are fully independent and batched — no serial tree traversal bottleneck.
+
+- Enable with `--gumbel`
+- Use `--gumbel-considered` to set the number of actions considered at the root (k, default 32)
+- Rounds = ceil(log2(k)) — e.g. k=32 → 5 rounds
+- Scales better with VRAM: larger batch sizes and k values are straightforward
+
 ## Running Training
 
 ### Fresh start (local)
@@ -51,6 +68,21 @@ python -m hive_gpu \
   --iterations 100 \
   --wave-size 8 \
   --expansion -1 \
+  --checkpoint-dir checkpoints \
+  --log-file training.log
+```
+
+### With Gumbel AlphaZero (recommended for large VRAM)
+
+```bash
+python -m hive_gpu \
+  --encoder-type transformer \
+  --gumbel \
+  --games 256 \
+  --simulations 128 \
+  --gumbel-considered 32 \
+  --expansion -1 \
+  --iterations 100 \
   --checkpoint-dir checkpoints \
   --log-file training.log
 ```
@@ -83,11 +115,10 @@ docker run --gpus all \
   hive-neuralnet \
   python -m hive_gpu \
     --encoder-type transformer \
-    --gpu-native \
+    --gumbel \
     --games 512 \
-    --simulations 200 \
-    --iterations 500 \
-    --wave-size 8 \
+    --simulations 128 \
+    --gumbel-considered 32 \
     --expansion -1 \
     --endgame-frac 1.0 \
     --endgame-surround 5 \
@@ -122,12 +153,16 @@ python -m hive_gpu \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--games` | 64 | Parallel self-play games per iteration |
-| `--simulations` | 100 | MCTS simulations per move |
+| `--simulations` | 100 | MCTS simulations per move (or Gumbel simulation budget) |
 | `--iterations` | 20 | Total training iterations |
 | `--wave-size` | 8 | Parallel MCTS sims per GPU wave (increase for larger GPUs) |
+| `--gumbel` | off | Use Gumbel AlphaZero instead of MCTS |
+| `--gumbel-considered` | 32 | Number of root actions considered (k); rounds = ceil(log2(k)) |
+| `--gumbel-c-visit` | 50.0 | Q-transform visit count scale |
+| `--gumbel-c-scale` | 1.0 | Q-transform value scale |
 | `--expansion` | 0 | Expansion piece mask: 0=base, 1=+Mosquito, 2=+Ladybug, 4=+Pillbug, 7=all, -1=random |
 | `--endgame-frac` | 0.0 | Fraction of games starting from endgame positions (0–1) |
-| `--endgame-surround` | 5 | Queen neighbor count for endgame starts (4 or 5) |
+| `--endgame-surround` | 5 | Max queen neighbor count for endgame starts (range 4–surround) |
 | `--draw-keep-rate` | 1.0 | Fraction of drawn games kept for training (0.1 = discard 90%) |
 | `--lr` | 0.0002 | Learning rate |
 | `--buffer-size` | 50000 | Replay buffer capacity |
