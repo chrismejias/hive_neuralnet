@@ -43,7 +43,8 @@ mcts_select_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
     torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
-    torch::Tensor game_active, float c_puct, int B, int W, int max_nodes);
+    torch::Tensor game_active, torch::Tensor root_nodes,
+    float c_puct, int B, int W, int max_nodes);
 
 void mcts_replay_batch(
     torch::Tensor root_states, torch::Tensor leaf_states,
@@ -81,7 +82,7 @@ torch::Tensor mcts_extract_policy_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
     torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
-    torch::Tensor move_numbers,
+    torch::Tensor move_numbers, torch::Tensor root_nodes,
     float temperature, int temp_drop_move, float pruning_threshold,
     int B, int max_nodes);
 
@@ -89,7 +90,7 @@ void mcts_apply_root_noise(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
     torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
-    torch::Tensor noise, int max_children_pad,
+    torch::Tensor noise, torch::Tensor root_nodes, int max_children_pad,
     float dir_eps, float root_policy_temp,
     int B, int max_nodes);
 
@@ -139,7 +140,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     // ── GPU-native MCTS ────────────────────────────────────────────
     m.def("mcts_select_batch", &hive_gpu::mcts_select_batch,
-          "MCTS PUCT selection (GPU-native)");
+          "MCTS PUCT selection (GPU-native) — root_nodes enables tree reuse");
     m.def("mcts_replay_batch", &hive_gpu::mcts_replay_batch,
           "MCTS move-path replay to compute leaf states");
     m.def("mcts_expand_batch", &hive_gpu::mcts_expand_batch,

@@ -41,6 +41,7 @@ except ImportError:
 from archive.modules.hive_transformer_cpu.transformer_replay_buffer import (
     TransformerTrainingExample,
     TokenReplayBuffer,
+    GPUTokenReplayBuffer,
 )
 
 from archive.modules.hive_gpu_hybrid.gpu_mcts import GPUMCTSOrchestrator, GPUMCTSConfig, GPUTrainingExample
@@ -176,13 +177,19 @@ class GPUTrainer:
         self.config = config or GPUTrainConfig()
         self.net_config = net_config
         self.net_class = net_class
+        # Device (needed before buffer init to choose GPU buffer)
+        self.device = get_device(self.config.device)
+
         if self.config.encoder_type == "transformer":
-            self.buffer = TokenReplayBuffer(self.config.buffer_max_size)
+            if self.device.type == "cuda":
+                self.buffer = GPUTokenReplayBuffer(
+                    max_size=self.config.buffer_max_size,
+                    device=str(self.device),
+                )
+            else:
+                self.buffer = TokenReplayBuffer(self.config.buffer_max_size)
         else:
             self.buffer = GraphReplayBuffer(self.config.buffer_max_size)
-
-        # Device
-        self.device = get_device(self.config.device)
 
         # Mixed precision
         if self.config.use_amp is None:
@@ -263,7 +270,7 @@ class GPUTrainer:
                 try:
                     new_examples, sp_stats = self._self_play_phase()
                     break
-                except (RuntimeError, torch.cuda.CudaError, torch.AcceleratorError) as e:
+                except (RuntimeError, torch.cuda.CudaError) as e:
                     err_msg = str(e).lower()
                     if "cuda" not in err_msg and "illegal" not in err_msg:
                         raise

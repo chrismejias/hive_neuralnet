@@ -23,7 +23,7 @@ namespace hive_gpu {
 
 // ── MCTS Tree constants ───────────────────────────────────────────
 
-constexpr int DEFAULT_MAX_TREE_NODES = 32768;
+constexpr int DEFAULT_MAX_TREE_NODES = 65536;
 constexpr int MAX_TREE_DEPTH = 128;
 
 // ── GPU MCTS Tree structure (SoA) ─────────────────────────────────
@@ -132,6 +132,7 @@ __global__ void mcts_select_kernel(
     int*      vl_paths,        // [total_sims, MAX_TREE_DEPTH]
     int*      vl_lengths,      // [total_sims]
     const int8_t* game_active, // [B]
+    const int*    root_nodes,  // [B] — which node is the current root per game
     float c_puct,
     int B, int total_sims
 ) {
@@ -152,7 +153,7 @@ __global__ void mcts_select_kernel(
         move_paths + (int64_t)sim_idx * MAX_TREE_DEPTH * MOVE_SZ);
     int* my_vl = vl_paths + (int64_t)sim_idx * MAX_TREE_DEPTH;
 
-    int node = 0;   // start at root
+    int node = root_nodes[game];   // start at current root (supports tree reuse)
     int path_len = 0;
 
     // Hard-bounded loop: MAX_TREE_DEPTH iterations max.
@@ -529,6 +530,7 @@ __global__ void mcts_extract_policy_kernel(
     MCTSTree    tree,
     float*      policies,          // [B, ACTION_SPACE_SIZE]
     const int*  move_numbers,      // [B]
+    const int*  root_nodes,        // [B] — current root per game
     float temperature,
     int   temp_drop_move,
     float pruning_threshold,
@@ -538,7 +540,7 @@ __global__ void mcts_extract_policy_kernel(
     if (game >= B) return;
 
     float* policy   = policies + (int64_t)game * ACTION_SPACE_SIZE;
-    int    root_idx = tree_idx(tree, game, 0);
+    int    root_idx = tree_idx(tree, game, root_nodes[game]);
     int    fc       = tree.first_child[root_idx];
     int    nc       = tree.num_children[root_idx];
     if (fc < 0 || nc == 0) return;
@@ -604,6 +606,7 @@ __global__ void mcts_extract_policy_kernel(
 __global__ void mcts_root_noise_kernel(
     MCTSTree     tree,
     const float* dirichlet_noise,  // [B, max_children_pad]
+    const int*   root_nodes,       // [B] — current root per game
     int   max_children_pad,
     float dir_eps,
     float root_policy_temp,
@@ -612,7 +615,7 @@ __global__ void mcts_root_noise_kernel(
     int game = blockIdx.x * blockDim.x + threadIdx.x;
     if (game >= B) return;
 
-    int root_idx = tree_idx(tree, game, 0);
+    int root_idx = tree_idx(tree, game, root_nodes[game]);
     int fc = tree.first_child[root_idx];
     int nc = tree.num_children[root_idx];
     if (fc < 0 || nc == 0) return;

@@ -82,10 +82,11 @@ class GPUNativeMCTSOrchestrator:
             "is_terminal":    torch.zeros(B, M, dtype=torch.int8, device=dev),
             "terminal_value": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "node_count":     torch.ones(B, dtype=torch.int32, device=dev),  # root=node 0
+            "root_node":      torch.zeros(B, dtype=torch.int32, device=dev),  # current root per game
         }
 
     def _reset_tree(self, tree: dict[str, torch.Tensor]) -> None:
-        """Reset tree to root-only state for a new move decision."""
+        """Full reset to a fresh single-root tree (called once per self_play_batch)."""
         tree["visit_count"].zero_()
         tree["total_value"].zero_()
         tree["prior"].zero_()
@@ -97,6 +98,7 @@ class GPUNativeMCTSOrchestrator:
         tree["is_terminal"].zero_()
         tree["terminal_value"].zero_()
         tree["node_count"].fill_(1)  # node 0 = root
+        tree["root_node"].zero_()    # all games start at node 0
 
     def _tree_args(self, tree: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         """Return tree tensors in the order expected by CUDA host wrappers."""
@@ -130,9 +132,13 @@ class GPUNativeMCTSOrchestrator:
             root_states = self.ext.create_initial_states(B, cfg.expansion_mask)
         tree = self._alloc_tree(B)
 
+        # Full reset once per game batch (not per move — tree reuse handles moves)
+        self._reset_tree(tree)
+
         active = [True] * B
         move_numbers = [0] * B
         histories: list[list[tuple]] = [[] for _ in range(B)]
+        first_move = True
 
         while any(active):
             current_turns = self._get_turns(root_states, B)
@@ -146,10 +152,12 @@ class GPUNativeMCTSOrchestrator:
                 use_full = True
                 num_sims = cfg.num_simulations
 
-            # Run GPU-native MCTS
+            # Run GPU-native MCTS (tree is reused across moves)
             policies, graphs, seqs, nn_priors = self._batched_mcts(
-                root_states, B, active, move_numbers, tree, num_sims=num_sims,
+                root_states, B, active, move_numbers, tree,
+                num_sims=num_sims, first_move=first_move,
             )
+            first_move = False
 
             # Compute per-piece mobility
             mob_tensor, mob_counts = self.ext.compute_mobility_batch(root_states, B, False)
@@ -163,6 +171,7 @@ class GPUNativeMCTSOrchestrator:
 
             # Record history & select actions
             action_move_bytes = np.zeros((B, self._move_size), dtype=np.uint8)
+            chosen_child_nodes = [-1] * B  # child node index chosen per game (for tree reuse)
 
             for i in range(B):
                 if not active[i]:
@@ -194,8 +203,9 @@ class GPUNativeMCTSOrchestrator:
                             policy[:] = 1.0 / len(policy)
                     action = int(np.random.choice(len(policy), p=policy))
 
-                # Look up move bytes from tree
-                move_bytes = self._action_to_move_bytes_from_tree(tree, i, action)
+                # Look up move bytes from tree; also record the child node for reuse
+                move_bytes, child_node = self._action_to_move_bytes_from_tree(tree, i, action)
+                chosen_child_nodes[i] = child_node
                 if move_bytes is not None:
                     action_move_bytes[i] = move_bytes
                 else:
@@ -209,6 +219,9 @@ class GPUNativeMCTSOrchestrator:
                     )
                     if fb is not None:
                         action_move_bytes[i] = fb
+
+            # Reroot tree at chosen child for each active game
+            self._reroot_tree(tree, B, active, chosen_child_nodes)
 
             # Apply moves
             moves_t = torch.from_numpy(action_move_bytes).cuda()
@@ -251,33 +264,41 @@ class GPUNativeMCTSOrchestrator:
         move_numbers: list[int],
         tree: dict[str, torch.Tensor],
         num_sims: int | None = None,
+        first_move: bool = False,
     ) -> tuple[
         list[np.ndarray],
         list[HiveGraph],
         list[HiveTokenSequence | None],
         list[np.ndarray | None],
     ]:
-        """Run GPU-native MCTS.  Returns (policies, graphs, seqs, nn_priors)."""
+        """Run GPU-native MCTS.  Returns (policies, graphs, seqs, nn_priors).
+
+        Tree reuse: the tree is NOT reset here — it persists across moves within
+        a game batch.  `first_move=True` triggers root expansion + noise;
+        subsequent moves only re-apply noise to the already-expanded new root.
+        """
         cfg = self.config
         if num_sims is None:
             num_sims = cfg.num_simulations
 
-        # Reset tree
-        self._reset_tree(tree)
-
-        # Mark terminal roots
         game_active = torch.tensor(
             [1 if active[i] else 0 for i in range(B)],
             dtype=torch.int8, device="cuda",
         )
 
-        # Expand roots: encode + NN + expand kernel
-        root_graphs, root_seqs, nn_priors = self._expand_roots(
-            root_states, B, tree, active,
-        )
-
-        # Apply root policy temperature + Dirichlet noise
-        self._apply_root_noise(tree, B, active)
+        if first_move:
+            # First move of the batch: expand roots via NN, then apply noise.
+            root_graphs, root_seqs, nn_priors = self._expand_roots(
+                root_states, B, tree, active,
+            )
+            self._apply_root_noise(tree, B, active)
+        else:
+            # Subsequent moves: root is the chosen child from the previous move.
+            # Its children are already expanded with NN priors — just encode for
+            # history and re-apply fresh Dirichlet noise.
+            root_graphs, root_seqs = self._encode_roots_for_history(root_states, B)
+            nn_priors = self._extract_nn_priors_from_tree(tree, B, active)
+            self._apply_root_noise(tree, B, active)
 
         # Run simulation waves
         W = cfg.wave_size
@@ -289,10 +310,10 @@ class GPUNativeMCTSOrchestrator:
             actual_w = min(W, num_sims - wave * W)
             total = actual_w * B
 
-            # SELECT
+            # SELECT — starts from root_node[game] (supports tree reuse)
             leaf_idx, move_paths, path_lens, vl_paths, vl_lens = self.ext.mcts_select_batch(
                 *self._tree_args(tree),
-                game_active, cfg.c_puct, B, actual_w, self._max_nodes,
+                game_active, tree["root_node"], cfg.c_puct, B, actual_w, self._max_nodes,
             )
 
             # REPLAY
@@ -333,11 +354,11 @@ class GPUNativeMCTSOrchestrator:
                 B, total, self._max_nodes,
             )
 
-        # Extract policies
+        # Extract policies from current root_node per game
         move_nums_t = torch.tensor(move_numbers, dtype=torch.int32, device="cuda")
         policies_t = self.ext.mcts_extract_policy_batch(
             *self._tree_args(tree),
-            move_nums_t, cfg.temperature, cfg.temperature_drop_move,
+            move_nums_t, tree["root_node"], cfg.temperature, cfg.temperature_drop_move,
             cfg.policy_target_pruning, B, self._max_nodes,
         )
         policies_np = policies_t.cpu().numpy()  # [B, ACTION_SPACE_SIZE]
@@ -404,10 +425,13 @@ class GPUNativeMCTSOrchestrator:
         )
 
         # Extract NN priors BEFORE noise (for surprise weighting)
+        # On first move root_node is always 0 so indexing [:, 0] is equivalent,
+        # but use root_node for consistency.
         nn_priors: list[np.ndarray | None] = [None] * B
         action_probs_np = action_probs.cpu().numpy()
-        fc_cpu = tree["first_child"][:, 0].cpu().numpy()
-        nc_cpu = tree["num_children"][:, 0].cpu().numpy()
+        _row = torch.arange(B, device="cuda")
+        fc_cpu = tree["first_child"][_row, tree["root_node"]].cpu().numpy()
+        nc_cpu = tree["num_children"][_row, tree["root_node"]].cpu().numpy()
         ai_cpu = tree["action_idx"].cpu().numpy()
 
         for i in range(B):
@@ -431,8 +455,10 @@ class GPUNativeMCTSOrchestrator:
     ) -> None:
         """Apply root policy temperature + Dirichlet noise via GPU kernel."""
         cfg = self.config
-        # Get num_children per game to generate appropriately-sized Dirichlet noise
-        nc_cpu = tree["num_children"][:, 0].cpu().numpy()  # root's num_children
+        # Gather num_children for the current root node per game
+        row_idx = torch.arange(B, device="cuda")
+        nc_tensor = tree["num_children"][row_idx, tree["root_node"]]  # [B]
+        nc_cpu = nc_tensor.cpu().numpy()
 
         max_nc = int(nc_cpu.max()) if nc_cpu.max() > 0 else 1
 
@@ -452,9 +478,90 @@ class GPUNativeMCTSOrchestrator:
 
         self.ext.mcts_apply_root_noise(
             *self._tree_args(tree),
-            noise_t, max_nc,
+            noise_t, tree["root_node"], max_nc,
             cfg.dirichlet_epsilon, cfg.root_policy_temp,
             B, self._max_nodes,
+        )
+
+    def _encode_roots_for_history(
+        self,
+        root_states: torch.Tensor,
+        B: int,
+    ) -> tuple[list, list]:
+        """Encode current root states to get graphs/seqs for history recording.
+
+        Unlike _expand_roots, this does NOT run the NN or touch the tree.
+        Used on moves 2+ when the tree is reused.
+        """
+        if hasattr(self.encoder, "encode_batch_with_graphs_and_seqs"):
+            _, root_graphs, root_seqs = (
+                self.encoder.encode_batch_with_graphs_and_seqs(root_states, B)
+            )
+            return root_graphs, root_seqs
+        elif hasattr(self.encoder, "encode_batch_with_graphs"):
+            _, root_graphs = self.encoder.encode_batch_with_graphs(root_states, B)
+            return root_graphs, [None] * B
+        else:
+            return [None] * B, [None] * B
+
+    def _extract_nn_priors_from_tree(
+        self,
+        tree: dict[str, torch.Tensor],
+        B: int,
+        active: list[bool],
+    ) -> list[np.ndarray | None]:
+        """Read NN priors for the current root's children from tree storage.
+
+        The tree stores clean NN priors (before noise) for all expanded nodes.
+        Called before _apply_root_noise so the priors are still noise-free.
+        Reads only the root's children (O(nc) per game), not the full tree.
+        """
+        row_idx = torch.arange(B, device="cuda")
+        fc_cpu = tree["first_child"][row_idx, tree["root_node"]].cpu().numpy()
+        nc_cpu = tree["num_children"][row_idx, tree["root_node"]].cpu().numpy()
+
+        nn_priors: list[np.ndarray | None] = [None] * B
+        for i in range(B):
+            fc_i = int(fc_cpu[i])
+            nc_i = int(nc_cpu[i])
+            if not active[i] or fc_i < 0 or nc_i == 0:
+                continue
+            # Slice read: only nc_i entries, not the full max_nodes tensor
+            ai_slice = tree["action_idx"][i, fc_i:fc_i + nc_i].cpu().numpy()
+            prior_slice = tree["prior"][i, fc_i:fc_i + nc_i].cpu().numpy()
+            prior = np.zeros(self._action_space_size, dtype=np.float32)
+            for c in range(nc_i):
+                action = int(ai_slice[c])
+                if 0 <= action < self._action_space_size:
+                    prior[action] = float(prior_slice[c])
+            nn_priors[i] = prior
+        return nn_priors
+
+    def _reroot_tree(
+        self,
+        tree: dict[str, torch.Tensor],
+        B: int,
+        active: list[bool],
+        chosen_child_nodes: list[int],
+    ) -> None:
+        """Update root_node to the chosen child for each active game.
+
+        The chosen child's subtree is preserved in the flat node array.
+        We only update the logical root pointer and clear the child's
+        parent link so backprop stops there correctly.
+        """
+        new_roots = tree["root_node"].clone()
+        for i in range(B):
+            if active[i] and chosen_child_nodes[i] >= 0:
+                new_roots[i] = chosen_child_nodes[i]
+        tree["root_node"].copy_(new_roots)
+
+        # Clear parent_idx for all new roots so backprop terminates correctly.
+        # scatter_: tree["parent_idx"][i, new_roots[i]] = -1 for all i.
+        tree["parent_idx"].scatter_(
+            1,
+            new_roots.long().unsqueeze(1),
+            torch.full((B, 1), -1, dtype=torch.int32, device="cuda"),
         )
 
     # ── Win-in-one override ───────────────────────────────────────
@@ -481,15 +588,17 @@ class GPUNativeMCTSOrchestrator:
         perspective → winning for the root player.  We confirm by checking the
         raw GPU result code:  WHITE_WINS=1, BLACK_WINS=2.
         """
-        # Gather per-game root-child metadata (one CPU read per tensor)
-        fc_np  = tree["first_child"][:, 0].cpu().numpy()   # [B]
-        nc_np  = tree["num_children"][:, 0].cpu().numpy()  # [B]
-        ai_np  = tree["action_idx"].cpu().numpy()           # [B, max_nodes]
-        mb_np  = tree["move_bytes"].cpu().numpy()           # [B, max_nodes, move_sz]
+        # Gather per-game root-child metadata — use sliced reads to avoid
+        # pulling the full [B, max_nodes] tensors to CPU every move.
+        row_idx = torch.arange(B, device="cuda")
+        fc_np  = tree["first_child"][row_idx, tree["root_node"]].cpu().numpy()   # [B]
+        nc_np  = tree["num_children"][row_idx, tree["root_node"]].cpu().numpy()  # [B]
 
         # Build a flat batch: one entry per (game, root-child) pair
-        game_indices:  list[int] = []
-        child_indices: list[int] = []
+        game_indices:    list[int] = []
+        child_indices:   list[int] = []
+        move_bytes_list: list[np.ndarray] = []
+        action_idx_list: list[int] = []
 
         for i in range(B):
             if not active[i]:
@@ -498,9 +607,14 @@ class GPUNativeMCTSOrchestrator:
             nc = int(nc_np[i])
             if fc < 0 or nc == 0:
                 continue
+            # Slice reads: only nc entries for this game's root children
+            mb_slice = tree["move_bytes"][i, fc:fc + nc].cpu().numpy()
+            ai_slice = tree["action_idx"][i, fc:fc + nc].cpu().numpy()
             for c in range(nc):
                 game_indices.append(i)
                 child_indices.append(fc + c)
+                move_bytes_list.append(mb_slice[c])
+                action_idx_list.append(int(ai_slice[c]))
 
         if not game_indices:
             return
@@ -511,11 +625,8 @@ class GPUNativeMCTSOrchestrator:
         # Clone root states (fancy-index creates a copy, not a view)
         states_test = root_states[gi_t].clone()
 
-        # Build corresponding move bytes tensor
-        moves_np = np.stack(
-            [mb_np[game_indices[k], child_indices[k]] for k in range(total)],
-            axis=0,
-        ).astype(np.uint8)
+        # Build corresponding move bytes tensor from already-fetched slices
+        moves_np = np.stack(move_bytes_list, axis=0).astype(np.uint8)
         moves_t = torch.from_numpy(moves_np).cuda()
 
         # Apply all moves and check results in one GPU call
@@ -533,7 +644,7 @@ class GPUNativeMCTSOrchestrator:
                 continue  # already found a win for this game
             win_result = 1 if (current_turns[i] % 2 == 0) else 2
             if results_np[k] == win_result:
-                win_action = int(ai_np[i, child_indices[k]])
+                win_action = action_idx_list[k]
                 if 0 <= win_action < len(policies[i]):
                     policies[i][:] = 0.0
                     policies[i][win_action] = 1.0
@@ -546,12 +657,16 @@ class GPUNativeMCTSOrchestrator:
         tree: dict[str, torch.Tensor],
         game_idx: int,
         action: int,
-    ) -> np.ndarray | None:
-        """Look up move bytes for a given action from root's children in the GPU tree."""
-        fc = tree["first_child"][game_idx, 0].item()
-        nc = tree["num_children"][game_idx, 0].item()
+    ) -> tuple[np.ndarray | None, int]:
+        """Look up move bytes for a given action from the current root's children.
+
+        Returns (move_bytes, child_node_index).  child_node_index is -1 if not found.
+        """
+        root_node = tree["root_node"][game_idx].item()
+        fc = tree["first_child"][game_idx, root_node].item()
+        nc = tree["num_children"][game_idx, root_node].item()
         if fc < 0 or nc == 0:
-            return None
+            return None, -1
 
         # Search root's children for matching action
         ai_slice = tree["action_idx"][game_idx, fc:fc + nc].cpu().numpy()
@@ -559,8 +674,8 @@ class GPUNativeMCTSOrchestrator:
 
         for c in range(nc):
             if ai_slice[c] == action:
-                return mb_slice[c].copy()
-        return None
+                return mb_slice[c].copy(), fc + c
+        return None, -1
 
     def _action_to_gpu_move_fallback(
         self,

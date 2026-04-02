@@ -405,7 +405,8 @@ mcts_select_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
     at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
-    at::Tensor game_active, float c_puct, int B, int W, int max_nodes
+    at::Tensor game_active, at::Tensor root_nodes,
+    float c_puct, int B, int W, int max_nodes
 ) {
     int total = W * B;
     auto oi = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
@@ -429,6 +430,7 @@ mcts_select_batch(
         static_cast<int*>(vl_paths.data_ptr()),
         static_cast<int*>(vl_lens.data_ptr()),
         static_cast<const int8_t*>(game_active.data_ptr()),
+        static_cast<const int*>(root_nodes.data_ptr()),
         c_puct, B, total);
     // No sync: next kernel on same stream reads outputs after this completes.
 
@@ -557,7 +559,7 @@ at::Tensor mcts_extract_policy_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
     at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
-    at::Tensor move_numbers,
+    at::Tensor move_numbers, at::Tensor root_nodes,
     float temperature, int temp_drop_move, float pruning_threshold,
     int B, int max_nodes
 ) {
@@ -572,6 +574,7 @@ at::Tensor mcts_extract_policy_batch(
         tree,
         static_cast<float*>(policies.data_ptr()),
         static_cast<const int*>(move_numbers.data_ptr()),
+        static_cast<const int*>(root_nodes.data_ptr()),
         temperature, temp_drop_move, pruning_threshold, B);
     // No sync: PyTorch syncs on .cpu() when Python reads the result.
 
@@ -585,7 +588,7 @@ void mcts_apply_root_noise(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
     at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
-    at::Tensor noise, int max_children_pad,
+    at::Tensor noise, at::Tensor root_nodes, int max_children_pad,
     float dir_eps, float root_policy_temp,
     int B, int max_nodes
 ) {
@@ -596,6 +599,7 @@ void mcts_apply_root_noise(
     mcts_root_noise_kernel<<<blocks, threads>>>(
         tree,
         static_cast<const float*>(noise.data_ptr()),
+        static_cast<const int*>(root_nodes.data_ptr()),
         max_children_pad, dir_eps, root_policy_temp, B);
     // No sync: same-stream ordering; next op sees updated priors correctly.
 }
