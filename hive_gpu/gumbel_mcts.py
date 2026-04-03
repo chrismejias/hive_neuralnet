@@ -626,7 +626,7 @@ class GumbelAlphaZeroOrchestrator:
         legal_action_indices: torch.Tensor,  # [B, MAX_LEGAL_MOVES]
     ) -> torch.Tensor:
         """Gather full-action scores onto the legal move list."""
-        safe_actions = legal_action_indices.clamp(min=0)
+        safe_actions = legal_action_indices.clamp(min=0).long()
         gathered = action_scores.gather(1, safe_actions)
         gathered[legal_action_indices < 0] = float("-inf")
         return gathered
