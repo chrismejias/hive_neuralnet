@@ -18,13 +18,35 @@ AlphaZero-style self-play training for the board game [Hive](https://en.wikipedi
 
 ## Setup
 
-### Option A: Docker (recommended for cloud/RunPod)
+### Option A: Docker / Linux (recommended for cloud, RunPod, or WSL2)
 
 ```bash
 docker build -t hive-neuralnet .
 ```
 
-The image compiles the CUDA extension automatically at build time.
+The image compiles the CUDA extension automatically at build time through
+`hive_gpu.load_extension()`, using `ninja` inside the container and storing
+the compiled artifact under `/workspace/.torch_extensions`.
+
+If you are moving off Windows because extension builds are unreliable there,
+this is the preferred route.
+
+For WSL2 on Windows, make sure these prerequisites are in place before trying
+to build:
+
+- `Virtual Machine Platform` enabled
+- BIOS/UEFI virtualization enabled
+- a WSL2 distro installed, for example `Ubuntu-24.04`
+
+Typical setup:
+
+```powershell
+wsl --install --no-distribution
+wsl --install -d Ubuntu-24.04
+```
+
+If `wsl --install -d Ubuntu-24.04` fails with `HCS_E_HYPERV_NOT_INSTALLED`,
+enable virtualization features first and reboot before retrying.
 
 ### Option B: Local
 
@@ -105,7 +127,7 @@ python -m hive_gpu \
 
 The `--resume` flag loads network weights, optimizer state, and learning rate schedule. The replay buffer is not saved and resets on restart.
 
-### Docker (RunPod)
+### Docker (RunPod / Linux)
 
 Mount a local directory for checkpoints so they persist if the container stops:
 
@@ -125,6 +147,30 @@ docker run --gpus all \
     --resume checkpoints/hive_gpu_checkpoint_0124.pt \
     --checkpoint-dir checkpoints \
     --log-file checkpoints/training.log
+```
+
+To smoke-test that the Linux extension build worked before starting a long run:
+
+```bash
+docker run --rm --gpus all hive-neuralnet \
+  python -c "import hive_gpu; ext = hive_gpu.load_extension(); print(ext.BOARD_SIZE, ext.ACTION_SPACE_SIZE)"
+```
+
+To run a single Gumbel iteration as a Linux smoke test:
+
+```bash
+docker run --rm --gpus all \
+  -v $(pwd)/checkpoints:/workspace/checkpoints \
+  hive-neuralnet \
+  python -m hive_gpu \
+    --encoder-type transformer \
+    --gumbel \
+    --games 32 \
+    --simulations 64 \
+    --gumbel-considered 32 \
+    --iterations 1 \
+    --checkpoint-dir checkpoints \
+    --log-file checkpoints/linux_smoke.log
 ```
 
 ### With endgame curriculum

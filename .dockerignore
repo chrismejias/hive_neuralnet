@@ -6,6 +6,8 @@ __pycache__/
 
 # Virtual environment
 .venv/
+.torch_extensions/
+.pytest_cache/
 
 # Compiled Windows extension (will be rebuilt for Linux inside container)
 hive_gpu/*.pyd
@@ -15,6 +17,7 @@ build/
 # Checkpoints (mount at runtime instead)
 checkpoints/
 checkpoints_*/
+benchmark_runs/
 
 # Logs
 *.log

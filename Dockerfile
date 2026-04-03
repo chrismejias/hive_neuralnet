@@ -27,6 +27,7 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.14 1 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.14 1
 
 WORKDIR /workspace
+ENV TORCH_EXTENSIONS_DIR=/workspace/.torch_extensions
 
 # Install PyTorch 2.10.0 with CUDA 12.8
 # (adjust index URL if a different nightly/release channel is needed)
@@ -42,11 +43,9 @@ RUN python -m pip install \
 # Copy project source
 COPY . /workspace
 
-# Compile the CUDA extension (inplace inside the container)
-RUN cd /workspace && python -m pip install -e hive_gpu/
-
-# Verify the build
-RUN python -c "import hive_gpu; ext = hive_gpu.load_extension(); print('hive_gpu_ext loaded, BOARD_SIZE =', ext.BOARD_SIZE)"
+# Compile the CUDA extension through the runtime JIT path and keep the
+# resulting artifacts in the image under /workspace/.torch_extensions.
+RUN python -c "import hive_gpu; hive_gpu._extension = None; ext = hive_gpu.load_extension(); print('hive_gpu_ext loaded, BOARD_SIZE =', ext.BOARD_SIZE)"
 
 # Default command: show training help
 CMD ["python", "-m", "hive_gpu", "--help"]

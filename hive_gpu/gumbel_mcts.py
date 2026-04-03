@@ -294,13 +294,10 @@ class GumbelAlphaZeroOrchestrator:
         num_candidates_initial = int(candidate_mask.sum(dim=1).max().item())
         num_rounds = max(1, math.ceil(math.log2(num_candidates_initial)))
 
-        # Get legal moves + centroids upfront for child state construction
+        # Get legal moves upfront for child state construction
         legal_moves, num_legal_moves = self.ext.generate_legal_moves_batch(root_states, B)
-        centroids = self.ext.compute_centroids_batch(root_states, B).cpu().numpy()  # [B, 2]
-
-        # Build action_idx -> move_idx mapping per game
-        action_to_move = self._build_action_to_move_map(
-            root_states, B, legal_moves, num_legal_moves, centroids,
+        legal_action_indices = self.ext.legal_moves_to_actions_batch(
+            root_states, legal_moves, num_legal_moves, B,
         )
 
         remaining_budget = torch.full(
@@ -329,7 +326,7 @@ class GumbelAlphaZeroOrchestrator:
             child_values = self._evaluate_candidates(
                 root_states, B, topk_actions, candidate_mask,
                 visits_this_round, legal_moves, num_legal_moves,
-                action_to_move,
+                legal_action_indices,
             )  # [B, max_k] mean child values (negated = from root player perspective)
 
             # Update Q-values
@@ -394,7 +391,7 @@ class GumbelAlphaZeroOrchestrator:
         visits_per_action: torch.Tensor,
         legal_moves: torch.Tensor,
         num_legal_moves: torch.Tensor,
-        action_to_move: dict[int, dict[int, int]],
+        legal_action_indices: torch.Tensor,  # [B, MAX_LEGAL_MOVES]
     ) -> torch.Tensor:
         """Evaluate candidate actions by applying them and running NN on child states.
 
@@ -411,34 +408,19 @@ class GumbelAlphaZeroOrchestrator:
         state_size = root_states.shape[1]
 
         # Collect all (game_idx, candidate_idx) pairs that need evaluation
-        game_indices = []
-        cand_indices = []
-        move_indices = []  # index into legal_moves[game_idx]
+        matched_moves = self._match_actions_to_legal_moves(
+            topk_actions, legal_action_indices, num_legal_moves,
+        )
+        active_candidates = candidate_mask & (matched_moves >= 0)
+        candidate_pairs = torch.nonzero(active_candidates, as_tuple=False)
 
-        topk_np = topk_actions.cpu().numpy()
-        cand_np = candidate_mask.cpu().numpy()
-        nlegal_np = num_legal_moves.cpu().numpy()
-
-        for i in range(B):
-            if not cand_np[i].any():
-                continue
-            a2m = action_to_move.get(i, {})
-            for j in range(max_k):
-                if not cand_np[i, j]:
-                    continue
-                action = int(topk_np[i, j])
-                mi = a2m.get(action, -1)
-                if mi >= 0 and mi < nlegal_np[i]:
-                    game_indices.append(i)
-                    cand_indices.append(j)
-                    move_indices.append(mi)
-
-        if not game_indices:
+        if candidate_pairs.numel() == 0:
             return torch.zeros(B, max_k, device="cuda")
 
-        total = len(game_indices)
-        gi_t = torch.tensor(game_indices, dtype=torch.int64, device="cuda")
-        mi_t = torch.tensor(move_indices, dtype=torch.int64, device="cuda")
+        gi_t = candidate_pairs[:, 0].to(dtype=torch.int64)
+        cj_t = candidate_pairs[:, 1].to(dtype=torch.int64)
+        mi_t = matched_moves[gi_t, cj_t].to(dtype=torch.int64)
+        total = int(candidate_pairs.shape[0])
 
         # Clone root states for each candidate
         child_states = root_states[gi_t].clone()  # [total, state_size]
@@ -478,7 +460,7 @@ class GumbelAlphaZeroOrchestrator:
                 # Simpler: r==1 means white won, r==2 means black won.
                 # The root player just moved, so if it's now opponent's turn,
                 # result favoring root player → child_value = -1 (bad for child).
-                gi = game_indices[k]
+                gi = int(gi_t[k].item())
                 root_turn_byte = root_states[gi, self._OFF_TURN].item()
                 root_is_white = (root_turn_byte % 2 == 0)
                 root_won = (r == 1 and root_is_white) or (r == 2 and not root_is_white)
@@ -494,7 +476,7 @@ class GumbelAlphaZeroOrchestrator:
                 child_states,
                 neg_child_values,
                 results,
-                game_indices,
+                gi_t,
                 visits_per_action,
             )
         else:
@@ -502,8 +484,7 @@ class GumbelAlphaZeroOrchestrator:
 
         # Scatter back to [B, max_k]
         result_tensor = torch.zeros(B, max_k, device="cuda")
-        for k in range(total):
-            result_tensor[game_indices[k], cand_indices[k]] = child_reply_values[k]
+        result_tensor[gi_t, cj_t] = child_reply_values
 
         return result_tensor
 
@@ -512,7 +493,7 @@ class GumbelAlphaZeroOrchestrator:
         child_states: torch.Tensor,
         default_root_values: torch.Tensor,
         child_results: np.ndarray,
-        game_indices: list[int],
+        root_game_indices: torch.Tensor,
         visits_per_action: torch.Tensor,
     ) -> torch.Tensor:
         """Probe likely replies from each non-terminal child state.
@@ -528,7 +509,9 @@ class GumbelAlphaZeroOrchestrator:
         legal_moves, num_legal = self.ext.generate_legal_moves_batch(child_states, total)
         legal_mask_int, _ = self.ext.generate_legal_mask_batch(child_states, total)
         legal_mask = legal_mask_int.bool()
-        centroids = self.ext.compute_centroids_batch(child_states, total).cpu().numpy()
+        legal_action_indices = self.ext.legal_moves_to_actions_batch(
+            child_states, legal_moves, num_legal, total,
+        )
 
         encoded = self.encoder.encode_batch(child_states, total)
         with torch.no_grad():
@@ -538,36 +521,30 @@ class GumbelAlphaZeroOrchestrator:
             else:
                 child_policy_logits, _, *_ = self.net(encoded)
         child_policy_logits[~legal_mask] = float("-inf")
-        child_policy = torch.softmax(child_policy_logits, dim=-1).cpu().numpy()
+        child_policy = torch.softmax(child_policy_logits, dim=-1)
 
-        action_to_move = self._build_action_to_move_map(
-            child_states, total, legal_moves, num_legal, centroids,
-        )
-        moves_np = legal_moves.cpu().numpy()
-        num_legal_np = num_legal.cpu().numpy()
-        visits_np = visits_per_action.cpu().numpy()
+        num_legal_cpu = num_legal.cpu()
+        root_game_indices_cpu = root_game_indices.cpu()
+        reply_parent: list[int] = []
+        reply_move_indices: list[int] = []
+        move_scores = self._gather_legal_action_scores(child_policy, legal_action_indices)
+        ranked_moves = torch.argsort(move_scores, dim=1, descending=True)
 
-        reply_parent = []
-        reply_move_bytes = []
         for parent_idx in range(total):
             if child_results[parent_idx] != 0:
                 continue
-            reply_budget = max(0, int(visits_np[game_indices[parent_idx]]) - 1)
-            if reply_budget <= 0:
+            root_game_idx = int(root_game_indices_cpu[parent_idx].item())
+            reply_budget = max(0, int(visits_per_action[root_game_idx].item()) - 1)
+            nl = int(num_legal_cpu[parent_idx].item())
+            if reply_budget <= 0 or nl == 0:
                 continue
-            nl = int(num_legal_np[parent_idx])
-            if nl == 0:
-                continue
-            action_probs = child_policy[parent_idx]
-            move_map = action_to_move.get(parent_idx, {})
-            ranked = sorted(
-                move_map.items(),
-                key=lambda item: float(action_probs[item[0]]),
-                reverse=True,
-            )
-            for action, move_idx in ranked[:reply_budget]:
+            keep = min(reply_budget, nl)
+            for k in range(keep):
+                move_idx = int(ranked_moves[parent_idx, k].item())
+                if move_idx >= nl or move_scores[parent_idx, move_idx].item() == float("-inf"):
+                    break
                 reply_parent.append(parent_idx)
-                reply_move_bytes.append(moves_np[parent_idx, move_idx].copy())
+                reply_move_indices.append(move_idx)
 
         if not reply_parent:
             return root_values
@@ -575,7 +552,8 @@ class GumbelAlphaZeroOrchestrator:
         reply_total = len(reply_parent)
         parent_idx_t = torch.tensor(reply_parent, dtype=torch.int64, device="cuda")
         grandchild_states = child_states[parent_idx_t].clone()
-        moves_t = torch.from_numpy(np.stack(reply_move_bytes, axis=0)).cuda()
+        move_idx_t = torch.tensor(reply_move_indices, dtype=torch.int64, device="cuda")
+        moves_t = legal_moves[parent_idx_t, move_idx_t]
         self.ext.apply_moves_batch(grandchild_states, moves_t, reply_total)
 
         grandchild_results = self.ext.check_results_batch(
@@ -598,7 +576,6 @@ class GumbelAlphaZeroOrchestrator:
             elif r == 3:
                 grandchild_values[k] = 0.0
             else:
-                root_game_idx = game_indices[reply_parent[k]]
                 root_turn_byte = child_states[
                     reply_parent[k], self._OFF_TURN
                 ].item()
@@ -619,37 +596,40 @@ class GumbelAlphaZeroOrchestrator:
 
         return root_values
 
-    # ── Action-to-move mapping ────────────────────────────────────
+    # ── Action-to-move helpers ────────────────────────────────────
 
-    def _build_action_to_move_map(
+    def _match_actions_to_legal_moves(
         self,
-        root_states: torch.Tensor,
-        B: int,
-        legal_moves: torch.Tensor,   # [B, max_legal, move_size]
-        num_legal: torch.Tensor,      # [B]
-        centroids: np.ndarray,        # [B, 2]
-    ) -> dict[int, dict[int, int]]:
-        """Build per-game mapping from action_index -> legal_move_index.
+        actions: torch.Tensor,            # [B, N]
+        legal_action_indices: torch.Tensor,  # [B, MAX_LEGAL_MOVES]
+        num_legal: torch.Tensor,          # [B]
+    ) -> torch.Tensor:
+        """Return legal move indices for each action, or -1 when absent."""
+        matches = legal_action_indices.unsqueeze(1).eq(actions.unsqueeze(-1))
+        legal_slots = (
+            torch.arange(
+                legal_action_indices.shape[1], device=legal_action_indices.device,
+            ).unsqueeze(0) < num_legal.unsqueeze(1)
+        )
+        matches &= legal_slots.unsqueeze(1)
+        has_match = matches.any(dim=-1)
+        move_indices = matches.float().argmax(dim=-1).to(dtype=torch.int64)
+        return torch.where(
+            has_match,
+            move_indices,
+            torch.full_like(move_indices, -1),
+        )
 
-        Returns dict[game_idx, dict[action_idx, move_idx]].
-        """
-        moves_np = legal_moves.cpu().numpy()
-        nlegal_np = num_legal.cpu().numpy()
-        result: dict[int, dict[int, int]] = {}
-
-        for i in range(B):
-            nl = int(nlegal_np[i])
-            if nl == 0:
-                continue
-            cq, cr = int(centroids[i, 0]), int(centroids[i, 1])
-            a2m: dict[int, int] = {}
-            for mi in range(nl):
-                action = self._gpu_move_to_action(moves_np[i, mi], cq, cr)
-                if action is not None:
-                    a2m[action] = mi
-            result[i] = a2m
-
-        return result
+    def _gather_legal_action_scores(
+        self,
+        action_scores: torch.Tensor,      # [B, A]
+        legal_action_indices: torch.Tensor,  # [B, MAX_LEGAL_MOVES]
+    ) -> torch.Tensor:
+        """Gather full-action scores onto the legal move list."""
+        safe_actions = legal_action_indices.clamp(min=0)
+        gathered = action_scores.gather(1, safe_actions)
+        gathered[legal_action_indices < 0] = float("-inf")
+        return gathered
 
     # ── Improved policy computation ───────────────────────────────
 
@@ -741,8 +721,9 @@ class GumbelAlphaZeroOrchestrator:
         Generates all legal moves, applies each, checks for wins.
         """
         legal_moves, num_legal = self.ext.generate_legal_moves_batch(root_states, B)
-        masks, _ = self.ext.generate_legal_mask_batch(root_states, B)
-        centroids = self.ext.compute_centroids_batch(root_states, B).cpu().numpy()
+        legal_action_indices = self.ext.legal_moves_to_actions_batch(
+            root_states, legal_moves, num_legal, B,
+        )
         nlegal_np = num_legal.cpu().numpy()
 
         for i in range(B):
@@ -762,11 +743,8 @@ class GumbelAlphaZeroOrchestrator:
             win_result = 1 if (current_turns[i] % 2 == 0) else 2
             for mi in range(nl):
                 if results[mi] == win_result:
-                    cq, cr = int(centroids[i, 0]), int(centroids[i, 1])
-                    action = self._gpu_move_to_action(
-                        legal_moves[i, mi].cpu().numpy(), cq, cr,
-                    )
-                    if action is not None and 0 <= action < len(policies[i]):
+                    action = int(legal_action_indices[i, mi].item())
+                    if 0 <= action < len(policies[i]):
                         policies[i][:] = 0.0
                         policies[i][action] = 1.0
                         break
@@ -782,58 +760,16 @@ class GumbelAlphaZeroOrchestrator:
         """Find the GPU move bytes for a given action index."""
         single = states[game_idx:game_idx + 1]
         moves_t, num_legal = self.ext.generate_legal_moves_batch(single, 1)
-        nl = num_legal[0].item()
-        centroids = self.ext.compute_centroids_batch(single, 1).cpu().numpy()
-        cq, cr = int(centroids[0, 0]), int(centroids[0, 1])
-        raw = moves_t[0].cpu().numpy()
-
-        for mi in range(nl):
-            a = self._gpu_move_to_action(raw[mi], cq, cr)
-            if a == action:
-                return raw[mi].copy()
+        legal_action_indices = self.ext.legal_moves_to_actions_batch(
+            single, moves_t, num_legal, 1,
+        )
+        move_indices = (legal_action_indices[0] == action).nonzero(as_tuple=False)
+        nl = int(num_legal[0].item())
+        if move_indices.numel() > 0:
+            return moves_t[0, int(move_indices[0, 0].item())].cpu().numpy().copy()
         if nl > 0:
-            return raw[0].copy()
+            return moves_t[0, 0].cpu().numpy().copy()
         return None
-
-    def _gpu_move_to_action(
-        self, move_raw: np.ndarray, center_q: int, center_r: int,
-    ) -> int | None:
-        """Map raw GPU move bytes to action index."""
-        m_type = int(move_raw[0])
-        m_pt = int(move_raw[1])
-        m_from = int(move_raw[2]) | (int(move_raw[3]) << 8)
-        m_to = int(move_raw[4]) | (int(move_raw[5]) << 8)
-
-        if m_type == 2:
-            return self.ext.PASS_ACTION_INDEX
-
-        BOARD_SIZE = self.ext.BOARD_SIZE
-        HALF = BOARD_SIZE // 2
-        ENC_GRID = self.ext.ENC_GRID
-        ENC_HALF = ENC_GRID // 2
-        NUM_ENC = ENC_GRID * ENC_GRID
-
-        if m_type == 0:  # PLACE
-            to_q = m_to % BOARD_SIZE - HALF
-            to_r = m_to // BOARD_SIZE - HALF
-            ec = to_q - center_q + ENC_HALF
-            er = to_r - center_r + ENC_HALF
-            if ec < 0 or ec >= ENC_GRID or er < 0 or er >= ENC_GRID:
-                return None
-            return (m_pt - 1) * NUM_ENC + er * ENC_GRID + ec
-        else:  # MOVE
-            fq = m_from % BOARD_SIZE - HALF
-            fr = m_from // BOARD_SIZE - HALF
-            tq = m_to % BOARD_SIZE - HALF
-            tr = m_to // BOARD_SIZE - HALF
-            sc = fq - center_q + ENC_HALF
-            sr = fr - center_r + ENC_HALF
-            dc = tq - center_q + ENC_HALF
-            dr = tr - center_r + ENC_HALF
-            if (sc < 0 or sc >= ENC_GRID or sr < 0 or sr >= ENC_GRID or
-                dc < 0 or dc >= ENC_GRID or dr < 0 or dr >= ENC_GRID):
-                return None
-            return self.ext.MOVEMENT_OFFSET + (sr * ENC_GRID + sc) * NUM_ENC + (dr * ENC_GRID + dc)
 
     # ── NN sub-batching ───────────────────────────────────────────
 
@@ -863,12 +799,10 @@ class GumbelAlphaZeroOrchestrator:
     _OFF_TURN = 3412
 
     def _get_turns(self, states: torch.Tensor, B: int) -> list[int]:
-        all_bytes = states.cpu().numpy()
         off = self._OFF_TURN
-        return [
-            int(all_bytes[i, off]) | (int(all_bytes[i, off + 1]) << 8)
-            for i in range(B)
-        ]
+        lo = states[:B, off].to(dtype=torch.int32)
+        hi = states[:B, off + 1].to(dtype=torch.int32)
+        return (lo | (hi << 8)).cpu().tolist()
 
     def _hex_neighbors(self, cell: int) -> list[int]:
         row = cell // self._BOARD_SIZE

@@ -300,6 +300,54 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> generate_legal_moves_and_mask_bat
     return std::make_tuple(moves_tensor, num_legal, masks);
 }
 
+__global__ void legal_moves_to_actions_kernel(
+    const HiveState* states,
+    const GPUMove* moves,     // [B, MAX_LEGAL_MOVES]
+    const int* num_legal,     // [B]
+    int* action_indices,      // [B, MAX_LEGAL_MOVES]
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    const HiveState& s = states[idx];
+    const GPUMove* my_moves = moves + idx * MAX_LEGAL_MOVES;
+    int* my_actions = action_indices + idx * MAX_LEGAL_MOVES;
+    int n_legal = num_legal[idx];
+
+    int center_q, center_r;
+    compute_centroid(s, center_q, center_r);
+
+    for (int m = 0; m < MAX_LEGAL_MOVES; ++m) {
+        my_actions[m] = -1;
+    }
+    for (int m = 0; m < n_legal; ++m) {
+        my_actions[m] = gpu_move_to_action(my_moves[m], center_q, center_r);
+    }
+}
+
+torch::Tensor legal_moves_to_actions_batch(
+    at::Tensor states_tensor,
+    at::Tensor legal_moves_tensor,
+    at::Tensor num_legal_tensor,
+    int batch_size
+) {
+    auto opts_i = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto action_indices = at::full({batch_size, MAX_LEGAL_MOVES}, -1, opts_i);
+
+    HiveState* states_ptr = reinterpret_cast<HiveState*>(states_tensor.data_ptr());
+    GPUMove* moves_ptr = reinterpret_cast<GPUMove*>(legal_moves_tensor.data_ptr());
+    int* num_legal_ptr = static_cast<int*>(num_legal_tensor.data_ptr());
+    int* action_ptr = static_cast<int*>(action_indices.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    legal_moves_to_actions_kernel<<<blocks, threads>>>(
+        states_ptr, moves_ptr, num_legal_ptr, action_ptr, batch_size);
+
+    return action_indices;
+}
+
 // ── Kernel: compute per-piece mobility for a batch of states ────────
 
 __global__ void compute_mobility_kernel(

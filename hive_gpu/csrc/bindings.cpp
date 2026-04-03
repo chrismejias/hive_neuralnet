@@ -36,6 +36,11 @@ std::tuple<torch::Tensor, torch::Tensor> compute_mobility_batch(
     torch::Tensor states_tensor, int batch_size, bool both_players);
 torch::Tensor compute_centroids_batch(
     torch::Tensor states_tensor, int batch_size);
+torch::Tensor legal_moves_to_actions_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    int batch_size);
 
 // GPU-native MCTS
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -137,6 +142,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("compute_centroids_batch", &hive_gpu::compute_centroids_batch,
           "Compute per-state centroids on GPU",
           py::arg("states"), py::arg("batch_size"));
+
+    m.def("legal_moves_to_actions_batch", &hive_gpu::legal_moves_to_actions_batch,
+          "Map generated legal moves to action indices on GPU",
+          py::arg("states"), py::arg("legal_moves"), py::arg("num_legal"),
+          py::arg("batch_size"));
 
     // ── GPU-native MCTS ────────────────────────────────────────────
     m.def("mcts_select_batch", &hive_gpu::mcts_select_batch,

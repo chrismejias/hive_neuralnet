@@ -50,3 +50,41 @@ def test_gumbel_improved_policy_stays_on_considered_actions():
     assert policy[1] == 0.0
     assert policy[3] == 0.0
     assert abs(policy.sum() - 1.0) < 1e-6
+
+
+def test_gumbel_matches_candidate_actions_to_legal_move_indices():
+    orchestrator = GumbelAlphaZeroOrchestrator.__new__(GumbelAlphaZeroOrchestrator)
+
+    actions = torch.tensor([[7, 3, 9], [4, 1, 2]], dtype=torch.int64)
+    legal_action_indices = torch.tensor(
+        [[5, 7, 9, -1], [4, 8, -1, -1]],
+        dtype=torch.int32,
+    )
+    num_legal = torch.tensor([3, 2], dtype=torch.int32)
+
+    move_indices = orchestrator._match_actions_to_legal_moves(
+        actions, legal_action_indices, num_legal,
+    )
+
+    assert move_indices.tolist() == [[1, -1, 2], [0, -1, -1]]
+
+
+def test_gumbel_gathers_scores_for_legal_moves_only():
+    orchestrator = GumbelAlphaZeroOrchestrator.__new__(GumbelAlphaZeroOrchestrator)
+
+    scores = torch.tensor(
+        [[0.1, 0.2, 0.3, 0.4], [0.8, 0.7, 0.6, 0.5]],
+        dtype=torch.float32,
+    )
+    legal_action_indices = torch.tensor(
+        [[3, 1, -1], [0, 2, -1]],
+        dtype=torch.int32,
+    )
+
+    gathered = orchestrator._gather_legal_action_scores(scores, legal_action_indices)
+
+    assert gathered[0, 0].item() == scores[0, 3].item()
+    assert gathered[0, 1].item() == scores[0, 1].item()
+    assert gathered[1, 0].item() == scores[1, 0].item()
+    assert gathered[1, 1].item() == scores[1, 2].item()
+    assert torch.isneginf(gathered[:, 2]).all()
