@@ -1,11 +1,11 @@
 # Hive Neural Network
 
-AlphaZero-style self-play training for the board game [Hive](https://en.wikipedia.org/wiki/Hive_(game)), using a GPU-native transformer with CUDA MCTS kernels.
+AlphaZero-style self-play training for the board game [Hive](https://en.wikipedia.org/wiki/Hive_(game)), using a GPU-native transformer with Gumbel AlphaZero search.
 
 ## Architecture
 
 - **Network**: Transformer encoder (~9M parameters) with policy, value, and queen-surround auxiliary heads
-- **MCTS**: GPU-native tree search — select/expand/backprop all run as CUDA kernels
+- **Search**: Gumbel AlphaZero (default) — Sequential Halving with Gumbel noise, fully batched NN evaluations per round; or GPU-native MCTS with CUDA kernels (opt-out via `--no-gumbel`)
 - **Self-play**: Batched parallel games entirely on GPU; no Python loop overhead
 - **Expansion pieces**: Supports Mosquito, Ladybug, Pillbug (configurable or random)
 - **Endgame curriculum**: Optionally start games from near-decided positions to sharpen tactical play
@@ -62,20 +62,21 @@ Or if a prebuilt `.pyd`/`.so` is already present in `hive_gpu/`, it loads automa
 
 ## Search Algorithms
 
-Two search algorithms are available:
+### Gumbel AlphaZero (default)
 
-### Wave-parallel MCTS (default)
+Based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). Uses Sequential Halving with Gumbel noise to select and evaluate a fixed budget of candidate actions. All NN evaluations within a round are fully independent and batched — no serial tree traversal bottleneck.
 
-GPU-native tree search with W simulations per wave. Virtual loss diversifies selections within each wave. Use `--wave-size` to control parallelism (higher = more GPU utilization, slightly lower quality).
-
-### Gumbel AlphaZero
-
-An alternative to MCTS based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). Instead of tree traversals, uses Sequential Halving with Gumbel noise to select and evaluate a fixed budget of candidate actions. All NN evaluations within a round are fully independent and batched — no serial tree traversal bottleneck.
-
-- Enable with `--gumbel`
+- **On by default** — no flag needed
 - Use `--gumbel-considered` to set the number of actions considered at the root (k, default 32)
 - Rounds = ceil(log2(k)) — e.g. k=32 → 5 rounds
-- Scales better with VRAM: larger batch sizes and k values are straightforward
+- Scales well with VRAM: run more games in parallel, not more serial rounds
+
+### Wave-parallel MCTS (opt-out)
+
+GPU-native tree search with W simulations per wave. Virtual loss diversifies selections within each wave. Use `--wave-size` to control parallelism.
+
+- Disable Gumbel and use MCTS with `--no-gumbel`
+- Use `--wave-size` to tune parallelism (default 8; increase for larger GPUs)
 
 ## Running Training
 
@@ -84,22 +85,6 @@ An alternative to MCTS based on [Danihelka et al., 2022](https://openreview.net/
 ```bash
 python -m hive_gpu \
   --encoder-type transformer \
-  --gpu-native \
-  --games 256 \
-  --simulations 128 \
-  --iterations 100 \
-  --wave-size 8 \
-  --expansion -1 \
-  --checkpoint-dir checkpoints \
-  --log-file training.log
-```
-
-### With Gumbel AlphaZero (recommended for large VRAM)
-
-```bash
-python -m hive_gpu \
-  --encoder-type transformer \
-  --gumbel \
   --games 256 \
   --simulations 128 \
   --gumbel-considered 32 \
@@ -109,17 +94,18 @@ python -m hive_gpu \
   --log-file training.log
 ```
 
+Gumbel AlphaZero is used by default. Pass `--no-gumbel` to fall back to wave-parallel MCTS.
+
 ### Resume from checkpoint (local)
 
 ```bash
 python -m hive_gpu \
   --encoder-type transformer \
-  --gpu-native \
   --games 256 \
   --simulations 128 \
-  --iterations 100 \
-  --wave-size 8 \
+  --gumbel-considered 32 \
   --expansion -1 \
+  --iterations 100 \
   --resume checkpoints/hive_gpu_checkpoint_0124.pt \
   --checkpoint-dir checkpoints \
   --log-file training.log
@@ -137,7 +123,6 @@ docker run --gpus all \
   hive-neuralnet \
   python -m hive_gpu \
     --encoder-type transformer \
-    --gumbel \
     --games 512 \
     --simulations 128 \
     --gumbel-considered 32 \
@@ -156,7 +141,7 @@ docker run --rm --gpus all hive-neuralnet \
   python -c "import hive_gpu; ext = hive_gpu.load_extension(); print(ext.BOARD_SIZE, ext.ACTION_SPACE_SIZE)"
 ```
 
-To run a single Gumbel iteration as a Linux smoke test:
+To run a single iteration as a smoke test:
 
 ```bash
 docker run --rm --gpus all \
@@ -164,7 +149,6 @@ docker run --rm --gpus all \
   hive-neuralnet \
   python -m hive_gpu \
     --encoder-type transformer \
-    --gumbel \
     --games 32 \
     --simulations 64 \
     --gumbel-considered 32 \
@@ -180,12 +164,11 @@ Start a fraction of games from positions where both queens are nearly surrounded
 ```bash
 python -m hive_gpu \
   --encoder-type transformer \
-  --gpu-native \
   --games 512 \
   --simulations 128 \
-  --iterations 200 \
-  --wave-size 8 \
+  --gumbel-considered 32 \
   --expansion -1 \
+  --iterations 200 \
   --endgame-frac 1.0 \
   --endgame-surround 5 \
   --draw-keep-rate 0.10 \
@@ -201,8 +184,8 @@ python -m hive_gpu \
 | `--games` | 64 | Parallel self-play games per iteration |
 | `--simulations` | 100 | MCTS simulations per move (or Gumbel simulation budget) |
 | `--iterations` | 20 | Total training iterations |
-| `--wave-size` | 8 | Parallel MCTS sims per GPU wave (increase for larger GPUs) |
-| `--gumbel` | off | Use Gumbel AlphaZero instead of MCTS |
+| `--no-gumbel` | — | Disable Gumbel and fall back to wave-parallel MCTS |
+| `--wave-size` | 8 | Parallel MCTS sims per GPU wave (only with `--no-gumbel`) |
 | `--gumbel-considered` | 32 | Number of root actions considered (k); rounds = ceil(log2(k)) |
 | `--gumbel-c-visit` | 50.0 | Q-transform visit count scale |
 | `--gumbel-c-scale` | 1.0 | Q-transform value scale |

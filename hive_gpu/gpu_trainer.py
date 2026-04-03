@@ -137,7 +137,7 @@ class GPUTrainConfig:
     use_gpu_native: bool = False
 
     # Gumbel AlphaZero search (sequential halving, no MCTS tree)
-    use_gumbel: bool = False
+    use_gumbel: bool = True
     gumbel_max_considered: int = 32  # top-k actions before halving
     gumbel_c_visit: float = 50.0
     gumbel_c_scale: float = 1.0

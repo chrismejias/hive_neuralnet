@@ -269,13 +269,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(use_gpu_native=False)
 
-    # Gumbel AlphaZero search — opt-in, off by default
+    # Gumbel AlphaZero search — on by default, opt-out with --no-gumbel
     parser.add_argument(
-        "--gumbel", action="store_true", dest="use_gumbel",
-        help="Use Gumbel AlphaZero search (sequential halving, no MCTS tree). "
-             "Better GPU utilization than MCTS at equivalent sim budgets.",
+        "--no-gumbel", action="store_false", dest="use_gumbel",
+        help="Disable Gumbel AlphaZero search and fall back to GPU-native MCTS.",
     )
-    parser.set_defaults(use_gumbel=False)
+    parser.set_defaults(use_gumbel=True)
     parser.add_argument(
         "--gumbel-considered", type=int, default=32,
         help="Max actions to consider in Gumbel sequential halving (top-k before halving).",
