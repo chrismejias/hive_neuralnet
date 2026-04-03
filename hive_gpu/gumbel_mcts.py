@@ -718,7 +718,8 @@ class GumbelAlphaZeroOrchestrator:
     ) -> None:
         """Override policies with probability 1 for any immediate win.
 
-        Generates all legal moves, applies each, checks for wins.
+        Fully batched: one apply_moves_batch + one check_results_batch across
+        all games, replacing the previous per-game kernel dispatch loop.
         """
         legal_moves, num_legal = self.ext.generate_legal_moves_batch(root_states, B)
         legal_action_indices = self.ext.legal_moves_to_actions_batch(
@@ -726,28 +727,49 @@ class GumbelAlphaZeroOrchestrator:
         )
         nlegal_np = num_legal.cpu().numpy()
 
+        # Build flat index tensors across all active games in one pass
+        gi_flat: list[int] = []
+        mi_flat: list[int] = []
+        game_offsets: list[int] = []   # start index in flat array for each game
+        game_nlegal: list[int] = []    # number of moves per game (0 if inactive)
+
         for i in range(B):
-            if not active[i]:
-                continue
-            nl = int(nlegal_np[i])
+            game_offsets.append(len(gi_flat))
+            nl = int(nlegal_np[i]) if active[i] else 0
+            game_nlegal.append(nl)
+            for m in range(nl):
+                gi_flat.append(i)
+                mi_flat.append(m)
+
+        total = len(gi_flat)
+        if total == 0:
+            return
+
+        gi_t = torch.tensor(gi_flat, dtype=torch.int64, device="cuda")
+        mi_t = torch.tensor(mi_flat, dtype=torch.int64, device="cuda")
+
+        # Single batched apply + check — two kernel launches, one CPU sync
+        test_states = root_states[gi_t].clone()
+        flat_moves = legal_moves[gi_t, mi_t]
+        self.ext.apply_moves_batch(test_states, flat_moves, total)
+        results_np = self.ext.check_results_batch(test_states, total).cpu().numpy()
+
+        # Scatter-reduce: find first winning move per game
+        flat_idx = 0
+        for i in range(B):
+            nl = game_nlegal[i]
             if nl == 0:
+                flat_idx += nl
                 continue
-
-            # Clone state for each legal move
-            gi_t = torch.full((nl,), i, dtype=torch.int64, device="cuda")
-            test_states = root_states[gi_t].clone()
-            moves = legal_moves[i, :nl]
-            self.ext.apply_moves_batch(test_states, moves, nl)
-            results = self.ext.check_results_batch(test_states, nl).cpu().numpy()
-
             win_result = 1 if (current_turns[i] % 2 == 0) else 2
             for mi in range(nl):
-                if results[mi] == win_result:
+                if results_np[flat_idx + mi] == win_result:
                     action = int(legal_action_indices[i, mi].item())
                     if 0 <= action < len(policies[i]):
                         policies[i][:] = 0.0
                         policies[i][action] = 1.0
-                        break
+                    break
+            flat_idx += nl
 
     # ── Action → move bytes lookup ────────────────────────────────
 
