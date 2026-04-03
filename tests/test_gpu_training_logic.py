@@ -1,0 +1,52 @@
+import torch
+
+from hive_gpu.gpu_trainer import GPUTrainer
+from hive_gpu.gumbel_mcts import GumbelAlphaZeroOrchestrator, GumbelConfig
+
+
+def test_random_expansion_run_list_preserves_requested_game_count():
+    run_list = GPUTrainer._build_run_list(
+        games_per_batch=10,
+        batches_per_iteration=1,
+        expansion_mask=-1,
+    )
+
+    assert sum(size for _, size in run_list) == 10
+    assert [mask for mask, _ in run_list] == list(range(8))
+    assert max(size for _, size in run_list) - min(size for _, size in run_list) <= 1
+
+
+def test_gumbel_improved_policy_stays_on_considered_actions():
+    orchestrator = GumbelAlphaZeroOrchestrator.__new__(GumbelAlphaZeroOrchestrator)
+    orchestrator.config = GumbelConfig(
+        c_visit=50.0,
+        c_scale=1.0,
+        policy_target_pruning=0.0,
+    )
+    orchestrator._action_space_size = 4
+
+    logits = torch.tensor([[1.0, 10.0, 2.0, -5.0]], dtype=torch.float32)
+    topk_actions = torch.tensor([[0, 2]], dtype=torch.int64)
+    q_sums = torch.tensor([[3.0, 1.0]], dtype=torch.float32)
+    visit_counts = torch.tensor([[3, 1]], dtype=torch.int32)
+    legal_mask = torch.tensor([[True, True, True, False]])
+    root_values = torch.tensor([0.25], dtype=torch.float32)
+    nn_prior_probs = torch.softmax(logits, dim=-1)
+
+    policies, _ = orchestrator._compute_improved_policy(
+        logits=logits,
+        topk_actions=topk_actions,
+        q_sums=q_sums,
+        visit_counts=visit_counts,
+        legal_mask=legal_mask,
+        root_values=root_values,
+        nn_prior_probs=nn_prior_probs,
+        B=1,
+        max_k=2,
+        active=[True],
+    )
+
+    policy = policies[0]
+    assert policy[1] == 0.0
+    assert policy[3] == 0.0
+    assert abs(policy.sum() - 1.0) < 1e-6

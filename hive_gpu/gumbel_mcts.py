@@ -303,15 +303,27 @@ class GumbelAlphaZeroOrchestrator:
             root_states, B, legal_moves, num_legal_moves, centroids,
         )
 
+        remaining_budget = torch.full(
+            (B,), cfg.num_simulations, dtype=torch.int32, device="cuda"
+        )
+
         for round_idx in range(num_rounds):
             n_remaining = candidate_mask.sum(dim=1).float()  # [B]
             max_remaining = int(n_remaining.max().item())
             if max_remaining == 0:
                 break
 
-            # Allocate visits per candidate this round
-            # Total budget spread across rounds; each candidate gets equal share
-            visits_this_round = max(1, cfg.num_simulations // (max_remaining * num_rounds))
+            # Allocate the remaining per-game simulation budget across the
+            # still-alive candidates. This keeps later rounds meaningful
+            # instead of duplicating the same one-ply value estimate.
+            n_remaining_i = candidate_mask.sum(dim=1).int()
+            visits_this_round = torch.where(
+                n_remaining_i > 0,
+                torch.clamp(remaining_budget // n_remaining_i.clamp(min=1), min=1),
+                torch.zeros_like(remaining_budget),
+            )
+            if int(visits_this_round.max().item()) == 0:
+                break
 
             # ── Build child states for all candidates × visits ──
             child_values = self._evaluate_candidates(
@@ -321,11 +333,15 @@ class GumbelAlphaZeroOrchestrator:
             )  # [B, max_k] mean child values (negated = from root player perspective)
 
             # Update Q-values
-            old_n = visit_counts.float()
-            new_n = old_n + visits_this_round * candidate_mask.float()
-            # Incremental mean update
-            q_sums += child_values * visits_this_round * candidate_mask.float()
-            visit_counts += visits_this_round * candidate_mask.int()
+            visits_per_candidate = visits_this_round.unsqueeze(1).float()
+            q_sums += child_values * visits_per_candidate * candidate_mask.float()
+            visit_counts += (
+                visits_this_round.unsqueeze(1) * candidate_mask.int()
+            )
+            remaining_budget = torch.clamp(
+                remaining_budget - visits_this_round * n_remaining_i,
+                min=0,
+            )
 
             # ── Score candidates and halve ──
             if round_idx < num_rounds - 1:
@@ -375,7 +391,7 @@ class GumbelAlphaZeroOrchestrator:
         B: int,
         topk_actions: torch.Tensor,   # [B, max_k]
         candidate_mask: torch.Tensor,  # [B, max_k]
-        visits_per_action: int,
+        visits_per_action: torch.Tensor,
         legal_moves: torch.Tensor,
         num_legal_moves: torch.Tensor,
         action_to_move: dict[int, dict[int, int]],
@@ -385,9 +401,11 @@ class GumbelAlphaZeroOrchestrator:
         For each active candidate, clone root → apply action → NN eval.
         Returns [B, max_k] tensor of mean child values (negated for root perspective).
 
-        When visits_per_action > 1, we re-evaluate the same child state multiple
-        times — but since the child is deterministic, we just do one eval per
-        candidate and multiply.  (Future: could do deeper search from child.)
+        When more than one simulation is allocated to a surviving candidate, we
+        probe multiple likely replies from the child state and aggregate them as
+        a pessimistic best reply for the opponent. That gives later halving
+        rounds additional search signal instead of duplicating the same one-ply
+        value.
         """
         max_k = topk_actions.shape[1]
         state_size = root_states.shape[1]
@@ -469,12 +487,137 @@ class GumbelAlphaZeroOrchestrator:
         # Negate: Q(a) from root's perspective = -V(child)
         neg_child_values = -child_values
 
+        # Spend extra budget on likely replies from the child state.
+        max_reply_budget = int(visits_per_action.max().item()) if total > 0 else 0
+        if max_reply_budget > 1:
+            child_reply_values = self._probe_child_replies(
+                child_states,
+                neg_child_values,
+                results,
+                game_indices,
+                visits_per_action,
+            )
+        else:
+            child_reply_values = neg_child_values
+
         # Scatter back to [B, max_k]
         result_tensor = torch.zeros(B, max_k, device="cuda")
         for k in range(total):
-            result_tensor[game_indices[k], cand_indices[k]] = neg_child_values[k]
+            result_tensor[game_indices[k], cand_indices[k]] = child_reply_values[k]
 
         return result_tensor
+
+    def _probe_child_replies(
+        self,
+        child_states: torch.Tensor,
+        default_root_values: torch.Tensor,
+        child_results: np.ndarray,
+        game_indices: list[int],
+        visits_per_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Probe likely replies from each non-terminal child state.
+
+        Returns a root-perspective value per child candidate. Terminal children
+        or children with no extra budget keep their default one-ply estimate.
+        """
+        total = child_states.shape[0]
+        root_values = default_root_values.clone()
+        if total == 0:
+            return root_values
+
+        legal_moves, num_legal = self.ext.generate_legal_moves_batch(child_states, total)
+        legal_mask_int, _ = self.ext.generate_legal_mask_batch(child_states, total)
+        legal_mask = legal_mask_int.bool()
+        centroids = self.ext.compute_centroids_batch(child_states, total).cpu().numpy()
+
+        encoded = self.encoder.encode_batch(child_states, total)
+        with torch.no_grad():
+            cfg = self.config
+            if cfg.nn_max_batch > 0 and total > cfg.nn_max_batch:
+                child_policy_logits, _ = self._nn_forward_subbatched(encoded, total)
+            else:
+                child_policy_logits, _, *_ = self.net(encoded)
+        child_policy_logits[~legal_mask] = float("-inf")
+        child_policy = torch.softmax(child_policy_logits, dim=-1).cpu().numpy()
+
+        action_to_move = self._build_action_to_move_map(
+            child_states, total, legal_moves, num_legal, centroids,
+        )
+        moves_np = legal_moves.cpu().numpy()
+        num_legal_np = num_legal.cpu().numpy()
+        visits_np = visits_per_action.cpu().numpy()
+
+        reply_parent = []
+        reply_move_bytes = []
+        for parent_idx in range(total):
+            if child_results[parent_idx] != 0:
+                continue
+            reply_budget = max(0, int(visits_np[game_indices[parent_idx]]) - 1)
+            if reply_budget <= 0:
+                continue
+            nl = int(num_legal_np[parent_idx])
+            if nl == 0:
+                continue
+            action_probs = child_policy[parent_idx]
+            move_map = action_to_move.get(parent_idx, {})
+            ranked = sorted(
+                move_map.items(),
+                key=lambda item: float(action_probs[item[0]]),
+                reverse=True,
+            )
+            for action, move_idx in ranked[:reply_budget]:
+                reply_parent.append(parent_idx)
+                reply_move_bytes.append(moves_np[parent_idx, move_idx].copy())
+
+        if not reply_parent:
+            return root_values
+
+        reply_total = len(reply_parent)
+        parent_idx_t = torch.tensor(reply_parent, dtype=torch.int64, device="cuda")
+        grandchild_states = child_states[parent_idx_t].clone()
+        moves_t = torch.from_numpy(np.stack(reply_move_bytes, axis=0)).cuda()
+        self.ext.apply_moves_batch(grandchild_states, moves_t, reply_total)
+
+        grandchild_results = self.ext.check_results_batch(
+            grandchild_states, reply_total
+        ).cpu().numpy()
+        encoded_gc = self.encoder.encode_batch(grandchild_states, reply_total)
+        with torch.no_grad():
+            cfg = self.config
+            if cfg.nn_max_batch > 0 and reply_total > cfg.nn_max_batch:
+                _, grandchild_values = self._nn_forward_subbatched(encoded_gc, reply_total)
+            else:
+                _, grandchild_values, *_ = self.net(encoded_gc)
+        grandchild_values = grandchild_values.squeeze(-1)
+
+        # After the opponent reply, it is the root player's turn again.
+        for k in range(reply_total):
+            r = grandchild_results[k]
+            if r == 0:
+                continue
+            elif r == 3:
+                grandchild_values[k] = 0.0
+            else:
+                root_game_idx = game_indices[reply_parent[k]]
+                root_turn_byte = child_states[
+                    reply_parent[k], self._OFF_TURN
+                ].item()
+                root_is_white = (root_turn_byte % 2 == 1)
+                root_won = (r == 1 and root_is_white) or (r == 2 and not root_is_white)
+                grandchild_values[k] = 1.0 if root_won else -1.0
+
+        # Opponent selects the reply that is worst for the root player.
+        for parent_idx in set(reply_parent):
+            vals = grandchild_values[
+                torch.tensor(
+                    [i for i, p in enumerate(reply_parent) if p == parent_idx],
+                    dtype=torch.int64,
+                    device=grandchild_values.device,
+                )
+            ]
+            root_values[parent_idx] = torch.min(vals)
+
+        return root_values
 
     # ── Action-to-move mapping ────────────────────────────────────
 
@@ -542,19 +685,18 @@ class GumbelAlphaZeroOrchestrator:
 
         max_n = visit_counts.max(dim=1, keepdim=True).values.float().clamp(min=1)
 
-        # Q-completion: unvisited actions get -root_value (opponent's perspective)
-        # For the full action space, default Q = -root_value
-        q_completed_full = (-root_values).unsqueeze(1).expand(B, A).clone()  # [B, A]
-
-        # Fill in visited actions
-        topk_q = torch.where(visit_counts > 0, q_mean, (-root_values).unsqueeze(1).expand_as(q_mean))
-        q_completed_full.scatter_(1, topk_actions, topk_q)
-
-        # Q-transform on full action space
-        qtransform_full = (cfg.c_visit + max_n) * cfg.c_scale * q_completed_full  # [B, A]
-
-        # Improved logits
-        improved_logits = logits + qtransform_full
+        # Restrict policy improvement to the searched candidate set rather than
+        # leaking probability mass back onto the full legal action space.
+        improved_logits = torch.full_like(logits, float("-inf"))
+        topk_q = torch.where(
+            visit_counts > 0,
+            q_mean,
+            (-root_values).unsqueeze(1).expand_as(q_mean),
+        )
+        topk_logits = logits.gather(1, topk_actions)
+        topk_qtransform = (cfg.c_visit + max_n) * cfg.c_scale * topk_q
+        improved_topk = topk_logits + topk_qtransform
+        improved_logits.scatter_(1, topk_actions, improved_topk)
         improved_logits[~legal_mask] = float("-inf")
 
         # Softmax → improved policy

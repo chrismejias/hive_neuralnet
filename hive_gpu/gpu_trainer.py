@@ -387,19 +387,11 @@ class GPUTrainer:
 
         self.best_net.eval()
 
-        # Build the list of (mask, sub_batch_size) pairs to execute.
-        if cfg.expansion_mask < 0:
-            # Per-game randomisation: cover all 8 masks equally.
-            num_masks = 8
-            total_games = cfg.games_per_batch * cfg.batches_per_iteration
-            sub_size = max(1, total_games // num_masks)
-            run_list = [(mask, sub_size) for mask in range(num_masks)]
-        else:
-            # Fixed mask: original loop over batches_per_iteration.
-            run_list = [
-                (cfg.expansion_mask, cfg.games_per_batch)
-                for _ in range(cfg.batches_per_iteration)
-            ]
+        run_list = self._build_run_list(
+            cfg.games_per_batch,
+            cfg.batches_per_iteration,
+            cfg.expansion_mask,
+        )
 
         all_examples: list = []
         stats = {
@@ -570,6 +562,34 @@ class GPUTrainer:
             stats["dag_nodes"] = last_orchestrator.total_dag_nodes
 
         return all_examples, stats
+
+    @staticmethod
+    def _build_run_list(
+        games_per_batch: int,
+        batches_per_iteration: int,
+        expansion_mask: int,
+    ) -> list[tuple[int, int]]:
+        """Build the list of ``(expansion_mask, sub_batch_size)`` self-play runs.
+
+        For random-per-game expansion mode, distribute the exact requested game
+        count across all 8 masks instead of dropping the remainder.
+        """
+        if expansion_mask >= 0:
+            return [
+                (expansion_mask, games_per_batch)
+                for _ in range(batches_per_iteration)
+            ]
+
+        total_games = games_per_batch * batches_per_iteration
+        num_masks = 8
+        base = total_games // num_masks
+        remainder = total_games % num_masks
+        run_list: list[tuple[int, int]] = []
+        for mask in range(num_masks):
+            sub_size = base + (1 if mask < remainder else 0)
+            if sub_size > 0:
+                run_list.append((mask, sub_size))
+        return run_list
 
     @staticmethod
     def _compute_surprise_weight(
