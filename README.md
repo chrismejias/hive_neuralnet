@@ -186,7 +186,7 @@ python -m hive_gpu \
 | `--iterations` | 20 | Total training iterations |
 | `--no-gumbel` | — | Disable Gumbel and fall back to wave-parallel MCTS |
 | `--wave-size` | 8 | Parallel MCTS sims per GPU wave (only with `--no-gumbel`) |
-| `--gumbel-considered` | 32 | Number of root actions considered (k); rounds = ceil(log2(k)) |
+| `--gumbel-considered` | 16 | Number of root actions considered (k); rounds = ceil(log2(k)) |
 | `--gumbel-c-visit` | 50.0 | Q-transform visit count scale |
 | `--gumbel-c-scale` | 1.0 | Q-transform value scale |
 | `--expansion` | 0 | Expansion piece mask: 0=base, 1=+Mosquito, 2=+Ladybug, 4=+Pillbug, 7=all, -1=random |
@@ -194,7 +194,7 @@ python -m hive_gpu \
 | `--endgame-surround` | 5 | Max queen neighbor count for endgame starts (range 4–surround) |
 | `--draw-keep-rate` | 1.0 | Fraction of drawn games kept for training (0.1 = discard 90%) |
 | `--lr` | 0.0002 | Learning rate |
-| `--buffer-size` | 50000 | Replay buffer capacity |
+| `--buffer-size` | 100000 | Replay buffer capacity |
 | `--resume` | — | Path to checkpoint to resume from |
 | `--log-file` | — | Append output to log file (in addition to terminal) |
 

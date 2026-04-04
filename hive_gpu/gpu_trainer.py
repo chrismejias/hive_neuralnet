@@ -71,12 +71,12 @@ class GPUTrainConfig:
 
     # Training
     batch_size: int = 256  # bumped from 64 — better GPU utilisation on 24 GB+
-    num_epochs: int = 2
+    num_epochs: int = 3
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4
 
     # Replay buffer
-    buffer_max_size: int = 50_000
+    buffer_max_size: int = 100_000
 
     # Arena
     arena_games: int = 20
@@ -138,7 +138,7 @@ class GPUTrainConfig:
 
     # Gumbel AlphaZero search (sequential halving, no MCTS tree)
     use_gumbel: bool = True
-    gumbel_max_considered: int = 32  # top-k actions before halving
+    gumbel_max_considered: int = 16  # top-k actions before halving
     gumbel_c_visit: float = 50.0
     gumbel_c_scale: float = 1.0
 

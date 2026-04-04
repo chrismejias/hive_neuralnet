@@ -74,7 +74,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Number of self-play batches per iteration.",
     )
     parser.add_argument(
-        "--epochs", type=int, default=5,
+        "--epochs", type=int, default=3,
         help="Training epochs per iteration.",
     )
     parser.add_argument(
@@ -276,7 +276,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(use_gumbel=True)
     parser.add_argument(
-        "--gumbel-considered", type=int, default=32,
+        "--gumbel-considered", type=int, default=16,
         help="Max actions to consider in Gumbel sequential halving (top-k before halving).",
     )
     parser.add_argument(
@@ -300,7 +300,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Replay buffer
     parser.add_argument(
-        "--buffer-size", type=int, default=50_000,
+        "--buffer-size", type=int, default=100_000,
         help="Maximum replay buffer size.",
     )
 
