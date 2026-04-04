@@ -481,7 +481,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Search:       {search_str}")
     print(f"  Checkpoints:  {cfg.checkpoint_dir}")
     if cfg.expansion_mask < 0:
-        exp_str = "random per game (all 8 subsets, split across sub-batches)"
+        exp_str = "rotating per iteration (mask = (iter-1) % 8, cycles through all 8 subsets)"
     elif cfg.expansion_mask == 0:
         exp_str = "base game only"
     else:

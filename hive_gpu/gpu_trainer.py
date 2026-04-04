@@ -274,7 +274,7 @@ class GPUTrainer:
             sp_stats = None
             for cuda_attempt in range(max_cuda_retries + 1):
                 try:
-                    new_examples, sp_stats = self._self_play_phase()
+                    new_examples, sp_stats = self._self_play_phase(iteration)
                     break
                 except (RuntimeError, torch.cuda.CudaError) as e:
                     err_msg = str(e).lower()
@@ -373,13 +373,13 @@ class GPUTrainer:
 
     def _self_play_phase(
         self,
+        iteration: int = 1,
     ) -> tuple[list, dict]:
         """Run GPU-accelerated self-play, returning training examples.
 
-        When expansion_mask < 0 (random-per-game mode), the total games are
-        split evenly across all 8 possible expansion masks (0-7).  Each group
-        is run as a separate, smaller orchestrator call so every game sees a
-        different expansion subset.  When expansion_mask >= 0 all games share
+        When expansion_mask < 0 (rotating mode), the mask for this iteration
+        is chosen as (iteration - 1) % 8, cycling through all 8 expansion
+        subsets one per iteration.  When expansion_mask >= 0 all games share
         that fixed mask (original behaviour).
         """
         cfg = self.config
@@ -387,10 +387,13 @@ class GPUTrainer:
 
         self.best_net.eval()
 
+        # Resolve -1 → a single mask for this iteration (round-robin over 0-7)
+        resolved_mask = (iteration - 1) % 8 if cfg.expansion_mask < 0 else cfg.expansion_mask
+
         run_list = self._build_run_list(
             cfg.games_per_batch,
             cfg.batches_per_iteration,
-            cfg.expansion_mask,
+            resolved_mask,
         )
 
         all_examples: list = []
@@ -399,7 +402,7 @@ class GPUTrainer:
             "white_wins": 0,
             "black_wins": 0,
             "draws": 0,
-            "expansion_mask": cfg.expansion_mask,  # -1 = random per game
+            "expansion_mask": resolved_mask if cfg.expansion_mask < 0 else cfg.expansion_mask,
         }
         last_orchestrator = None
 
