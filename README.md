@@ -12,9 +12,9 @@ AlphaZero-style self-play training for the board game [Hive](https://en.wikipedi
 
 ## Requirements
 
-- Python 3.14
-- PyTorch 2.10.0
-- CUDA 12.8 / cuDNN 9.1.0
+- Python 3.11+
+- PyTorch 2.4+ (tested with 2.4.1+cu124)
+- CUDA 12.4+ / driver supporting CUDA 12.8
 
 ## Setup
 
@@ -51,7 +51,7 @@ enable virtualization features first and reboot before retrying.
 ### Option B: Local
 
 ```bash
-pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+pip install torch --index-url https://download.pytorch.org/whl/cu124
 pip install numpy ninja pytest
 
 # Compile the CUDA extension
@@ -67,8 +67,8 @@ Or if a prebuilt `.pyd`/`.so` is already present in `hive_gpu/`, it loads automa
 Based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). Uses Sequential Halving with Gumbel noise to select and evaluate a fixed budget of candidate actions. All NN evaluations within a round are fully independent and batched — no serial tree traversal bottleneck.
 
 - **On by default** — no flag needed
-- Use `--gumbel-considered` to set the number of actions considered at the root (k, default 32)
-- Rounds = ceil(log2(k)) — e.g. k=32 → 5 rounds
+- Use `--gumbel-considered` to set the number of actions considered at the root (k, default 16)
+- Rounds = ceil(log2(k)) — e.g. k=16 → 4 rounds
 - Scales well with VRAM: run more games in parallel, not more serial rounds
 
 ### Wave-parallel MCTS (opt-out)
@@ -87,7 +87,7 @@ python -m hive_gpu \
   --encoder-type transformer \
   --games 256 \
   --simulations 128 \
-  --gumbel-considered 32 \
+  --gumbel-considered 16 \
   --expansion -1 \
   --iterations 100 \
   --checkpoint-dir checkpoints \
@@ -103,7 +103,7 @@ python -m hive_gpu \
   --encoder-type transformer \
   --games 256 \
   --simulations 128 \
-  --gumbel-considered 32 \
+  --gumbel-considered 16 \
   --expansion -1 \
   --iterations 100 \
   --resume checkpoints/hive_gpu_checkpoint_0124.pt \
@@ -125,7 +125,7 @@ docker run --gpus all \
     --encoder-type transformer \
     --games 512 \
     --simulations 128 \
-    --gumbel-considered 32 \
+    --gumbel-considered 16 \
     --expansion -1 \
     --endgame-frac 1.0 \
     --endgame-surround 5 \
@@ -151,7 +151,7 @@ docker run --rm --gpus all \
     --encoder-type transformer \
     --games 32 \
     --simulations 64 \
-    --gumbel-considered 32 \
+    --gumbel-considered 16 \
     --iterations 1 \
     --checkpoint-dir checkpoints \
     --log-file checkpoints/linux_smoke.log
@@ -166,7 +166,7 @@ python -m hive_gpu \
   --encoder-type transformer \
   --games 512 \
   --simulations 128 \
-  --gumbel-considered 32 \
+  --gumbel-considered 16 \
   --expansion -1 \
   --iterations 200 \
   --endgame-frac 1.0 \
@@ -181,7 +181,7 @@ python -m hive_gpu \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--games` | 64 | Parallel self-play games per iteration |
+| `--games` | 64 | Parallel self-play games per iteration (256 recommended for 24 GB+ GPU) |
 | `--simulations` | 100 | MCTS simulations per move (or Gumbel simulation budget) |
 | `--iterations` | 20 | Total training iterations |
 | `--no-gumbel` | — | Disable Gumbel and fall back to wave-parallel MCTS |
@@ -194,7 +194,9 @@ python -m hive_gpu \
 | `--endgame-surround` | 5 | Max queen neighbor count for endgame starts (range 4–surround) |
 | `--draw-keep-rate` | 1.0 | Fraction of drawn games kept for training (0.1 = discard 90%) |
 | `--lr` | 0.0002 | Learning rate |
-| `--buffer-size` | 100000 | Replay buffer capacity |
+| `--batch-size` | 256 | Training batch size |
+| `--epochs` | 3 | Training epochs per iteration |
+| `--buffer-size` | 100000 | Replay buffer capacity (~5–6 iterations of history at 256 games) |
 | `--resume` | — | Path to checkpoint to resume from |
 | `--log-file` | — | Append output to log file (in addition to terminal) |
 
