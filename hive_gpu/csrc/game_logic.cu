@@ -326,7 +326,7 @@ __global__ void legal_moves_to_actions_kernel(
     }
 }
 
-torch::Tensor legal_moves_to_actions_batch(
+at::Tensor legal_moves_to_actions_batch(
     at::Tensor states_tensor,
     at::Tensor legal_moves_tensor,
     at::Tensor num_legal_tensor,

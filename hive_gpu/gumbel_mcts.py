@@ -125,7 +125,7 @@ class GumbelAlphaZeroOrchestrator:
             current_turns = self._get_turns(states, B)
 
             # ── Gumbel search for all active games ──
-            policies, graphs, seqs, nn_priors = self._gumbel_search(
+            policies, graphs, seqs, nn_priors, root_legal_moves, root_legal_action_indices, root_num_legal = self._gumbel_search(
                 states, B, active, move_numbers,
             )
 
@@ -138,7 +138,8 @@ class GumbelAlphaZeroOrchestrator:
             self._check_immediate_wins(states, B, active, current_turns, policies)
 
             # Record history and select actions
-            action_move_bytes = np.zeros((B, self._move_size), dtype=np.uint8)
+            # selected_actions[i] = chosen action index; -1 for inactive games.
+            selected_actions = np.full(B, -1, dtype=np.int64)
 
             for i in range(B):
                 if not active[i]:
@@ -168,10 +169,19 @@ class GumbelAlphaZeroOrchestrator:
                             p[:] = 1.0 / len(p)
                     action = int(np.random.choice(len(p), p=p))
 
-                # Look up move bytes for selected action
-                fb = self._action_to_gpu_move(states, i, action)
-                if fb is not None:
-                    action_move_bytes[i] = fb
+                selected_actions[i] = action
+
+            # Vectorised move lookup — one gather replaces B per-game kernel launches.
+            actions_t = torch.from_numpy(selected_actions).to(device="cuda").unsqueeze(1)  # [B, 1]
+            matched = self._match_actions_to_legal_moves(
+                actions_t, root_legal_action_indices, root_num_legal,
+            ).squeeze(1)  # [B]
+            has_match = matched >= 0
+            safe_idx = matched.clamp(min=0).long()
+            batch_idx = torch.arange(B, device="cuda")
+            move_bytes_t = root_legal_moves[batch_idx, safe_idx]  # [B, move_size]
+            move_bytes_t[~has_match] = 0
+            action_move_bytes = move_bytes_t.cpu().numpy()
 
             # Apply moves
             moves_t = torch.from_numpy(action_move_bytes).cuda()
@@ -217,6 +227,9 @@ class GumbelAlphaZeroOrchestrator:
         list,
         list[HiveTokenSequence | None],
         list[np.ndarray | None],
+        torch.Tensor,  # legal_moves  [B, MAX_LEGAL_MOVES, move_size]
+        torch.Tensor,  # legal_action_indices  [B, MAX_LEGAL_MOVES]
+        torch.Tensor,  # num_legal_moves  [B]
     ]:
         """Run Gumbel AlphaZero search.  Returns (policies, graphs, seqs, nn_priors)."""
         cfg = self.config
@@ -361,16 +374,16 @@ class GumbelAlphaZeroOrchestrator:
                 n_keep = (n_remaining / 2).ceil().int().clamp(min=1)
                 max_keep = int(n_keep.max().item())
 
-                # For each game, keep the top n_keep[i] candidates
+                # Vectorised halving: rank every candidate slot, keep rank < n_keep.
+                # sorted_idx[i, r] = index of the r-th best slot for game i.
+                # inv_rank[i, j] = rank of slot j (0 = best).
                 sorted_idx = sigma.argsort(dim=1, descending=True)  # [B, max_k]
-                new_candidate_mask = torch.zeros_like(candidate_mask)
-                for i in range(B):
-                    if not active[i]:
-                        continue
-                    nk = int(n_keep[i].item())
-                    keep_indices = sorted_idx[i, :nk]
-                    new_candidate_mask[i, keep_indices] = True
-                candidate_mask = new_candidate_mask
+                inv_rank = torch.empty_like(sorted_idx)
+                inv_rank.scatter_(
+                    1, sorted_idx,
+                    torch.arange(max_k, device="cuda").unsqueeze(0).expand(B, -1),
+                )
+                candidate_mask = (inv_rank < n_keep.unsqueeze(1)) & candidate_mask
 
         # ── Step 5: Compute improved policy ──
         policies_np, nn_priors_list = self._compute_improved_policy(
@@ -378,7 +391,7 @@ class GumbelAlphaZeroOrchestrator:
             legal_mask, root_values, nn_prior_probs, B, max_k, active,
         )
 
-        return policies_np, root_graphs, root_seqs, nn_priors_list
+        return policies_np, root_graphs, root_seqs, nn_priors_list, legal_moves, legal_action_indices, num_legal_moves
 
     # ── Child state evaluation ────────────────────────────────────
 
@@ -431,8 +444,9 @@ class GumbelAlphaZeroOrchestrator:
         # Apply moves
         self.ext.apply_moves_batch(child_states, moves, total)
 
-        # Check for terminal states
-        results = self.ext.check_results_batch(child_states, total).cpu().numpy()
+        # Check for terminal states (keep on GPU for vectorised override below)
+        results_t = self.ext.check_results_batch(child_states, total)
+        results = results_t.cpu().numpy()  # still needed by _probe_child_replies
 
         # Encode child states and run NN
         encoded = self.encoder.encode_batch(child_states, total)
@@ -445,26 +459,21 @@ class GumbelAlphaZeroOrchestrator:
 
         child_values = child_values.squeeze(-1)  # [total]
 
-        # For terminal states, use the game result instead of NN value
+        # Vectorised terminal override — no Python loop over results.
         # Results: 0=in_progress, 1=white_wins, 2=black_wins, 3=draw
-        for k in range(total):
-            r = results[k]
-            if r == 0:
-                continue
-            elif r == 3:
-                child_values[k] = 0.0
-            else:
-                # Terminal value from child's perspective:
-                # The child state is after root player moved.
-                # We need to read whose turn it is in the child state.
-                # Simpler: r==1 means white won, r==2 means black won.
-                # The root player just moved, so if it's now opponent's turn,
-                # result favoring root player → child_value = -1 (bad for child).
-                gi = int(gi_t[k].item())
-                root_turn_byte = root_states[gi, self._OFF_TURN].item()
-                root_is_white = (root_turn_byte % 2 == 0)
-                root_won = (r == 1 and root_is_white) or (r == 2 and not root_is_white)
-                child_values[k] = -1.0 if root_won else 1.0
+        root_turn_bytes = root_states[gi_t, self._OFF_TURN]  # [total]
+        root_is_white = (root_turn_bytes % 2 == 0)
+        root_won = ((results_t == 1) & root_is_white) | ((results_t == 2) & ~root_is_white)
+        is_terminal = results_t != 0
+        is_draw = results_t == 3
+        terminal_values = torch.where(
+            is_draw,
+            torch.zeros_like(child_values),
+            torch.where(root_won,
+                        torch.full_like(child_values, -1.0),
+                        torch.full_like(child_values,  1.0)),
+        )
+        child_values = torch.where(is_terminal, terminal_values, child_values)
 
         # Negate: Q(a) from root's perspective = -V(child)
         neg_child_values = -child_values
@@ -523,28 +532,25 @@ class GumbelAlphaZeroOrchestrator:
         child_policy_logits[~legal_mask] = float("-inf")
         child_policy = torch.softmax(child_policy_logits, dim=-1)
 
-        num_legal_cpu = num_legal.cpu()
-        root_game_indices_cpu = root_game_indices.cpu()
-        reply_parent: list[int] = []
-        reply_move_indices: list[int] = []
         move_scores = self._gather_legal_action_scores(child_policy, legal_action_indices)
-        ranked_moves = torch.argsort(move_scores, dim=1, descending=True)
+        best_move_idx = move_scores.argmax(dim=1)  # [total] — top-1 reply per parent
 
-        for parent_idx in range(total):
-            if child_results[parent_idx] != 0:
-                continue
-            root_game_idx = int(root_game_indices_cpu[parent_idx].item())
-            reply_budget = max(0, int(visits_per_action[root_game_idx].item()) - 1)
-            nl = int(num_legal_cpu[parent_idx].item())
-            if reply_budget <= 0 or nl == 0:
-                continue
-            keep = min(reply_budget, nl)
-            for k in range(keep):
-                move_idx = int(ranked_moves[parent_idx, k].item())
-                if move_idx >= nl or move_scores[parent_idx, move_idx].item() == float("-inf"):
-                    break
-                reply_parent.append(parent_idx)
-                reply_move_indices.append(move_idx)
+        # Vectorised eligibility: non-terminal, has reply budget, has legal moves,
+        # and the best move has a finite score (i.e. is actually legal).
+        child_results_t = torch.from_numpy(child_results).to("cuda")
+        reply_budgets = (visits_per_action[root_game_indices] - 1).clamp(min=0)
+        best_scores = move_scores.gather(1, best_move_idx.unsqueeze(1)).squeeze(1)
+        eligible = (
+            (child_results_t == 0) &
+            (reply_budgets > 0) &
+            (num_legal > 0) &
+            best_scores.isfinite()
+        )
+
+        reply_parent_t = eligible.nonzero(as_tuple=True)[0]   # [n_replies]
+        reply_move_t = best_move_idx[reply_parent_t]           # [n_replies]
+        reply_parent = reply_parent_t.cpu().tolist()
+        reply_move_indices = reply_move_t.cpu().tolist()
 
         if not reply_parent:
             return root_values
@@ -569,30 +575,28 @@ class GumbelAlphaZeroOrchestrator:
         grandchild_values = grandchild_values.squeeze(-1)
 
         # After the opponent reply, it is the root player's turn again.
-        for k in range(reply_total):
-            r = grandchild_results[k]
-            if r == 0:
-                continue
-            elif r == 3:
-                grandchild_values[k] = 0.0
-            else:
-                root_turn_byte = child_states[
-                    reply_parent[k], self._OFF_TURN
-                ].item()
-                root_is_white = (root_turn_byte % 2 == 1)
-                root_won = (r == 1 and root_is_white) or (r == 2 and not root_is_white)
-                grandchild_values[k] = 1.0 if root_won else -1.0
+        # Vectorised terminal override for grandchild states.
+        gc_results_t = torch.from_numpy(grandchild_results).to("cuda")
+        parent_idx_for_turn = torch.tensor(reply_parent, dtype=torch.int64, device="cuda")
+        gc_root_turn_bytes = child_states[parent_idx_for_turn, self._OFF_TURN]
+        gc_root_is_white = (gc_root_turn_bytes % 2 == 1)
+        gc_root_won = (
+            ((gc_results_t == 1) & gc_root_is_white) |
+            ((gc_results_t == 2) & ~gc_root_is_white)
+        )
+        gc_is_terminal = gc_results_t != 0
+        gc_is_draw = gc_results_t == 3
+        gc_terminal = torch.where(
+            gc_is_draw,
+            torch.zeros_like(grandchild_values),
+            torch.where(gc_root_won,
+                        torch.full_like(grandchild_values, 1.0),
+                        torch.full_like(grandchild_values, -1.0)),
+        )
+        grandchild_values = torch.where(gc_is_terminal, gc_terminal, grandchild_values)
 
-        # Opponent selects the reply that is worst for the root player.
-        for parent_idx in set(reply_parent):
-            vals = grandchild_values[
-                torch.tensor(
-                    [i for i, p in enumerate(reply_parent) if p == parent_idx],
-                    dtype=torch.int64,
-                    device=grandchild_values.device,
-                )
-            ]
-            root_values[parent_idx] = torch.min(vals)
+        # Each parent has exactly one reply (top-1), so scatter directly.
+        root_values[parent_idx_for_turn] = grandchild_values
 
         return root_values
 
