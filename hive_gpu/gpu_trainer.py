@@ -70,7 +70,7 @@ class GPUTrainConfig:
     dirichlet_epsilon: float = 0.25
 
     # Training
-    batch_size: int = 256
+    batch_size: int = 256  # bumped from 64 — better GPU utilisation on 24 GB+
     num_epochs: int = 2
     learning_rate: float = 2e-4
     weight_decay: float = 1e-4

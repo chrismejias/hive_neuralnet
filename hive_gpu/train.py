@@ -78,7 +78,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Training epochs per iteration.",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=64,
+        "--batch-size", type=int, default=256,
         help="Training batch size.",
     )
     parser.add_argument(

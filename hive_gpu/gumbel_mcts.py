@@ -479,14 +479,34 @@ class GumbelAlphaZeroOrchestrator:
         neg_child_values = -child_values
 
         # Spend extra budget on likely replies from the child state.
+        # Pre-compute child legal info and reuse child_logits already in hand so
+        # that _probe_child_replies does not need to re-encode / re-run the NN on
+        # the same child states a second time.
         max_reply_budget = int(visits_per_action.max().item()) if total > 0 else 0
         if max_reply_budget > 1:
+            child_legal_moves, child_num_legal = self.ext.generate_legal_moves_batch(
+                child_states, total
+            )
+            child_legal_mask_int, _ = self.ext.generate_legal_mask_batch(child_states, total)
+            child_legal_mask = child_legal_mask_int.bool()
+            child_legal_action_indices = self.ext.legal_moves_to_actions_batch(
+                child_states, child_legal_moves, child_num_legal, total,
+            )
+            # Apply legal mask to the logits we already have; clone to avoid
+            # mutating the tensor that may be used elsewhere.
+            masked_child_logits = child_logits.clone()
+            masked_child_logits[~child_legal_mask] = float("-inf")
+
             child_reply_values = self._probe_child_replies(
                 child_states,
                 neg_child_values,
                 results,
                 gi_t,
                 visits_per_action,
+                child_legal_moves=child_legal_moves,
+                child_num_legal=child_num_legal,
+                child_legal_action_indices=child_legal_action_indices,
+                child_policy_logits=masked_child_logits,
             )
         else:
             child_reply_values = neg_child_values
@@ -504,32 +524,52 @@ class GumbelAlphaZeroOrchestrator:
         child_results: np.ndarray,
         root_game_indices: torch.Tensor,
         visits_per_action: torch.Tensor,
+        child_legal_moves: "torch.Tensor | None" = None,
+        child_num_legal: "torch.Tensor | None" = None,
+        child_legal_action_indices: "torch.Tensor | None" = None,
+        child_policy_logits: "torch.Tensor | None" = None,
     ) -> torch.Tensor:
         """Probe likely replies from each non-terminal child state.
 
         Returns a root-perspective value per child candidate. Terminal children
         or children with no extra budget keep their default one-ply estimate.
+
+        When pre-computed child legal info and policy logits are supplied by
+        _evaluate_candidates, this method skips re-encoding and re-running the
+        NN on child states (they were just evaluated one call earlier).
         """
         total = child_states.shape[0]
         root_values = default_root_values.clone()
         if total == 0:
             return root_values
 
-        legal_moves, num_legal = self.ext.generate_legal_moves_batch(child_states, total)
-        legal_mask_int, _ = self.ext.generate_legal_mask_batch(child_states, total)
-        legal_mask = legal_mask_int.bool()
-        legal_action_indices = self.ext.legal_moves_to_actions_batch(
-            child_states, legal_moves, num_legal, total,
-        )
+        if child_legal_moves is None:
+            child_legal_moves, child_num_legal = self.ext.generate_legal_moves_batch(
+                child_states, total
+            )
+        if child_legal_action_indices is None:
+            child_legal_mask_int, _ = self.ext.generate_legal_mask_batch(child_states, total)
+            child_legal_mask = child_legal_mask_int.bool()
+            child_legal_action_indices = self.ext.legal_moves_to_actions_batch(
+                child_states, child_legal_moves, child_num_legal, total,
+            )
 
-        encoded = self.encoder.encode_batch(child_states, total)
-        with torch.no_grad():
-            cfg = self.config
-            if cfg.nn_max_batch > 0 and total > cfg.nn_max_batch:
-                child_policy_logits, _ = self._nn_forward_subbatched(encoded, total)
-            else:
-                child_policy_logits, _, *_ = self.net(encoded)
-        child_policy_logits[~legal_mask] = float("-inf")
+        if child_policy_logits is None:
+            child_legal_mask_int, _ = self.ext.generate_legal_mask_batch(child_states, total)
+            child_legal_mask = child_legal_mask_int.bool()
+            encoded = self.encoder.encode_batch(child_states, total)
+            with torch.no_grad():
+                cfg = self.config
+                if cfg.nn_max_batch > 0 and total > cfg.nn_max_batch:
+                    child_policy_logits, _ = self._nn_forward_subbatched(encoded, total)
+                else:
+                    child_policy_logits, _, *_ = self.net(encoded)
+            child_policy_logits[~child_legal_mask] = float("-inf")
+
+        # child_policy_logits is already masked (either passed in or computed above)
+        legal_moves = child_legal_moves
+        num_legal = child_num_legal
+        legal_action_indices = child_legal_action_indices
         child_policy = torch.softmax(child_policy_logits, dim=-1)
 
         move_scores = self._gather_legal_action_scores(child_policy, legal_action_indices)
