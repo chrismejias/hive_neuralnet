@@ -85,6 +85,7 @@ class GPUTrainConfig:
 
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
+    checkpoint_keep_every: int = 0  # 0 = keep all; N = keep only multiples of N
 
     # LR scheduling
     lr_schedule: str = "cosine"
@@ -817,7 +818,12 @@ class GPUTrainer:
     # ── Checkpointing ─────────────────────────────────────────────────
 
     def _save_checkpoint(self, net: torch.nn.Module, iteration: int) -> str:
-        """Save a training checkpoint."""
+        """Save a training checkpoint, then prune non-milestone checkpoints.
+
+        Keeps every checkpoint whose iteration number is a multiple of
+        ``checkpoint_keep_every`` (default 25).  All others are deleted
+        after the new checkpoint is safely written.
+        """
         path = os.path.join(
             self.config.checkpoint_dir,
             f"hive_gpu_checkpoint_{iteration:04d}.pt",
@@ -831,6 +837,22 @@ class GPUTrainer:
             },
             path,
         )
+
+        keep_every = self.config.checkpoint_keep_every
+        if keep_every > 0:
+            import glob
+            pattern = os.path.join(
+                self.config.checkpoint_dir, "hive_gpu_checkpoint_*.pt"
+            )
+            for ckpt in glob.glob(pattern):
+                fname = os.path.basename(ckpt)
+                try:
+                    ckpt_iter = int(fname.split("_")[-1].split(".")[0])
+                except ValueError:
+                    continue
+                if ckpt_iter % keep_every != 0:
+                    os.remove(ckpt)
+
         return path
 
     @classmethod

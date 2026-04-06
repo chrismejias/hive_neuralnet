@@ -329,6 +329,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Directory for checkpoints.",
     )
     parser.add_argument(
+        "--checkpoint-keep-every", type=int, default=0,
+        help="Keep only checkpoints whose iteration is a multiple of this value; "
+             "all others are deleted after saving. 0 = keep all.",
+    )
+    parser.add_argument(
         "--resume", type=str, default=None,
         help="Resume from checkpoint file.",
     )
@@ -373,6 +378,7 @@ def _build_train_config(args: argparse.Namespace) -> GPUTrainConfig:
         device=args.device,
         use_amp=False if args.no_amp else None,
         checkpoint_dir=args.checkpoint_dir,
+        checkpoint_keep_every=args.checkpoint_keep_every,
         skip_arena=args.skip_arena,
         playout_cap_randomize=args.playout_cap_randomize,
         playout_cap_randomize_prob=args.playout_cap_prob,
@@ -488,7 +494,8 @@ def main(argv: list[str] | None = None) -> None:
     else:
         search_str = 'MCTS (tree)'
     print(f"  Search:       {search_str}")
-    print(f"  Checkpoints:  {cfg.checkpoint_dir}")
+    keep_str = f"every {cfg.checkpoint_keep_every}" if cfg.checkpoint_keep_every > 0 else "all"
+    print(f"  Checkpoints:  {cfg.checkpoint_dir}  (keep: {keep_str})")
     if cfg.expansion_mask < 0:
         exp_str = "rotating per iteration (mask = (iter-1) % 8, cycles through all 8 subsets)"
     elif cfg.expansion_mask == 0:
