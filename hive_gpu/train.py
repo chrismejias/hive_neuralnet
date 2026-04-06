@@ -123,15 +123,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--c-puct", type=float, default=1.5,
-        help="PUCT exploration constant.",
+        help="PUCT exploration constant (--no-gumbel / MCTS only).",
     )
     parser.add_argument(
         "--dirichlet-alpha", type=float, default=0.3,
-        help="Dirichlet noise alpha for root exploration.",
+        help="Dirichlet noise alpha for root exploration (--no-gumbel / MCTS only; "
+             "Gumbel uses Gumbel noise instead).",
     )
     parser.add_argument(
         "--dirichlet-epsilon", type=float, default=0.25,
-        help="Dirichlet noise weight at root.",
+        help="Dirichlet noise weight at root (--no-gumbel / MCTS only).",
     )
     parser.add_argument(
         "--max-game-length", type=int, default=300,
@@ -139,7 +140,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--wave-size", type=int, default=8,
-        help="Parallel MCTS sims per wave (1 = sequential).",
+        help="Parallel MCTS sims per wave (--no-gumbel / MCTS only).",
     )
     parser.add_argument(
         "--nn-max-batch", type=int, default=0,
@@ -165,19 +166,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.set_defaults(skip_arena=True)
 
-    # Playout cap randomization (KataGo-style) — disabled by default
+    # Playout cap randomization (KataGo-style) — disabled by default; MCTS only
     parser.add_argument(
         "--playout-cap-randomize", action="store_true", dest="playout_cap_randomize",
-        help="Enable playout cap randomization (default: disabled).",
+        help="Enable playout cap randomization (--no-gumbel / MCTS only; default: disabled).",
     )
     parser.set_defaults(playout_cap_randomize=False)
     parser.add_argument(
         "--playout-cap-prob", type=float, default=0.25,
-        help="Probability of using full simulations per move (rest use fast sims).",
+        help="Probability of using full simulations per move (rest use fast sims). MCTS only.",
     )
     parser.add_argument(
         "--playout-cap-fast-sims", type=int, default=0,
-        help="Number of fast sims (0 = auto: simulations // 8).",
+        help="Number of fast sims (0 = auto: simulations // 8). MCTS only.",
     )
 
     # Policy softening (KataGo-style) — 0.03 by default
@@ -186,22 +187,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Mix policy targets toward uniform over legal moves (0=off, 0.03 default).",
     )
 
-    # Policy target pruning — zero out low-visit children
+    # Policy target pruning — zero out low-visit children (MCTS only)
+    # With Gumbel, the improved policy is the Q-transform output over max_k candidates;
+    # its support is already sparse and meaningful — pruning destroys that structure.
     parser.add_argument(
-        "--policy-target-pruning", type=float, default=0.02,
-        help="Zero out policy targets below this fraction of max visits (0=off).",
+        "--policy-target-pruning", type=float, default=0.0,
+        help="Zero out policy targets below this fraction of max visits (0=off). "
+             "Only meaningful with MCTS (--no-gumbel). Default: 0 (off).",
     )
 
-    # Root policy temperature — soften NN prior before Dirichlet noise
+    # Root policy temperature — soften NN prior before Dirichlet noise (MCTS only)
     parser.add_argument(
         "--root-policy-temp", type=float, default=1.1,
-        help="Temperature for root NN prior (>1 = softer, 1 = off).",
+        help="Temperature for root NN prior before Dirichlet noise (>1 = softer, 1 = off). "
+             "--no-gumbel / MCTS only.",
     )
 
-    # Shaped Dirichlet noise — scale alpha inversely with legal move count
+    # Shaped Dirichlet noise — scale alpha inversely with legal move count (MCTS only)
     parser.add_argument(
         "--no-shaped-dirichlet", action="store_false", dest="shaped_dirichlet",
-        help="Disable shaped Dirichlet noise (default: enabled, alpha=10/N_legal).",
+        help="Disable shaped Dirichlet noise (default: enabled, alpha=10/N_legal). "
+             "--no-gumbel / MCTS only.",
     )
     parser.set_defaults(shaped_dirichlet=True)
 
@@ -211,12 +217,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Scale for KL-based surprise weighting in replay buffer (0=off).",
     )
 
-    # Value head uncertainty — enabled by default
+    # Value head uncertainty — disabled by default (Gumbel value targets are 1-ply NN
+    # evals, not noisy rollouts, so Gaussian NLL adds a free variance term with no benefit)
     parser.add_argument(
-        "--no-predict-uncertainty", action="store_false", dest="predict_uncertainty",
-        help="Disable value head uncertainty prediction (default: enabled).",
+        "--predict-uncertainty", action="store_true", dest="predict_uncertainty",
+        help="Enable value head uncertainty prediction (Gaussian NLL instead of MSE). "
+             "Only useful with MCTS where value targets come from noisy rollouts. "
+             "Default: disabled.",
     )
-    parser.set_defaults(predict_uncertainty=True)
+    parser.set_defaults(predict_uncertainty=False)
 
     # MCGS (Monte Carlo Graph Search) — opt-in, off by default
     parser.add_argument(

@@ -466,7 +466,6 @@ class GPUTrainer:
                     encoder_type=cfg.encoder_type,
                     expansion_mask=mask,
                     nn_max_batch=cfg.nn_max_batch,
-                    policy_target_pruning=cfg.policy_target_pruning,
                     queen_pressure_scale=cfg.queen_pressure_scale,
                 )
                 orchestrator = GumbelAlphaZeroOrchestrator(self.best_net, gumbel_config)

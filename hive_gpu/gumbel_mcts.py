@@ -67,9 +67,6 @@ class GumbelConfig:
     # NN batching
     nn_max_batch: int = 0  # 0 = no limit
 
-    # Policy target pruning
-    policy_target_pruning: float = 0.02
-
     # Queen pressure value shaping for draws
     queen_pressure_scale: float = 0.4
 
@@ -738,14 +735,6 @@ class GumbelAlphaZeroOrchestrator:
         # scatter_, legal_mask broadcast, and large softmax that dominated runtime.
         # Padding slots (topk_logits = -inf) get 0 probability automatically.
         improved_probs = torch.softmax(improved_topk, dim=-1)  # [B, max_k]
-
-        # Apply policy target pruning in [B, max_k] space
-        if cfg.policy_target_pruning > 0:
-            max_prob = improved_probs.max(dim=1, keepdim=True).values
-            threshold = cfg.policy_target_pruning * max_prob
-            improved_probs = improved_probs * (improved_probs >= threshold)
-            sums = improved_probs.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            improved_probs = improved_probs / sums
 
         # Gather nn_prior at topk positions only — [B, max_k] transfer vs [B, A]
         nn_prior_topk = nn_prior_probs.gather(1, topk_actions)  # [B, max_k]
