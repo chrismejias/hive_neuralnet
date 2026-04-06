@@ -380,14 +380,14 @@ class GPUTransformerEncoder:
 
     def encode_batch_with_graphs_and_seqs(
         self, states_tensor: torch.Tensor, batch_size: int
-    ) -> tuple[HiveTokenBatch, list[HiveGraph], list[HiveTokenSequence]]:
-        """Encode once, return HiveTokenBatch, list[HiveGraph], and list[HiveTokenSequence].
+    ) -> tuple[HiveTokenBatch, list[None], list[HiveTokenSequence]]:
+        """Encode once, return HiveTokenBatch, graphs=None list, and list[HiveTokenSequence].
 
-        Single kernel call for all three representations needed by the transformer
-        training pipeline.
+        Graphs are GNN-only; transformer training uses sequences exclusively.
+        Skipping _assemble_graphs avoids 8 GPU->CPU syncs and a Python loop
+        over the batch on every root evaluation.
         """
         raw = self._raw_encode(states_tensor, batch_size)
         token_batch = self._assemble_token_batch(raw, batch_size)
-        graphs = self._gnn_encoder._assemble_graphs(raw, batch_size)
         sequences = self._unbatch_to_sequences(raw, batch_size)
-        return token_batch, graphs, sequences
+        return token_batch, [None] * batch_size, sequences
