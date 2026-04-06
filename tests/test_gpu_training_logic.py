@@ -46,10 +46,12 @@ def test_gumbel_improved_policy_stays_on_considered_actions():
         active=[True],
     )
 
-    policy = policies[0]
-    assert policy[1] == 0.0
-    assert policy[3] == 0.0
-    assert abs(policy.sum() - 1.0) < 1e-6
+    # policies[0] is now (action_indices [max_k], probs [max_k]) — sparse format.
+    act_indices, probs = policies[0]
+    # topk_actions were [0, 2], so only those two actions can have non-zero prob.
+    assert 1 not in act_indices
+    assert 3 not in act_indices
+    assert abs(probs.sum() - 1.0) < 1e-6
 
 
 def test_gumbel_matches_candidate_actions_to_legal_move_indices():

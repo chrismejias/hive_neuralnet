@@ -125,17 +125,25 @@ class GumbelAlphaZeroOrchestrator:
             current_turns = self._get_turns(states, B)
 
             # ── Gumbel search for all active games ──
+            # policies: list of (action_indices [max_k], probs [max_k]) sparse tuples
+            # nn_priors: list of (action_indices [max_k], nn_prior_vals [max_k]) or None
             policies, graphs, seqs, nn_priors, root_legal_moves, root_legal_action_indices, root_num_legal = self._gumbel_search(
                 states, B, active, move_numbers,
             )
 
-            # Compute per-piece mobility for history
+            # Compute per-piece mobility for history.
+            # Start a non-blocking transfer so the DMA can run while
+            # _check_immediate_wins dispatches its GPU kernels.
             mob_tensor, mob_counts = self.ext.compute_mobility_batch(states, B, False)
-            mob_np = mob_tensor.cpu().numpy()
-            mob_board_counts = mob_counts.cpu().numpy()
+            mob_cpu        = mob_tensor.to("cpu", non_blocking=True)
+            mob_counts_cpu = mob_counts.to("cpu", non_blocking=True)
 
-            # Override policies for immediate wins
-            self._check_immediate_wins(states, B, active, current_turns, policies)
+            # Override policies for immediate wins — returns {game_idx: win_action}
+            win_overrides = self._check_immediate_wins(states, B, active, current_turns)
+
+            # mob transfers are complete by now (GPU kernels above forced sync).
+            mob_np          = mob_cpu.numpy()
+            mob_board_counts = mob_counts_cpu.numpy()
 
             # Record history and select actions
             # selected_actions[i] = chosen action index; -1 for inactive games.
@@ -145,31 +153,38 @@ class GumbelAlphaZeroOrchestrator:
                 if not active[i]:
                     continue
 
-                policy = policies[i]
+                act_indices, probs = policies[i]   # [max_k] each (numpy)
                 turn = current_turns[i]
 
                 mob_i = mob_np[i, :mob_board_counts[i]].copy()
                 histories[i].append(
-                    (graphs[i], policy.copy(), turn, mob_i, seqs[i], nn_priors[i])
+                    (graphs[i], (act_indices, probs), turn, mob_i, seqs[i], nn_priors[i])
                 )
 
-                # Action selection: greedy after temp_drop, else sample
-                if move_numbers[i] >= cfg.temperature_drop_move:
-                    action = int(np.argmax(policy))
-                else:
-                    psum = policy.sum()
-                    if psum > 0 and np.isfinite(psum):
-                        p = policy / psum
-                    else:
-                        mask = policy > 0
-                        p = np.zeros_like(policy)
-                        if mask.any():
-                            p[mask] = 1.0 / mask.sum()
-                        else:
-                            p[:] = 1.0 / len(p)
-                    action = int(np.random.choice(len(p), p=p))
+                # Apply win override: force action and store one-hot sparse policy
+                if i in win_overrides:
+                    action = win_overrides[i]
+                    # Replace history tail with one-hot sparse policy
+                    histories[i][-1] = (
+                        graphs[i],
+                        (np.array([action], dtype=act_indices.dtype),
+                         np.array([1.0], dtype=probs.dtype)),
+                        turn, mob_i, seqs[i], nn_priors[i],
+                    )
+                    selected_actions[i] = action
+                    continue
 
-                selected_actions[i] = action
+                # Action selection: greedy after temp_drop, else sample from sparse dist
+                if move_numbers[i] >= cfg.temperature_drop_move:
+                    selected_actions[i] = int(act_indices[int(np.argmax(probs))])
+                else:
+                    psum = probs.sum()
+                    if psum > 0 and np.isfinite(psum):
+                        p = probs / psum
+                    else:
+                        p = np.ones(len(probs), dtype=np.float32) / len(probs)
+                    local_idx = int(np.random.choice(len(p), p=p))
+                    selected_actions[i] = int(act_indices[local_idx])
 
             # Vectorised move lookup — one gather replaces B per-game kernel launches.
             actions_t = torch.from_numpy(selected_actions).to(device="cuda").unsqueeze(1)  # [B, 1]
@@ -181,11 +196,9 @@ class GumbelAlphaZeroOrchestrator:
             batch_idx = torch.arange(B, device="cuda")
             move_bytes_t = root_legal_moves[batch_idx, safe_idx]  # [B, move_size]
             move_bytes_t[~has_match] = 0
-            action_move_bytes = move_bytes_t.cpu().numpy()
 
-            # Apply moves
-            moves_t = torch.from_numpy(action_move_bytes).cuda()
-            self.ext.apply_moves_batch(states, moves_t, B)
+            # Apply moves directly from the GPU tensor — no CPU roundtrip needed.
+            self.ext.apply_moves_batch(states, move_bytes_t, B)
 
             for i in range(B):
                 if active[i]:
@@ -683,14 +696,18 @@ class GumbelAlphaZeroOrchestrator:
         topk_actions: torch.Tensor,    # [B, max_k]
         q_sums: torch.Tensor,         # [B, max_k]
         visit_counts: torch.Tensor,   # [B, max_k]
-        legal_mask: torch.Tensor,     # [B, A] bool
+        legal_mask: torch.Tensor,     # [B, A] bool  (unused now, kept for API compat)
         root_values: torch.Tensor,    # [B]
         nn_prior_probs: torch.Tensor, # [B, A]
         B: int,
         max_k: int,
         active: list[bool],
-    ) -> tuple[list[np.ndarray], list[np.ndarray | None]]:
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[tuple[np.ndarray, np.ndarray] | None]]:
         """Compute improved policy targets from completed Q-values.
+
+        Works entirely in [B, max_k] space — no [B, A] allocations.
+        Returns sparse (action_indices, probs) pairs instead of dense arrays;
+        _build_examples scatters them into full [A] vectors when needed.
 
         pi_improved(a) = softmax(logit(a) + qtransform(Q_completed(a)))
 
@@ -698,7 +715,6 @@ class GumbelAlphaZeroOrchestrator:
         (the root value from the opponent's perspective = default expectation).
         """
         cfg = self.config
-        A = self._action_space_size
 
         # Compute Q-mean for visited candidates
         q_mean = torch.where(
@@ -709,42 +725,44 @@ class GumbelAlphaZeroOrchestrator:
 
         max_n = visit_counts.max(dim=1, keepdim=True).values.float().clamp(min=1)
 
-        # Restrict policy improvement to the searched candidate set rather than
-        # leaking probability mass back onto the full legal action space.
-        improved_logits = torch.full_like(logits, float("-inf"))
         topk_q = torch.where(
             visit_counts > 0,
             q_mean,
             (-root_values).unsqueeze(1).expand_as(q_mean),
         )
-        topk_logits = logits.gather(1, topk_actions)
+        topk_logits = logits.gather(1, topk_actions)          # [B, max_k]
         topk_qtransform = (cfg.c_visit + max_n) * cfg.c_scale * topk_q
-        improved_topk = topk_logits + topk_qtransform
-        improved_logits.scatter_(1, topk_actions, improved_topk)
-        improved_logits[~legal_mask] = float("-inf")
+        improved_topk = topk_logits + topk_qtransform         # [B, max_k]
 
-        # Softmax → improved policy
-        improved_policy = torch.softmax(improved_logits, dim=-1)  # [B, A]
+        # Softmax over max_k candidates only — avoids the [B, A] allocation,
+        # scatter_, legal_mask broadcast, and large softmax that dominated runtime.
+        # Padding slots (topk_logits = -inf) get 0 probability automatically.
+        improved_probs = torch.softmax(improved_topk, dim=-1)  # [B, max_k]
 
-        # Apply policy target pruning
+        # Apply policy target pruning in [B, max_k] space
         if cfg.policy_target_pruning > 0:
-            max_prob = improved_policy.max(dim=1, keepdim=True).values
+            max_prob = improved_probs.max(dim=1, keepdim=True).values
             threshold = cfg.policy_target_pruning * max_prob
-            improved_policy[improved_policy < threshold] = 0.0
-            # Renormalize
-            sums = improved_policy.sum(dim=1, keepdim=True).clamp(min=1e-8)
-            improved_policy = improved_policy / sums
+            improved_probs = improved_probs * (improved_probs >= threshold)
+            sums = improved_probs.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            improved_probs = improved_probs / sums
 
-        # Convert to numpy
-        improved_np = improved_policy.cpu().numpy()
-        nn_prior_np = nn_prior_probs.cpu().numpy()
+        # Gather nn_prior at topk positions only — [B, max_k] transfer vs [B, A]
+        nn_prior_topk = nn_prior_probs.gather(1, topk_actions)  # [B, max_k]
 
-        policies = []
-        nn_priors = []
+        # Single small transfer: [B, max_k] × 3 tensors  (vs [B, A] × 2 before)
+        actions_np    = topk_actions.cpu().numpy()    # [B, max_k] int64
+        probs_np      = improved_probs.cpu().numpy()  # [B, max_k] float32
+        nn_prior_np   = nn_prior_topk.cpu().numpy()   # [B, max_k] float32
+
+        policies: list[tuple[np.ndarray, np.ndarray]] = []
+        nn_priors: list[tuple[np.ndarray, np.ndarray] | None] = []
         for i in range(B):
-            policies.append(improved_np[i].copy())
+            act_i = actions_np[i]   # [max_k] — action indices
+            prob_i = probs_np[i]    # [max_k] — probabilities
+            policies.append((act_i, prob_i))
             if active[i]:
-                nn_priors.append(nn_prior_np[i].copy())
+                nn_priors.append((act_i, nn_prior_np[i]))
             else:
                 nn_priors.append(None)
 
@@ -758,12 +776,12 @@ class GumbelAlphaZeroOrchestrator:
         B: int,
         active: list[bool],
         current_turns: list[int],
-        policies: list[np.ndarray],
-    ) -> None:
-        """Override policies with probability 1 for any immediate win.
+    ) -> dict[int, int]:
+        """Find any immediate wins and return {game_idx: win_action_index}.
 
         Fully batched: one apply_moves_batch + one check_results_batch across
         all games, replacing the previous per-game kernel dispatch loop.
+        Callers apply the override to whichever policy representation they use.
         """
         legal_moves, num_legal = self.ext.generate_legal_moves_batch(root_states, B)
         legal_action_indices = self.ext.legal_moves_to_actions_batch(
@@ -774,11 +792,9 @@ class GumbelAlphaZeroOrchestrator:
         # Build flat index tensors across all active games in one pass
         gi_flat: list[int] = []
         mi_flat: list[int] = []
-        game_offsets: list[int] = []   # start index in flat array for each game
         game_nlegal: list[int] = []    # number of moves per game (0 if inactive)
 
         for i in range(B):
-            game_offsets.append(len(gi_flat))
             nl = int(nlegal_np[i]) if active[i] else 0
             game_nlegal.append(nl)
             for m in range(nl):
@@ -787,7 +803,7 @@ class GumbelAlphaZeroOrchestrator:
 
         total = len(gi_flat)
         if total == 0:
-            return
+            return {}
 
         gi_t = torch.tensor(gi_flat, dtype=torch.int64, device="cuda")
         mi_t = torch.tensor(mi_flat, dtype=torch.int64, device="cuda")
@@ -799,21 +815,19 @@ class GumbelAlphaZeroOrchestrator:
         results_np = self.ext.check_results_batch(test_states, total).cpu().numpy()
 
         # Scatter-reduce: find first winning move per game
+        win_overrides: dict[int, int] = {}
         flat_idx = 0
         for i in range(B):
             nl = game_nlegal[i]
-            if nl == 0:
-                flat_idx += nl
-                continue
-            win_result = 1 if (current_turns[i] % 2 == 0) else 2
-            for mi in range(nl):
-                if results_np[flat_idx + mi] == win_result:
-                    action = int(legal_action_indices[i, mi].item())
-                    if 0 <= action < len(policies[i]):
-                        policies[i][:] = 0.0
-                        policies[i][action] = 1.0
-                    break
+            if nl > 0:
+                win_result = 1 if (current_turns[i] % 2 == 0) else 2
+                for mi in range(nl):
+                    if results_np[flat_idx + mi] == win_result:
+                        win_overrides[i] = int(legal_action_indices[i, mi].item())
+                        break
             flat_idx += nl
+
+        return win_overrides
 
     # ── Action → move bytes lookup ────────────────────────────────
 
@@ -932,6 +946,7 @@ class GumbelAlphaZeroOrchestrator:
         final_qs_data: list[tuple[np.ndarray, np.ndarray]],
     ) -> list[list[GPUTrainingExample]]:
         qp_scale = self.config.queen_pressure_scale
+        A = self._action_space_size
         all_examples = []
         for i, history in enumerate(histories):
             result = int(final_results[i])
@@ -945,7 +960,7 @@ class GumbelAlphaZeroOrchestrator:
                 black_q_surrounded = float(qs_target_final[:, 1].sum()) if qs_mask_final[1] > 0 else 0.0
                 draw_value_white = qp_scale * (black_q_surrounded - white_q_surrounded) / 6.0
 
-            for step_idx, (graph, policy, turn, mobility, seq, nn_prior) in enumerate(history):
+            for step_idx, (graph, policy_sparse, turn, mobility, seq, nn_prior_sparse) in enumerate(history):
                 if result == 0 or result == 3:
                     if draw_value_white != 0.0:
                         player_is_white = (turn % 2 == 0)
@@ -977,6 +992,22 @@ class GumbelAlphaZeroOrchestrator:
                     fm = np.zeros(n, dtype=np.float32)
                     qs_target = np.zeros((n, 2), dtype=np.float32)
                     qs_mask = np.zeros(2, dtype=np.float32)
+
+                # Reconstruct dense [A] policy from sparse (action_indices, probs).
+                # Only the max_k (≤16) non-zero entries need scattering.
+                pol_actions, pol_probs = policy_sparse
+                policy = np.zeros(A, dtype=np.float32)
+                policy[pol_actions] = pol_probs
+
+                # Reconstruct sparse nn_prior into full [A] vector.
+                # _compute_surprise_weight only reads positions where policy > 0,
+                # which are exactly pol_actions — so only those slots need values.
+                nn_prior: np.ndarray | None = None
+                if nn_prior_sparse is not None:
+                    nn_prior_actions, nn_prior_vals = nn_prior_sparse
+                    nn_prior = np.zeros(A, dtype=np.float32)
+                    nn_prior[nn_prior_actions] = nn_prior_vals
+
                 examples.append(GPUTrainingExample(
                     graph=graph,
                     policy_target=policy,
