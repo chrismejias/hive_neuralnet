@@ -54,8 +54,8 @@ class HiveEncoder:
 
     # ── Board Grid Constants ────────────────────────────────────
 
-    BOARD_SIZE: int = 13
-    HALF_BOARD: int = 6  # BOARD_SIZE // 2
+    BOARD_SIZE: int = 17
+    HALF_BOARD: int = 8  # BOARD_SIZE // 2
 
     # ── Channel Layout ──────────────────────────────────────────
 

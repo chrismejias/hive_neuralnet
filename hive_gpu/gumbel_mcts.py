@@ -128,6 +128,12 @@ class GumbelAlphaZeroOrchestrator:
                 states, B, active, move_numbers,
             )
 
+            # Batch-transfer legal action indices to CPU once per step so we can
+            # mark all legal actions (not just Gumbel-visited ones) in the policy
+            # target.  This eliminates gradient flow to illegal actions in the loss.
+            root_legal_action_indices_cpu = root_legal_action_indices.cpu().numpy()
+            root_num_legal_cpu = root_num_legal.cpu().numpy()
+
             # Compute per-piece mobility for history.
             # Start a non-blocking transfer so the DMA can run while
             # _check_immediate_wins dispatches its GPU kernels.
@@ -153,9 +159,12 @@ class GumbelAlphaZeroOrchestrator:
                 act_indices, probs = policies[i]   # [max_k] each (numpy)
                 turn = current_turns[i]
 
+                n_legal = int(root_num_legal_cpu[i])
+                legal_acts_i = root_legal_action_indices_cpu[i, :n_legal].copy()
+
                 mob_i = mob_np[i, :mob_board_counts[i]].copy()
                 histories[i].append(
-                    (graphs[i], (act_indices, probs), turn, mob_i, seqs[i], nn_priors[i])
+                    (graphs[i], (act_indices, probs), turn, mob_i, seqs[i], nn_priors[i], legal_acts_i)
                 )
 
                 # Apply win override: force action and store one-hot sparse policy
@@ -166,7 +175,7 @@ class GumbelAlphaZeroOrchestrator:
                         graphs[i],
                         (np.array([action], dtype=act_indices.dtype),
                          np.array([1.0], dtype=probs.dtype)),
-                        turn, mob_i, seqs[i], nn_priors[i],
+                        turn, mob_i, seqs[i], nn_priors[i], legal_acts_i,
                     )
                     selected_actions[i] = action
                     continue
@@ -953,7 +962,7 @@ class GumbelAlphaZeroOrchestrator:
                 black_q_surrounded = float(qs_target_final[:, 1].sum()) if qs_mask_final[1] > 0 else 0.0
                 draw_value_white = qp_scale * (black_q_surrounded - white_q_surrounded) / 6.0
 
-            for step_idx, (graph, policy_sparse, turn, mobility, seq, nn_prior_sparse) in enumerate(history):
+            for step_idx, (graph, policy_sparse, turn, mobility, seq, nn_prior_sparse, legal_acts) in enumerate(history):
                 if result == 0 or result == 3:
                     if draw_value_white != 0.0:
                         player_is_white = (turn % 2 == 0)
@@ -991,6 +1000,13 @@ class GumbelAlphaZeroOrchestrator:
                 pol_actions, pol_probs = policy_sparse
                 policy = np.zeros(A, dtype=np.float32)
                 policy[pol_actions] = pol_probs
+                # Mark every legal action with a tiny epsilon so that
+                # target_policy > 0 correctly identifies the full legal set.
+                # The loss uses this to mask the softmax to legal actions only,
+                # eliminating gradient flow to illegal moves.
+                if legal_acts is not None and len(legal_acts) > 0:
+                    valid = legal_acts[legal_acts >= 0]
+                    policy[valid] = np.maximum(policy[valid], 1e-8)
 
                 # Reconstruct sparse nn_prior into full [A] vector.
                 # _compute_surprise_weight only reads positions where policy > 0,

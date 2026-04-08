@@ -47,13 +47,13 @@ class TransformerConfig:
     num_layers: int = 6
     dim_feedforward: int = 512
     dropout: float = 0.1
-    max_positions: int = 170        # 169 grid cells + 1 off-board
+    max_positions: int = HiveEncoder.BOARD_SIZE ** 2 + 1  # grid cells + 1 off-board
     num_token_types: int = 3        # CLS=0, board=1, hand=2
     token_feat_dim: int = TOKEN_FEAT_DIM   # 22
     global_feat_dim: int = GLOBAL_FEAT_DIM  # 6
     policy_conv_channels: int = 32
-    action_space_size: int = HiveEncoder.ACTION_SPACE_SIZE  # 29407
-    board_size: int = HiveEncoder.BOARD_SIZE                # 13
+    action_space_size: int = HiveEncoder.ACTION_SPACE_SIZE
+    board_size: int = HiveEncoder.BOARD_SIZE
 
     # Auxiliary heads
     aux_mobility_enabled: bool = False

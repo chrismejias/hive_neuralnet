@@ -22,8 +22,8 @@ constexpr int MAX_ENC_EDGES = 200;   // ~132 spatial + ~16 vertical max
 constexpr int NODE_FEAT_DIM = 25;
 constexpr int EDGE_FEAT_DIM = 9;
 constexpr int GLOBAL_FEAT_DIM = 6;
-constexpr int ENC_GRID = 13;         // 13×13 grid for NN spatial scatter
-constexpr int ENC_HALF = 6;
+constexpr int ENC_GRID = 17;         // 17×17 grid for NN spatial scatter
+constexpr int ENC_HALF = 8;
 
 // ── Action space constants (matches hive_engine/encoder.py) ──────────
 constexpr int NUM_ENC_GRID_CELLS = ENC_GRID * ENC_GRID;           // 169
