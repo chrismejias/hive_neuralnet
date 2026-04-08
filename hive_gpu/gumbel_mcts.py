@@ -735,6 +735,10 @@ class GumbelAlphaZeroOrchestrator:
         # scatter_, legal_mask broadcast, and large softmax that dominated runtime.
         # Padding slots (topk_logits = -inf) get 0 probability automatically.
         improved_probs = torch.softmax(improved_topk, dim=-1)  # [B, max_k]
+        # Guard: if a game has 0 legal moves its entire row is -inf, producing NaN
+        # from 0/0 in softmax. Replace with zeros — the history entry will have a
+        # zero policy and contribute 0 to the cross-entropy loss.
+        improved_probs = torch.nan_to_num(improved_probs, nan=0.0)
 
         # Gather nn_prior at topk positions only — [B, max_k] transfer vs [B, A]
         nn_prior_topk = nn_prior_probs.gather(1, topk_actions)  # [B, max_k]
