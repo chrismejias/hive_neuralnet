@@ -253,6 +253,64 @@ python -m pytest tests/
 
 241 tests covering the game engine, transformer network, and GPU move generation validation.
 
+## PRS Transformer (Piece-Relative Space)
+
+An alternative, much smaller model that operates in a **piece-relative action space** of 6,841 actions instead of the engine's ~85K position-absolute actions. Each action is encoded as *(actor token, reference token, direction)* — a representation that is invariant to board translation and rotation, generalising better from limited data.
+
+### Architecture
+
+- **Action space**: 6,841 = 5,488 MOVE (28×28×7) + 1,344 PLACE (8×28×6) + 8 FIRST\_PLACE + 1 PASS
+- **Policy head**: Factored bilinear scoring — `score(actor, ref, dir) = (Wₐ hᵢ) · ((W_r hⱼ) ⊙ dir_emb[k])` — two `bmm` calls, O(B × tokens × 7 × dk) memory
+- **Small config** (default): 1.3M parameters — d\_model=128, heads=8, layers=6, dim\_ff=512
+- **Large config**: 9.7M parameters — d\_model=256, heads=16, layers=8, dim\_ff=1024
+
+### Training
+
+```bash
+# Quick benchmark (1 iteration, 128 games, 256 sims, k=16)
+python -m hive_prs.train_prs \
+  --iterations 1 --games 128 --simulations 256 --max-considered 16
+
+# Full training run
+python -m hive_prs.train_prs \
+  --iterations 1500 --games 128 --simulations 512 --max-considered 16 \
+  --checkpoint-dir checkpoints_prs
+
+# Large model
+python -m hive_prs.train_prs \
+  --d-model 256 --num-heads 16 --num-layers 8 --dim-ff 1024 \
+  --iterations 1500 --games 128 --simulations 512 --max-considered 16 \
+  --checkpoint-dir checkpoints_prs_large
+```
+
+### Performance (RTX 4090, small model)
+
+| Config | Self-play | Training | Total |
+|--------|-----------|----------|-------|
+| 128 games, 256 sims, k=16 | ~60s | ~34s | ~94s/iter |
+
+Key optimisations:
+- All surviving (game × candidate) pairs evaluated in **one batched NN call** per halving round
+- Sparse Gumbel topk — operates on `(B, max_legal)` instead of `(B, 6841)`
+- GPU-to-GPU state indexing — no D2H/H2D roundtrip when copying root states
+- `torch.compile` enabled by default
+
+### PRS Key Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--iterations` | 1500 | Training iterations |
+| `--games` | 128 | Parallel self-play games per iteration |
+| `--simulations` | 512 | Gumbel simulation budget per move |
+| `--max-considered` | 16 | Root actions considered (k); rounds = ceil(log2(k)) |
+| `--d-model` | 128 | Transformer hidden dimension |
+| `--num-heads` | 8 | Attention heads |
+| `--num-layers` | 6 | Transformer layers |
+| `--dim-ff` | 512 | Feed-forward hidden dimension |
+| `--d-key` | 64 | Bilinear key dimension in policy head |
+| `--checkpoint-dir` | checkpoints\_prs | Checkpoint output directory |
+| `--resume` | — | Path to checkpoint to resume from |
+
 ## Project Structure
 
 ```
@@ -260,8 +318,16 @@ hive_engine/       # Core game rules (board, pieces, game state, hex grid)
 hive_transformer/  # Transformer network and token encoder
 hive_gpu/          # CUDA extension, GPU-native MCTS, trainer, CLI
   csrc/            # CUDA C++ source (move gen, MCTS tree, state encoder)
+hive_prs/          # PRS Transformer: piece-relative action space (6,841 actions)
+  action_space.py  # Action encoding/decoding, vectorised batch conversion
+  prs_encoder.py   # PRSEncoder: board state → token sequence
+  prs_transformer.py  # HivePRSTransformer + bilinear policy head
+  prs_replay_buffer.py  # PRSReplayBuffer with surprise-weight sampling
+  prs_orchestrator.py   # PRSGumbelOrchestrator: batched Gumbel self-play
+  prs_trainer.py   # PRSTrainer training loop
+  train_prs.py     # CLI entry point
 tests/             # Test suite
-checkpoints/       # Pretrained checkpoints
+checkpoints/       # Pretrained checkpoints (position-based model)
 archive/           # Archived CPU training code (GNN, NNUE, CPU MCTS)
 Dockerfile         # Container for cloud/RunPod deployment
 ```
