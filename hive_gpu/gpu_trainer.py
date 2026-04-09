@@ -147,11 +147,6 @@ class GPUTrainConfig:
     draw_keep_rate: float = 1.0
 
     # Queen pressure value shaping: for drawn games, use queen surround
-    # differential as a soft value target instead of 0.0.
-    # value = scale * (pieces_around_opp_queen - pieces_around_own_queen) / 6
-    # 0.0 = disabled (draws always get value 0.0)
-    queen_pressure_scale: float = 0.0
-
     # Expansion pieces: 3-bit mask (bit 0=Mosquito, 1=Ladybug, 2=Pillbug)
     # -1 = random each iteration (uniform over 0-7), 0-7 = fixed mask
     expansion_mask: int = 0
@@ -449,7 +444,6 @@ class GPUTrainer:
                 policy_target_pruning=cfg.policy_target_pruning,
                 root_policy_temp=cfg.root_policy_temp,
                 shaped_dirichlet=cfg.shaped_dirichlet,
-                queen_pressure_scale=cfg.queen_pressure_scale,
                 expansion_mask=mask,
             )
 
@@ -467,7 +461,6 @@ class GPUTrainer:
                     encoder_type=cfg.encoder_type,
                     expansion_mask=mask,
                     nn_max_batch=cfg.nn_max_batch,
-                    queen_pressure_scale=cfg.queen_pressure_scale,
                 )
                 orchestrator = GumbelAlphaZeroOrchestrator(self.best_net, gumbel_config)
             elif cfg.use_mcgs:

@@ -67,8 +67,6 @@ class GumbelConfig:
     # NN batching
     nn_max_batch: int = 0  # 0 = no limit
 
-    # Queen pressure value shaping for draws
-    queen_pressure_scale: float = 0.4
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────
@@ -947,7 +945,6 @@ class GumbelAlphaZeroOrchestrator:
         final_mob_board_counts: np.ndarray,
         final_qs_data: list[tuple[np.ndarray, np.ndarray]],
     ) -> list[list[GPUTrainingExample]]:
-        qp_scale = self.config.queen_pressure_scale
         A = self._action_space_size
         all_examples = []
         for i, history in enumerate(histories):
@@ -955,20 +952,9 @@ class GumbelAlphaZeroOrchestrator:
             examples = []
             num_steps = len(history)
 
-            draw_value_white = 0.0
-            if (result == 0 or result == 3) and qp_scale > 0.0:
-                qs_target_final, qs_mask_final = final_qs_data[i]
-                white_q_surrounded = float(qs_target_final[:, 0].sum()) if qs_mask_final[0] > 0 else 0.0
-                black_q_surrounded = float(qs_target_final[:, 1].sum()) if qs_mask_final[1] > 0 else 0.0
-                draw_value_white = qp_scale * (black_q_surrounded - white_q_surrounded) / 6.0
-
             for step_idx, (graph, policy_sparse, turn, mobility, seq, nn_prior_sparse, legal_acts) in enumerate(history):
                 if result == 0 or result == 3:
-                    if draw_value_white != 0.0:
-                        player_is_white = (turn % 2 == 0)
-                        value = draw_value_white if player_is_white else -draw_value_white
-                    else:
-                        value = 0.0
+                    value = 0.0
                 else:
                     player_is_white = (turn % 2 == 0)
                     if result == 1:
@@ -1004,9 +990,11 @@ class GumbelAlphaZeroOrchestrator:
                 # target_policy > 0 correctly identifies the full legal set.
                 # The loss uses this to mask the softmax to legal actions only,
                 # eliminating gradient flow to illegal moves.
+                # NOTE: Must be >= 1e-7 to survive float16 quantization in the
+                # replay buffer (float16 min positive ≈ 6e-5; 1e-8 → 0.0).
                 if legal_acts is not None and len(legal_acts) > 0:
                     valid = legal_acts[legal_acts >= 0]
-                    policy[valid] = np.maximum(policy[valid], 1e-8)
+                    policy[valid] = np.maximum(policy[valid], 1e-4)
 
                 # Reconstruct sparse nn_prior into full [A] vector.
                 # _compute_surprise_weight only reads positions where policy > 0,

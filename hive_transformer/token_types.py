@@ -19,7 +19,7 @@ TOKEN_TYPE_CLS = 0
 TOKEN_TYPE_BOARD = 1
 TOKEN_TYPE_HAND = 2
 
-OFF_BOARD_POSITION = 169  # Grid has 13*13=169 cells; this is the off-board index
+OFF_BOARD_POSITION = 289  # Grid has 17*17=289 cells; this is the off-board index
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ class HiveTokenSequence:
     """
 
     token_features: np.ndarray     # (S, 21) float32
-    token_positions: np.ndarray    # (S,) int32 — 0-168 for board, 169 for off-board
+    token_positions: np.ndarray    # (S,) int32 — 0-288 for board, 289 for off-board
     token_types: np.ndarray        # (S,) int32 — 0=CLS, 1=board, 2=hand
     num_board_tokens: int          # count of board piece tokens (not including CLS)
     global_features: np.ndarray    # (6,) float32

@@ -837,31 +837,15 @@ class GPUNativeMCTSOrchestrator:
         final_mob_board_counts: np.ndarray,
         final_qs_data: list[tuple[np.ndarray, np.ndarray]],
     ) -> list[list[GPUTrainingExample]]:
-        qp_scale = self.config.queen_pressure_scale
         all_examples = []
         for i, history in enumerate(histories):
             result = int(final_results[i])
             examples = []
             num_steps = len(history)
 
-            # Queen pressure value shaping for drawn games:
-            # Compute surround differential from final position.
-            draw_value_white = 0.0
-            if (result == 0 or result == 3) and qp_scale > 0.0:
-                qs_target_final, qs_mask_final = final_qs_data[i]
-                # Count pieces adjacent to each queen
-                white_q_surrounded = float(qs_target_final[:, 0].sum()) if qs_mask_final[0] > 0 else 0.0
-                black_q_surrounded = float(qs_target_final[:, 1].sum()) if qs_mask_final[1] > 0 else 0.0
-                # Positive = white is winning (more pieces around black's queen)
-                draw_value_white = qp_scale * (black_q_surrounded - white_q_surrounded) / 6.0
-
             for step_idx, (graph, policy, turn, mobility, seq, nn_prior) in enumerate(history):
                 if result == 0 or result == 3:
-                    if draw_value_white != 0.0:
-                        player_is_white = (turn % 2 == 0)
-                        value = draw_value_white if player_is_white else -draw_value_white
-                    else:
-                        value = 0.0
+                    value = 0.0
                 else:
                     player_is_white = (turn % 2 == 0)
                     if result == 1:

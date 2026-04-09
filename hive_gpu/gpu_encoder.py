@@ -281,7 +281,7 @@ class GPUTransformerEncoder:
         token_types[is_board] = TOKEN_TYPE_BOARD
         token_types[is_hand] = TOKEN_TYPE_HAND
 
-        # ── Token positions: OFF_BOARD for CLS/hand, row*13+col for board
+        # ── Token positions: OFF_BOARD for CLS/hand, row*17+col for board
         token_positions = torch.full(
             (B, max_seq_len), OFF_BOARD_POSITION,
             dtype=torch.int64, device=device,
@@ -289,7 +289,7 @@ class GPUTransformerEncoder:
         # Compute positions for all nodes; board nodes get row*13+col,
         # hand/padding nodes get OFF_BOARD_POSITION (from invalid grid_pos=-1)
         all_pos = (
-            node_grid_pos[:, :max_nodes, 0].to(torch.int64) * 13
+            node_grid_pos[:, :max_nodes, 0].to(torch.int64) * 17
             + node_grid_pos[:, :max_nodes, 1].to(torch.int64)
         )  # (B, max_nodes) — hand tokens get -14 from (-1)*13+(-1)
         valid_board_node = node_idx < nb_col  # (B, max_nodes)
@@ -348,7 +348,7 @@ class GPUTransformerEncoder:
             for j in range(nb_i):
                 r, c = int(pos_cpu[i, j, 0]), int(pos_cpu[i, j, 1])
                 if r >= 0 and c >= 0:
-                    tp[j + 1] = r * 13 + c
+                    tp[j + 1] = r * 17 + c
 
             # Token types: 0=CLS, 1=BOARD, 2=HAND
             tt = np.zeros(seq_len, dtype=np.int32)

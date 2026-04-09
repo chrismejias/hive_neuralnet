@@ -242,13 +242,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "Decisive games are always kept. Default: 1.0 (keep all).",
     )
 
-    # Queen pressure value shaping — soft value targets for drawn games
-    parser.add_argument(
-        "--queen-pressure-scale", type=float, default=0.4,
-        help="For drawn games, use queen surround differential as a soft value target. "
-             "value = scale * (opp_queen_surrounded - own_queen_surrounded) / 6. "
-             "0.0 = disabled. Default: 0.4.",
-    )
 
     # Expansion pieces
     parser.add_argument(
@@ -395,7 +388,6 @@ def _build_train_config(args: argparse.Namespace) -> GPUTrainConfig:
         gumbel_c_visit=args.gumbel_c_visit,
         gumbel_c_scale=args.gumbel_c_scale,
         draw_keep_rate=args.draw_keep_rate,
-        queen_pressure_scale=args.queen_pressure_scale,
         expansion_mask=args.expansion,
         endgame_frac=args.endgame_frac,
         endgame_surround=args.endgame_surround,
@@ -482,8 +474,6 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Shaped Dir:   {cfg.shaped_dirichlet}")
     print(f"  Surprise wt:  {cfg.policy_surprise_weight}")
     print(f"  Draw keep:    {cfg.draw_keep_rate:.0%} of draws kept")
-    qp_str = f"{cfg.queen_pressure_scale}" if cfg.queen_pressure_scale > 0 else "disabled"
-    print(f"  Q-pressure:   {qp_str}")
     print(f"  Uncertainty:  {net_cfg.predict_uncertainty}")
     if cfg.use_gumbel:
         search_str = f'Gumbel AlphaZero (k={cfg.gumbel_max_considered})'
