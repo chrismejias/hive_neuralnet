@@ -120,6 +120,126 @@ def decode_action(idx: int) -> dict:
 
 # Numpy arrays for vectorised ops
 _DIR_DELTA_NP = np.array(DIR_DELTA, dtype=np.int32)   # (6,)
+_DIR_FROM_NB  = (np.arange(6, dtype=np.int32) + 3) % 6  # opposite direction
+
+
+# ── All-representations map (for training target deduplication fix) ────────────
+
+def moves_to_all_reps(
+    move_bytes:        np.ndarray,   # (N_legal, 6) uint8
+    n_legal:           int,
+    occupied_cells:    np.ndarray,   # (N_board,) int32 ascending
+    canonical_indices: np.ndarray,   # (N_legal,) int32 — from batch_moves_to_action_indices
+) -> dict[int, np.ndarray]:
+    """
+    For each legal move, return ALL valid PRS indices (not just the canonical one).
+
+    A move ending at to_cell can be encoded using ANY occupied neighbour of
+    to_cell as the reference piece.  ``batch_moves_to_action_indices`` always
+    picks the smallest-token neighbour (canonical).  This function finds all
+    alternatives so training targets can be spread across every representation.
+
+    Returns
+    -------
+    dict mapping canonical_prs_index → np.ndarray of ALL PRS indices for that
+    physical move (canonical is always element 0).  Moves with a single
+    representation (first placement, beetle-stack) map to a length-1 array.
+    """
+    n_board = len(occupied_cells)
+
+    if n_legal == 0:
+        return {}
+
+    # Build cell→token lookup (size BOARD_CELLS, -1 = unoccupied)
+    cell_to_tok = np.full(BOARD_CELLS, -1, dtype=np.int32)
+    if n_board > 0:
+        cell_to_tok[occupied_cells] = np.arange(n_board, dtype=np.int32)
+
+    # Parse all moves at once
+    moves  = move_bytes[:n_legal].astype(np.int32)          # (N, 6)
+    mtype  = moves[:, 0]                                     # (N,)
+    pt     = (moves[:, 1] & 0x0F) - 1                       # (N,) 0-indexed piece type
+    fc     = moves[:, 2] | (moves[:, 3] << 8)               # (N,) from-cell
+    tc     = moves[:, 4] | (moves[:, 5] << 8)               # (N,) to-cell
+
+    # Actor token for movement actions (clamped for safe indexing; guarded by mtype)
+    fc_safe  = fc.clip(0, BOARD_CELLS - 1)
+    tc_safe  = tc.clip(0, BOARD_CELLS - 1)
+    actor_tok = np.where(mtype == 1, cell_to_tok[fc_safe], -1)  # (N,)
+
+    # Beetle-stack: to_cell was already occupied before the move
+    to_tok_at_dest = cell_to_tok[tc_safe]                       # (N,)
+    is_beetle_stack = (mtype == 1) & (to_tok_at_dest >= 0) & (to_tok_at_dest < MAX_BOARD)
+
+    # All 6 neighbours of to_cell
+    nb_all = tc[:, None] + _DIR_DELTA_NP[None, :]              # (N, 6)
+
+    # Validity: in bounds
+    in_bounds = (nb_all >= 0) & (nb_all < BOARD_CELLS)         # (N, 6)
+
+    # For movement actions, exclude the from-cell (it is vacated)
+    not_fc = nb_all != fc[:, None]                              # (N, 6)
+
+    # Token at each neighbour (clamp for safe indexing)
+    nb_safe = nb_all.clip(0, BOARD_CELLS - 1)
+    tok_nb  = cell_to_tok[nb_safe]                              # (N, 6)
+    occupied_nb = (tok_nb >= 0) & (tok_nb < MAX_BOARD)
+
+    # Direction FROM neighbour TO to_cell: opposite of the direction from tc TO neighbour
+    # _DIR_FROM_NB[d] = (d + 3) % 6
+    dir_nb = np.broadcast_to(_DIR_FROM_NB[None, :], (n_legal, 6))  # (N, 6)
+
+    # Valid placement neighbours
+    valid_place = in_bounds & occupied_nb & (mtype == 0)[:, None]  # (N, 6)
+
+    # Valid movement neighbours (non-stack): exclude from-cell
+    is_non_stack = (mtype == 1) & ~is_beetle_stack              # (N,)
+    valid_move   = in_bounds & not_fc & occupied_nb & is_non_stack[:, None]  # (N, 6)
+
+    # Precompute all (N, 6) PRS index arrays
+    place_idx = (
+        _PLACE_OFFSET
+        + pt[:, None] * (MAX_BOARD * (DIRECTIONS - 1))
+        + tok_nb * (DIRECTIONS - 1)
+        + dir_nb
+    )   # (N, 6)
+
+    move_idx = (
+        actor_tok[:, None] * (MAX_BOARD * DIRECTIONS)
+        + tok_nb * DIRECTIONS
+        + dir_nb
+    )   # (N, 6)
+
+    # Assemble per-move result
+    canonical_to_all: dict[int, np.ndarray] = {}
+
+    for j in range(n_legal):
+        can = int(canonical_indices[j])
+        if can < 0 or can >= ACTION_SPACE_SIZE:
+            continue
+
+        if is_beetle_stack[j]:
+            # Only one representation: (actor, to_tok, direction=6)
+            canonical_to_all[can] = np.array([can], dtype=np.int32)
+            continue
+
+        # Gather all valid PRS indices for this move
+        if mtype[j] == 0:   # placement
+            raw = place_idx[j, valid_place[j]]
+        else:                # regular movement
+            raw = move_idx[j, valid_move[j]]
+
+        # Filter to valid range and deduplicate
+        raw = raw[(raw >= 0) & (raw < ACTION_SPACE_SIZE)]
+        if len(raw) == 0:
+            canonical_to_all[can] = np.array([can], dtype=np.int32)
+        else:
+            unique = np.unique(raw)
+            # Put canonical first; append remaining sorted
+            others = unique[unique != can]
+            canonical_to_all[can] = np.concatenate(([can], others)).astype(np.int32)
+
+    return canonical_to_all
 
 
 # ── Batch vectorised conversion (fast path) ────────────────────────────────────

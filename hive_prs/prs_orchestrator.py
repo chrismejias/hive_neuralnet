@@ -16,7 +16,7 @@ import torch
 import hive_gpu
 from hive_prs.action_space import (
     ACTION_SPACE_SIZE, moves_to_action_indices, batch_moves_to_action_indices,
-    MAX_BOARD,
+    moves_to_all_reps, MAX_BOARD,
 )
 from hive_prs.prs_encoder import PRSEncoder
 from hive_prs.prs_replay_buffer import PRSTrainingExample
@@ -222,6 +222,16 @@ class PRSGumbelOrchestrator:
                 probs = vs / vsum if vsum > 0 else np.ones(max_k, dtype=np.float32) / max_k
                 S = int(sl_cpu[i])
 
+                # All-representations map: canonical_prs → array of all PRS indices
+                # for the same physical move.  Used in _build_examples to distribute
+                # policy probability across equivalent representations → better
+                # generalization when token ordering changes between game states.
+                nl_i  = int(nlegal_np[i])
+                no_i  = int(nocc_cpu[i])
+                all_reps_i = moves_to_all_reps(
+                    legal_np[i], nl_i, occ_cpu[i, :no_i], prs_from_move[i]
+                )
+
                 histories[i].append({
                     "token_features":   tf_cpu[i, :S].copy(),
                     "token_positions":  tp_cpu[i, :S].astype(np.int32),
@@ -236,6 +246,7 @@ class PRSGumbelOrchestrator:
                     "nn_prior":         nn_prior_np[i].copy(), # (A,) float32
                     "turn":             int(turns_np[i]),
                     "prs_from_move":    prs_from_move[i].copy(),  # (n_legal,) int32
+                    "all_reps_map":     all_reps_i,            # dict[canonical → all reps]
                 })
 
             # ── 9. Apply selected moves ──
@@ -460,35 +471,67 @@ class PRSGumbelOrchestrator:
                 else:
                     value = -1.0 if player_is_white else 1.0
 
-                # Dense policy from sparse (topk_actions, probs)
+                all_reps_map = step.get("all_reps_map", {})  # canonical → all reps array
+
+                # Dense policy: distribute each topk move's probability equally
+                # across ALL its PRS representations (canonical + equivalents).
+                # This ensures the network learns to recognise every valid
+                # encoding of the same physical move, improving generalisation
+                # when token ordering differs between game states.
                 topk = step["topk_actions"]
                 prob = step["probs"]
                 policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
                 for ai, p in zip(topk, prob):
                     ai = int(ai)
                     if 0 <= ai < ACTION_SPACE_SIZE:
-                        policy[ai] = float(p)
+                        reps = all_reps_map.get(ai)
+                        if reps is None or len(reps) == 0:
+                            policy[ai] += float(p)
+                        else:
+                            per_rep = float(p) / len(reps)
+                            for ri in reps:
+                                if 0 <= ri < ACTION_SPACE_SIZE:
+                                    policy[ri] += per_rep
 
-                # Mark all legal moves with epsilon floor so loss masks correctly
-                prs_lm = step["prs_from_move"]  # (n_legal,) int32
-                valid_legal = np.array(
-                    [p for p in prs_lm if 0 <= p < ACTION_SPACE_SIZE], dtype=np.int32
-                )
-                if len(valid_legal) > 0:
-                    policy[valid_legal] = np.maximum(policy[valid_legal], 1e-4)
+                # Epsilon floor: mark all representations of all legal moves so
+                # the CE loss mask includes non-canonical reps too.
+                EPS = 1e-4
+                for can_prs, reps in all_reps_map.items():
+                    eps_per = EPS / max(len(reps), 1)
+                    for ri in reps:
+                        if 0 <= ri < ACTION_SPACE_SIZE and policy[ri] < eps_per:
+                            policy[ri] = eps_per
+
                 psum = policy.sum()
                 if psum > 0:
                     policy /= psum
 
-                # Surprise weight
+                # Surprise weight: KL(policy_canonical || nn_prior).
+                # nn_prior is computed over canonical-only logits (-inf for
+                # non-canonical), so we aggregate policy back to canonical reps
+                # before computing KL to avoid log(p / ~0) = +inf.
                 nn_prior = step["nn_prior"]
-                mask = policy > 0
                 sw = 1.0
-                if mask.any():
-                    p_pos = policy[mask]
-                    q_pos = np.clip(nn_prior[mask], 1e-8, 1.0)
-                    kl = float(np.sum(p_pos * np.log(p_pos / q_pos)))
-                    sw = max(0.1, 1.0 + kl)
+                if all_reps_map:
+                    # Sum policy across reps → per-move canonical probability
+                    can_policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+                    for can_prs, reps in all_reps_map.items():
+                        valid_reps = [ri for ri in reps if 0 <= ri < ACTION_SPACE_SIZE]
+                        if valid_reps:
+                            can_policy[can_prs] = float(np.sum(policy[valid_reps]))
+                    can_mask = can_policy > 0
+                    if can_mask.any():
+                        p_pos = can_policy[can_mask]
+                        q_pos = np.clip(nn_prior[can_mask], 1e-8, 1.0)
+                        kl = float(np.sum(p_pos * np.log(p_pos / q_pos)))
+                        sw = max(0.1, 1.0 + kl)
+                else:
+                    mask = policy > 0
+                    if mask.any():
+                        p_pos = policy[mask]
+                        q_pos = np.clip(nn_prior[mask], 1e-8, 1.0)
+                        kl = float(np.sum(p_pos * np.log(p_pos / q_pos)))
+                        sw = max(0.1, 1.0 + kl)
 
                 game_exs.append(PRSTrainingExample(
                     token_features   = step["token_features"],
