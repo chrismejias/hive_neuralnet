@@ -130,7 +130,10 @@ class PRSGumbelOrchestrator:
                 legal_idx_padded[i, :nl] = li
                 legal_log_padded[i, :nl] = policy_logits[i, li]
 
-            u       = torch.rand(B, max_legal, device="cuda").clamp(1e-10, 1 - 1e-7)
+            # Clamp u away from 0 and 1 before Gumbel transform.
+            # 1e-4 is above the float16 minimum normal (~6.1e-5), so this is
+            # safe even if the computation ever runs under fp16 autocast.
+            u       = torch.rand(B, max_legal, device="cuda").clamp(1e-4, 1 - 1e-4)
             gumbel  = -torch.log(-torch.log(u))
             gumbel[legal_log_padded == float("-inf")] = float("-inf")
             perturbed_sparse = gumbel + legal_log_padded    # (B, max_legal)
