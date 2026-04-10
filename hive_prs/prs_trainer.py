@@ -11,7 +11,6 @@ Usage:
 
 from __future__ import annotations
 
-import copy
 import gc
 import math
 import os
@@ -148,9 +147,18 @@ class PRSTrainer:
         self.use_amp = cfg.use_amp if cfg.use_amp is not None else (self.device.type == "cuda")
         self._scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
 
-        self.best_net    = HivePRSTransformer(self.net_config).to(self.device)
+        # Self-play model: always uncompiled — Gumbel search calls the NN with
+        # varying batch sizes (B, B×K, B×K/2, …) which cause shape recompilation
+        # storms if torch.compile is active here.
+        self.best_net = HivePRSTransformer(self.net_config).to(self.device)
+
+        # Training model: compiled once, then reused across iterations by loading
+        # weights from best_net at the start of each _train call.
+        # Fixed batch size during training → stable shapes → JIT cache always hits.
+        self._train_net: nn.Module = HivePRSTransformer(self.net_config).to(self.device)
         if cfg.compile_net and self.device.type == "cuda":
-            self.best_net = torch.compile(self.best_net)
+            self._train_net = torch.compile(self._train_net)
+
         self.buffer      = PRSReplayBuffer(cfg.buffer_max_size)
         self.elo_tracker = EloTracker()
         self._start_iter = 1
@@ -197,19 +205,19 @@ class PRSTrainer:
 
             # ── Train ──
             t0 = time.time()
-            new_net, loss, loss_dict = self._train(iteration)
+            loss, loss_dict = self._train(iteration)
             train_time = time.time() - t0
             comp = " | ".join(f"{k}={v:.4f}" for k, v in loss_dict.items())
             print(f"  Training: loss={loss:.4f}, {train_time:.1f}s  [{comp}]")
             self._cleanup()
 
             # ── Promote ──
-            self.best_net = new_net
+            # best_net is updated in-place by _train; no reassignment needed.
             elo = self.elo_tracker.update(1.0, self.config.arena_games)
             print(f"  ELO: {elo:.0f}")
 
             # ── Checkpoint ──
-            self._save_checkpoint(self.best_net, iteration)
+            self._save_checkpoint(iteration)
 
             total = sp_time + train_time
             print(
@@ -265,16 +273,26 @@ class PRSTrainer:
 
     # ── Training step ────────────────────────────────────────────────────
 
-    def _train(self, iteration: int) -> tuple[nn.Module, float, dict]:
-        cfg     = self.config
-        new_net = copy.deepcopy(self.best_net)
-        new_net.train()
+    def _train(self, iteration: int) -> tuple[float, dict]:
+        """Train _train_net (compiled) from best_net weights, then sync back.
 
-        lr = self._lr(iteration)
-        opt = optim.Adam(new_net.parameters(), lr=lr, weight_decay=cfg.weight_decay)
+        Keeps best_net uncompiled (for self-play) while using a persistent compiled
+        _train_net for gradient steps (fixed batch size → stable shapes → JIT cache
+        always hits after the first compilation on iteration 1).
+        """
+        cfg = self.config
 
         if len(self.buffer) < cfg.batch_size:
-            return new_net, 0.0, {}
+            return 0.0, {}
+
+        # ── Sync weights: best_net → _train_net ──
+        # getattr handles both compiled (OptimizedModule._orig_mod) and plain modules.
+        underlying = getattr(self._train_net, "_orig_mod", self._train_net)
+        underlying.load_state_dict(self.best_net.state_dict())
+        self._train_net.train()
+
+        lr  = self._lr(iteration)
+        opt = optim.Adam(self._train_net.parameters(), lr=lr, weight_decay=cfg.weight_decay)
 
         total_loss_sum = 0.0
         comp_sums: dict[str, float] = {}
@@ -290,7 +308,7 @@ class PRSTrainer:
 
                 if self.use_amp and self._scaler is not None:
                     with torch.amp.autocast("cuda"):
-                        logits, value = new_net(batch.prs_batch)
+                        logits, value = self._train_net(batch.prs_batch)
                         loss, ld = compute_prs_loss(
                             logits, value, batch.policy_targets, batch.value_targets,
                             cfg.policy_softening,
@@ -298,18 +316,22 @@ class PRSTrainer:
                     self._scaler.scale(loss).backward()
                     if cfg.max_grad_norm > 0:
                         self._scaler.unscale_(opt)
-                        torch.nn.utils.clip_grad_norm_(new_net.parameters(), cfg.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            self._train_net.parameters(), cfg.max_grad_norm
+                        )
                     self._scaler.step(opt)
                     self._scaler.update()
                 else:
-                    logits, value = new_net(batch.prs_batch)
+                    logits, value = self._train_net(batch.prs_batch)
                     loss, ld = compute_prs_loss(
                         logits, value, batch.policy_targets, batch.value_targets,
                         cfg.policy_softening,
                     )
                     loss.backward()
                     if cfg.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(new_net.parameters(), cfg.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(
+                            self._train_net.parameters(), cfg.max_grad_norm
+                        )
                     opt.step()
 
                 total_loss_sum += loss.item()
@@ -317,20 +339,24 @@ class PRSTrainer:
                     comp_sums[k] = comp_sums.get(k, 0.0) + v.item()
                 n_batches += 1
 
+        # ── Sync weights back: _train_net → best_net ──
+        self.best_net.load_state_dict(underlying.state_dict())
+        self.best_net.eval()
+
         n = max(n_batches, 1)
-        return new_net, total_loss_sum / n, {k: v / n for k, v in comp_sums.items()}
+        return total_loss_sum / n, {k: v / n for k, v in comp_sums.items()}
 
     # ── Checkpointing ────────────────────────────────────────────────────
 
-    def _save_checkpoint(self, net: nn.Module, iteration: int) -> None:
+    def _save_checkpoint(self, iteration: int) -> None:
         cfg = self.config
         keep = cfg.checkpoint_keep_every
         if keep > 0 and iteration % keep != 0:
             return
         path = os.path.join(cfg.checkpoint_dir, f"prs_iter_{iteration:04d}.pt")
         torch.save({
-            "iteration":  iteration,
-            "model_state": net.state_dict(),
+            "iteration":   iteration,
+            "model_state": self.best_net.state_dict(),  # always save uncompiled weights
             "net_config":  self.net_config,
         }, path)
         print(f"  Saved: {path}")

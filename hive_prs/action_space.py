@@ -150,8 +150,11 @@ def batch_moves_to_action_indices(
 
     # ── Flatten all legal moves with their game id ──
     game_ids   = np.repeat(np.arange(B, dtype=np.int32), nlegal_np)  # (total,)
-    flat_moves = np.vstack([legal_np[i, :nlegal_np[i]] for i in range(B)
-                             if nlegal_np[i] > 0])                    # (total, 6)
+    # Boolean-index across the padded move array — avoids a Python loop + vstack
+    max_l      = legal_np.shape[1]
+    j_range    = np.arange(max_l, dtype=np.int32)
+    valid_j    = j_range[None, :] < nlegal_np[:, None]   # (B, MAX_L) bool
+    flat_moves = legal_np[valid_j]                        # (total, 6) uint8
 
     move_type  = flat_moves[:, 0].astype(np.int32)
     piece_type = (flat_moves[:, 1] & 0x0F).astype(np.int32) - 1      # 0-indexed

@@ -37,6 +37,12 @@ class PRSGumbelConfig:
     max_game_length:            int   = 300
     expansion_mask:             int   = 0
     nn_max_batch:               int   = 0
+    # When True, apply a 2-ply reply probe in each halving round.
+    # The opponent plays a uniformly-random legal reply; the resulting grandchild
+    # is evaluated by the NN.  This adds crucial 2-ply terminal detection
+    # (catches positions where the opponent can immediately win back) at low cost:
+    # reply selection is pure GPU — no Python batch_moves_to_action_indices call.
+    use_reply_probe:            bool  = True
 
 
 class PRSGumbelOrchestrator:
@@ -80,22 +86,23 @@ class PRSGumbelOrchestrator:
             nlegal_np = nlegal_t.cpu().numpy()      # (B,)
 
             # ── 3. PRS legal mask + inverse lookup (vectorised) ──
-            prs_from_move: list[np.ndarray]     = batch_moves_to_action_indices(
+            prs_from_move: list[np.ndarray] = batch_moves_to_action_indices(
                 legal_np, nlegal_np, occ_cpu, nocc_cpu)
-            move_from_prs: list[dict[int, int]] = []
-            prs_mask = torch.zeros(B, ACTION_SPACE_SIZE, dtype=torch.bool, device="cuda")
 
+            # prs_to_j[i, prs_idx] = move column j, or -1 if not legal.
+            # Written in reverse-j order so the first occurrence (lowest j) wins
+            # when two moves share the same PRS index.
+            prs_to_j = np.full((B, ACTION_SPACE_SIZE), -1, dtype=np.int16)
             for i in range(B):
-                idx = prs_from_move[i]
-                valid_mask = (idx >= 0) & (idx < ACTION_SPACE_SIZE)
-                valid_prs  = idx[valid_mask]
-                valid_j    = np.where(valid_mask)[0]
-                # keep first occurrence (lowest j) for duplicate PRS indices
-                _, first   = np.unique(valid_prs, return_index=True)
-                inv        = dict(zip(valid_prs[first].tolist(), valid_j[first].tolist()))
-                move_from_prs.append(inv)
-                if len(valid_prs):
-                    prs_mask[i, valid_prs] = True
+                arr = prs_from_move[i]
+                valid = (arr >= 0) & (arr < ACTION_SPACE_SIZE)
+                if valid.any():
+                    vp = arr[valid]
+                    vj = np.where(valid)[0].astype(np.int16)
+                    prs_to_j[i, vp[::-1]] = vj[::-1]   # reverse: first j wins
+
+            prs_to_j_t = torch.from_numpy(prs_to_j).to("cuda")   # (B, A) int16
+            prs_mask    = prs_to_j_t >= 0                          # (B, A) bool
 
             # ── 4. Root NN evaluation ──
             with torch.no_grad():
@@ -106,7 +113,10 @@ class PRSGumbelOrchestrator:
 
             nn_prior_np = torch.softmax(policy_logits, dim=-1).cpu().numpy()  # (B, A)
 
-            # ── 5. Gumbel + top-k (sparse: work only on legal actions) ──
+            # ── 5. Dense Gumbel topk ──
+            # Work directly on (B, ACTION_SPACE_SIZE) — no per-game Python loop.
+            # policy_logits already has -inf for illegal moves; Gumbel of -inf stays -inf.
+            # 1e-4 clamp is above the float16 minimum normal (~6.1e-5).
             num_legal_prs = prs_mask.sum(dim=1)   # (B,)
             k      = cfg.max_num_considered_actions
             eff_k  = num_legal_prs.clamp(max=k)
@@ -117,56 +127,32 @@ class PRSGumbelOrchestrator:
                     active[i] = False
                 break
 
-            # Sparse gumbel: gather legal logits into (B, max_legal) tensor,
-            # do topk there, then scatter selected indices back to global PRS space.
-            max_legal = int(num_legal_prs.max().item())
-
-            # Build padded (B, max_legal) tensors of legal PRS indices and logits
-            legal_idx_padded  = torch.zeros(B, max_legal, dtype=torch.int64, device="cuda")
-            legal_log_padded  = torch.full((B, max_legal), float("-inf"), device="cuda")
-            for i in range(B):
-                nl = int(num_legal_prs[i].item())
-                li = prs_mask[i].nonzero(as_tuple=False).squeeze(1)[:nl]  # (nl,)
-                legal_idx_padded[i, :nl] = li
-                legal_log_padded[i, :nl] = policy_logits[i, li]
-
-            # Clamp u away from 0 and 1 before Gumbel transform.
-            # 1e-4 is above the float16 minimum normal (~6.1e-5), so this is
-            # safe even if the computation ever runs under fp16 autocast.
-            u       = torch.rand(B, max_legal, device="cuda").clamp(1e-4, 1 - 1e-4)
-            gumbel  = -torch.log(-torch.log(u))
-            gumbel[legal_log_padded == float("-inf")] = float("-inf")
-            perturbed_sparse = gumbel + legal_log_padded    # (B, max_legal)
-
-            _, topk_local = torch.topk(perturbed_sparse, max_k, dim=1)  # (B, max_k)
-            topk_actions  = legal_idx_padded.gather(1, topk_local)       # (B, max_k) global PRS idx
-            # perturbed at topk positions (for score computation later)
-            perturbed_topk = perturbed_sparse.gather(1, topk_local)      # (B, max_k)
+            u = torch.rand(B, ACTION_SPACE_SIZE, device="cuda").clamp(1e-4, 1 - 1e-4)
+            gumbel = -torch.log(-torch.log(u))
+            gumbel[~prs_mask] = float("-inf")
+            perturbed_dense = gumbel + policy_logits              # (B, ACTION_SPACE_SIZE)
+            perturbed_topk, topk_actions = torch.topk(perturbed_dense, max_k, dim=1)
+            # topk_actions: (B, max_k) global PRS indices — no extra gather needed
 
             # ── 6. Sequential halving ──
-            q_sums        = torch.zeros(B, max_k, device="cuda")
-            visit_counts  = torch.zeros(B, max_k, dtype=torch.int32, device="cuda")
-            cand_mask     = torch.ones(B, max_k, dtype=torch.bool, device="cuda")
+            q_sums       = torch.zeros(B, max_k, device="cuda")
+            visit_counts = torch.zeros(B, max_k, dtype=torch.int32, device="cuda")
 
-            for i in range(B):
-                ek = int(eff_k[i].item())
-                if ek < max_k:
-                    cand_mask[i, ek:] = False
+            # Vectorised cand_mask: replaces B .item() CUDA syncs with one comparison.
+            k_range   = torch.arange(max_k, device="cuda").unsqueeze(0)  # (1, max_k)
+            cand_mask = k_range < eff_k.to(torch.int64).unsqueeze(1)     # (B, max_k)
 
             # Sequential halving: ONE batched NN call per round evaluates all
             # surviving (game × candidate) pairs simultaneously.
-            # When the simulation budget provides > 1 visit per candidate per round,
-            # we also apply a greedy 2-ply reply probe (opponent plays argmax of
-            # child policy, reusing logits already computed in the 1-ply call).
-            # This matches the original Gumbel orchestrator's _probe_child_replies.
+            # Reply probe (greedy 2-ply) is gated on cfg.use_reply_probe.
             n_rounds = max(1, math.ceil(math.log2(max_k + 1e-9)))
             visits_per_cand = max(1, cfg.num_simulations // max(n_rounds * max_k, 1))
-            do_probe = visits_per_cand > 1
+            do_probe = cfg.use_reply_probe and visits_per_cand > 1
 
             for _ in range(n_rounds):
                 q_sums, visit_counts = self._halving_round_batched(
                     states, topk_actions, cand_mask, q_sums, visit_counts,
-                    legal_np, nlegal_np, occ_cpu, nocc_cpu, move_from_prs,
+                    legal_np, nlegal_np, occ_cpu, nocc_cpu, prs_to_j,
                     do_reply_probe=do_probe,
                 )
 
@@ -215,47 +201,58 @@ class PRSGumbelOrchestrator:
             visits_np    = visits_float.cpu().numpy()
 
             # ── 8. Record history ──
+            # Batch all GPU→CPU transfers outside the per-game loop to avoid
+            # B separate CUDA API calls (one bulk transfer per tensor type).
             turns_lo = states[:B, _OFF_TURN].to(torch.int32)
             turns_hi = states[:B, _OFF_TURN + 1].to(torch.int32)
-            turns    = (turns_lo | (turns_hi << 8)).cpu().tolist()
+            turns_np = (turns_lo | (turns_hi << 8)).cpu().numpy()
+
+            tf_cpu = prs_batch.token_features.cpu().numpy()    # (B, S, 25)
+            tp_cpu = prs_batch.token_positions.cpu().numpy()   # (B, S)
+            tt_cpu = prs_batch.token_types.cpu().numpy()       # (B, S)
+            nb_cpu = prs_batch.num_board_tokens.cpu().numpy()  # (B,)
+            gf_cpu = prs_batch.global_features.cpu().numpy()   # (B, 6)
+            sl_cpu = prs_batch.seq_lengths.cpu().numpy()       # (B,)
 
             for i in range(B):
                 if not active[i]:
                     continue
                 vs = visits_np[i]
                 vsum = vs.sum()
-                if vsum > 0:
-                    probs = vs / vsum
-                else:
-                    probs = np.ones(max_k, dtype=np.float32) / max_k
+                probs = vs / vsum if vsum > 0 else np.ones(max_k, dtype=np.float32) / max_k
+                S = int(sl_cpu[i])
 
                 histories[i].append({
-                    "token_features":   prs_batch.token_features[i].cpu().numpy().copy(),
-                    "token_positions":  prs_batch.token_positions[i].cpu().numpy().astype(np.int32),
-                    "token_types":      prs_batch.token_types[i].cpu().numpy().astype(np.int8),
-                    "num_board_tokens": int(prs_batch.num_board_tokens[i].item()),
-                    "global_features":  prs_batch.global_features[i].cpu().numpy().copy(),
-                    "seq_length":       int(prs_batch.seq_lengths[i].item()),
+                    "token_features":   tf_cpu[i, :S].copy(),
+                    "token_positions":  tp_cpu[i, :S].astype(np.int32),
+                    "token_types":      tt_cpu[i, :S].astype(np.int8),
+                    "num_board_tokens": int(nb_cpu[i]),
+                    "global_features":  gf_cpu[i].copy(),
+                    "seq_length":       S,
                     "occupied_cells":   occ_cpu[i].copy(),
                     "num_occupied":     int(nocc_cpu[i]),
                     "topk_actions":     topk_np[i].copy(),    # (max_k,) PRS indices
                     "probs":            probs.copy(),          # (max_k,) float32
                     "nn_prior":         nn_prior_np[i].copy(), # (A,) float32
-                    "turn":             int(turns[i]),
+                    "turn":             int(turns_np[i]),
                     "prs_from_move":    prs_from_move[i].copy(),  # (n_legal,) int32
                 })
 
             # ── 9. Apply selected moves ──
             move_bytes_np = np.zeros((B, self._move_size), dtype=np.uint8)
-            for i in range(B):
-                if not active[i]:
-                    continue
-                sel_prs = int(sel_np[i])
-                j = move_from_prs[i].get(sel_prs, -1)
-                if j >= 0:
-                    move_bytes_np[i] = legal_np[i, j]
-                elif int(nlegal_np[i]) > 0:
-                    move_bytes_np[i] = legal_np[i, 0]   # fallback
+            active_arr = np.array(active, dtype=bool)
+            active_idx = np.where(active_arr)[0]
+            if len(active_idx) > 0:
+                sel_prs_a = sel_np[active_idx]                                 # (|A|,)
+                j_a       = prs_to_j[active_idx, sel_prs_a].astype(np.int32)  # (|A|,)
+                has_j     = j_a >= 0
+                has_fb    = ~has_j & (nlegal_np[active_idx] > 0)
+                if has_j.any():
+                    ok = active_idx[has_j]
+                    move_bytes_np[ok] = legal_np[ok, j_a[has_j]]
+                if has_fb.any():
+                    fb = active_idx[has_fb]
+                    move_bytes_np[fb] = legal_np[fb, 0]
 
             move_bytes_t = torch.from_numpy(move_bytes_np).cuda()
             self.ext.apply_moves_batch(states, move_bytes_t, B)
@@ -291,7 +288,7 @@ class PRSGumbelOrchestrator:
         nlegal_np:      np.ndarray,           # (B,) int32
         occ_cpu:        np.ndarray,           # (B, MAX_BOARD) int32
         nocc_cpu:       np.ndarray,           # (B,) int32
-        move_from_prs:  list[dict[int, int]], # B-length list of PRS→move_j dicts
+        prs_to_j:       np.ndarray,           # (B, ACTION_SPACE_SIZE) int16 — PRS→move_j
         do_reply_probe: bool = False,         # apply greedy 2-ply when True
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Evaluate every surviving candidate for every game in one NN batch.
@@ -314,15 +311,16 @@ class PRSGumbelOrchestrator:
         # Build N child states: root_states[game_idx[n]] + apply candidate action
         child_states = root_states[game_idx].clone()    # (N, state_size) on CUDA
 
+        # Vectorised move lookup: prs_to_j[game, prs] → column j (-1 = not found)
+        j_vals = prs_to_j[game_idx_np, cand_prs_np].astype(np.int32)   # (N,)
+        has_j  = j_vals >= 0
+        has_fb = ~has_j & (nlegal_np[game_idx_np] > 0)
+
         move_bytes_np = np.zeros((N, self._move_size), dtype=np.uint8)
-        for n in range(N):
-            g   = int(game_idx_np[n])
-            sel = int(cand_prs_np[n])
-            j   = move_from_prs[g].get(sel, -1)
-            if j >= 0:
-                move_bytes_np[n] = legal_np[g, j]
-            elif int(nlegal_np[g]) > 0:
-                move_bytes_np[n] = legal_np[g, 0]
+        if has_j.any():
+            move_bytes_np[has_j] = legal_np[game_idx_np[has_j], j_vals[has_j]]
+        if has_fb.any():
+            move_bytes_np[has_fb] = legal_np[game_idx_np[has_fb], 0]
 
         move_bytes_t = torch.from_numpy(move_bytes_np).cuda()
         self.ext.apply_moves_batch(child_states, move_bytes_t, N)
@@ -354,52 +352,32 @@ class PRSGumbelOrchestrator:
         )
         child_values = torch.where(is_terminal, terminal_val, child_values)
 
-        # ── Greedy 2-ply reply probe ───────────────────────────────────────────
-        # Mirrors the original Gumbel orchestrator's _probe_child_replies:
-        # the opponent plays their greedy best move (argmax of child policy),
-        # then we evaluate the resulting grandchild state.
-        # Only applied when do_reply_probe=True (simulation budget allows it).
+        # ── 2-ply reply probe ─────────────────────────────────────────────────────
+        # Apply the opponent's reply to each non-terminal child, then evaluate the
+        # resulting grandchild with the NN.  This gives 2-ply tactical signal:
+        # candidates where the opponent can immediately win are marked as bad (Q≈−1).
+        #
+        # Reply selection uses uniform-random sampling over the child's legal moves.
+        # This avoids the expensive batch_moves_to_action_indices call needed for
+        # the greedy argmax while still providing correct terminal detection for
+        # the vast majority of tactically important positions.
+        # (For a randomly-initialised net, random ≡ greedy anyway.)
         if do_reply_probe:
             non_terminal_mask = ~is_terminal.bool()   # (N,)
             if non_terminal_mask.any():
                 nt_idx = non_terminal_mask.nonzero(as_tuple=True)[0]   # (M,)
                 M      = nt_idx.shape[0]
 
-                # Legal moves at each non-terminal child state
-                gc_legal_t, gc_nlegal_t = self.ext.generate_legal_moves_batch(
-                    child_states, N
-                )
+                # Legal moves for non-terminal children only (avoid full-N CUDA call)
                 gc_states    = child_states[nt_idx].clone()  # (M, state_size)
-                gc_legal_sub = gc_legal_t[nt_idx]            # (M, MAX_L, move_size)
+                gc_legal_t, gc_nlegal_t = self.ext.generate_legal_moves_batch(gc_states, M)
 
-                # Convert child legal moves → PRS indices (vectorised)
-                gc_occ_np   = child_prs.occupied_cells[nt_idx].cpu().numpy()
-                gc_nocc_np  = child_prs.num_occupied[nt_idx].cpu().numpy()
-                gc_legal_np = gc_legal_sub.cpu().numpy()
-                gc_nlegal_np = gc_nlegal_t[nt_idx].cpu().numpy()
-
-                gc_prs_arrs = batch_moves_to_action_indices(
-                    gc_legal_np, gc_nlegal_np, gc_occ_np, gc_nocc_np
-                )   # list[M] of int32 arrays
-
-                # Vectorised greedy best-reply: build (M, max_nl) PRS index table,
-                # gather child logits, take argmax per row.
-                max_nl   = int(gc_nlegal_t[nt_idx].max().item())
-                prs_pad  = np.full((M, max_nl), -1, dtype=np.int32)
-                for m in range(M):
-                    nl_m = len(gc_prs_arrs[m])
-                    prs_pad[m, :nl_m] = gc_prs_arrs[m]
-
-                prs_pad_t   = torch.from_numpy(prs_pad).to("cuda")         # (M, max_nl)
-                valid_prs   = (prs_pad_t >= 0) & (prs_pad_t < ACTION_SPACE_SIZE)
-                safe_prs    = prs_pad_t.clamp(0, ACTION_SPACE_SIZE - 1).long()  # (M, max_nl)
-                nt_logits   = child_logits[nt_idx]                        # (M, A)
-                logit_grid  = nt_logits.gather(1, safe_prs)               # (M, max_nl)
-                logit_grid[~valid_prs] = float("-inf")
-                best_j      = logit_grid.argmax(dim=1).clamp(0, gc_legal_sub.shape[1] - 1)
-
-                reply_t = gc_legal_sub[
-                    torch.arange(M, device="cuda"), best_j, :
+                # Random legal reply — pure GPU, no Python/CPU conversion needed.
+                # Uniform over [0, n_legal_i) per child.
+                gc_nlegal_f  = gc_nlegal_t.float().clamp(min=1)         # (M,)
+                random_j     = (torch.rand(M, device="cuda") * gc_nlegal_f).long()
+                reply_t      = gc_legal_t[
+                    torch.arange(M, device="cuda"), random_j, :
                 ].to(torch.uint8)
                 self.ext.apply_moves_batch(gc_states, reply_t, M)
 

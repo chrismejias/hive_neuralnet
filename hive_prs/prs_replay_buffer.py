@@ -67,10 +67,13 @@ class PRSReplayBuffer:
 
     def sample_batch(self, batch_size: int) -> PRSTrainingBatch:
         """Sample a random batch and collate into a PRSTrainingBatch."""
-        weights = np.array([e.surprise_weight for e in self.buffer], dtype=np.float32)
+        # Convert deque to list once: enables O(1) random access instead of
+        # O(n/4) per deque.__getitem__ call (256 × O(n/4) = slow for large buffers).
+        buf = list(self.buffer)
+        weights = np.array([e.surprise_weight for e in buf], dtype=np.float32)
         weights /= weights.sum()
-        indices = np.random.choice(len(self.buffer), size=batch_size, p=weights)
-        samples = [self.buffer[i] for i in indices]
+        indices = np.random.choice(len(buf), size=batch_size, p=weights)
+        samples = [buf[i] for i in indices]
         return _collate(samples)
 
 
