@@ -172,7 +172,7 @@ class PRSGumbelOrchestrator:
                 max_n = int(visit_counts.max().item())
                 sigma = (cfg.c_visit + max_n) * cfg.c_scale
                 q_mean = q_sums / visit_counts.clamp(min=1).float()
-                scores = perturbed_topk + q_mean / (sigma + 1e-8)
+                scores = perturbed_topk + sigma * q_mean   # qtransform: multiply, not divide
                 scores[~cand_mask] = float("-inf")
 
                 _, keep = torch.topk(scores, num_keep, dim=1)
@@ -184,11 +184,22 @@ class PRSGumbelOrchestrator:
             max_n  = int(visit_counts.max().item())
             sigma  = (cfg.c_visit + max_n) * cfg.c_scale
             q_mean = q_sums / visit_counts.clamp(min=1).float()
-            final_scores = perturbed_topk + q_mean / (sigma + 1e-8)
+            final_scores = perturbed_topk + sigma * q_mean   # qtransform: multiply, not divide
             final_scores[~cand_mask] = float("-inf")
 
-            sel_local  = torch.argmax(final_scores, dim=1)                           # (B,)
-            sel_global = topk_actions.gather(1, sel_local.unsqueeze(1)).squeeze(1)   # (B,) PRS idx
+            if cfg.temperature > 0:
+                # Stochastic sampling — critical for diversity when games share identical states.
+                # argmax is deterministic: if one logit dominates, all B games pick the same action.
+                # Sampling from softmax(scores / T) ensures different games diverge.
+                temp_probs = torch.softmax(final_scores / cfg.temperature, dim=-1)  # (B, max_k)
+                # Games with no valid PRS candidates (cand_mask all False) produce NaN
+                # from softmax of all-inf → replace with uniform so multinomial doesn't crash.
+                uniform = 1.0 / max(max_k, 1)
+                temp_probs = temp_probs.nan_to_num(nan=uniform)
+                sel_local  = torch.multinomial(temp_probs, 1).squeeze(1)            # (B,)
+            else:
+                sel_local  = torch.argmax(final_scores, dim=1)                      # (B,)
+            sel_global = topk_actions.gather(1, sel_local.unsqueeze(1)).squeeze(1)  # (B,) PRS idx
             sel_np     = sel_global.cpu().numpy()
 
             # Policy target from visit counts
@@ -303,11 +314,85 @@ class PRSGumbelOrchestrator:
         move_bytes_t = torch.from_numpy(move_bytes_np).cuda()
         self.ext.apply_moves_batch(child_states, move_bytes_t, N)
 
+        # Terminal detection — override NN value for won/drawn/lost positions
+        results_t = self.ext.check_results_batch(child_states, N)   # (N,) int32 on CUDA
+
         # ONE encode + ONE NN forward for all N child states
         child_prs = self.encoder.encode_batch(child_states, N)
         with torch.no_grad():
             _, child_values = self.net(child_prs)
-        child_q = -child_values.squeeze(-1).float()   # (N,) — negated for root perspective
+        child_values = child_values.squeeze(-1).float()   # (N,)
+
+        # Vectorised terminal override (same logic as original Gumbel orchestrator)
+        # root_states[game_idx, _OFF_TURN] gives the turn byte BEFORE the move was applied,
+        # so it tells us which player just moved (= the root player for this candidate).
+        root_turn_bytes = root_states[game_idx, _OFF_TURN]   # (N,) uint8
+        root_is_white   = (root_turn_bytes % 2 == 0)
+        root_won = ((results_t == 1) & root_is_white) | ((results_t == 2) & ~root_is_white)
+        is_terminal = results_t != 0
+        is_draw     = results_t == 3
+        terminal_val = torch.where(
+            is_draw,
+            torch.zeros_like(child_values),
+            torch.where(root_won,
+                        torch.full_like(child_values, -1.0),   # root won → child lost
+                        torch.full_like(child_values,  1.0)),  # root lost → child won
+        )
+        child_values = torch.where(is_terminal, terminal_val, child_values)
+
+        # ── 2-ply reply probing ────────────────────────────────────────────────
+        # For non-terminal children, apply the opponent's first legal reply, then
+        # encode + NN eval the grandchild and replace child_values with the
+        # grandchild estimate.  Terminal grandchildren get exact ±1 values.
+        # This mirrors the original Gumbel orchestrator's _probe_child_replies and
+        # is essential for finding wins with an untrained network.
+        non_terminal_mask = ~is_terminal.bool()   # (N,) on CUDA
+        if non_terminal_mask.any():
+            nt_idx = non_terminal_mask.nonzero(as_tuple=True)[0]   # (M,)
+            M      = nt_idx.shape[0]
+
+            gc_legal_t, gc_nlegal_t = self.ext.generate_legal_moves_batch(child_states, N)
+            gc_states    = child_states[nt_idx].clone()     # (M, state_size)
+            gc_legal_sub = gc_legal_t[nt_idx]               # (M, MAX_L, move_size)
+            gc_n         = gc_nlegal_t[nt_idx].clamp(min=1).long()  # (M,)
+            # Random opponent reply — introduces per-call stochasticity so repeated
+            # evals_per_round evaluations yield independent Q estimates (MC sampling).
+            rand_j  = (torch.rand(M, device=gc_n.device) * gc_n.float()).long()
+            rand_j  = rand_j.clamp(0, gc_legal_sub.shape[1] - 1)
+            reply_t = gc_legal_sub[torch.arange(M, device=gc_n.device), rand_j, :].to(torch.uint8)
+            self.ext.apply_moves_batch(gc_states, reply_t, M)
+
+            gc_results_t = self.ext.check_results_batch(gc_states, M)   # (M,)
+
+            # Encode + NN forward for grandchild states
+            gc_prs = self.encoder.encode_batch(gc_states, M)
+            with torch.no_grad():
+                _, gc_values = self.net(gc_prs)
+            gc_values = gc_values.squeeze(-1).float()   # (M,)
+
+            # Terminal override for grandchild (root player's turn again)
+            gc_is_terminal = gc_results_t != 0
+            gc_is_draw     = gc_results_t == 3
+            gc_root_iw     = root_is_white[nt_idx]
+            gc_root_won    = ((gc_results_t == 1) & gc_root_iw) | \
+                             ((gc_results_t == 2) & ~gc_root_iw)
+            gc_terminal_val = torch.where(
+                gc_is_draw,
+                torch.zeros(M, device="cuda"),
+                torch.where(gc_root_won,
+                            torch.ones(M, device="cuda"),
+                            torch.full((M,), -1.0, device="cuda")),
+            )
+            gc_values = torch.where(gc_is_terminal, gc_terminal_val, gc_values)
+
+            # gc_values is already from ROOT's perspective (same as grandchild player).
+            # child_values is from CHILD/OPPONENT's perspective → child_q = -child_values.
+            # For 2-ply: we need child_q[nt_idx] = gc_values (not -gc_values).
+            # We store -gc_values so the final negation gives the right sign.
+            child_values = child_values.clone()
+            child_values[nt_idx] = -gc_values  # store negated so -child_values = gc_values
+
+        child_q = -child_values   # negate: child perspective → root perspective
 
         # Scatter back
         q_sums.index_put_((game_idx, k_idx), child_q, accumulate=True)

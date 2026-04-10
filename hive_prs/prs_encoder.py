@@ -137,53 +137,36 @@ class PRSEncoder:
         token_types[is_hand]  = TOKEN_TYPE_HAND
 
         # ── Token positions: ABSOLUTE 23×23 cell index ──
-        # node_grid_pos contains the CENTROID-CENTRED (row, col) in the 17×17 grid.
-        # We want absolute cell index on the 23×23 board instead.
-        # The CUDA kernel stores the raw cell index in an auxiliary field; we
-        # reconstruct it from the centroid offset stored in global_features[4:6]
-        # (center_q, center_r normalised by HALF_BOARD=8) — OR we simply use the
-        # raw cell index that the CUDA kernel also emits as node_grid_pos but
-        # reinterpreted.
+        # node_grid_pos contains (row_enc, col_enc) in the 17×17 centroid-centred
+        # grid: enc = abs - centroid + 8, where centroid is the per-game piece
+        # centroid in absolute 23×23 space.
         #
-        # Simpler: node_grid_pos[b, i] = (row_enc, col_enc) in [0,17).
-        # We un-center: abs_col = col_enc - 8 + center_col
-        #               abs_row = row_enc - 8 + center_row
-        # where center = round(mean of occupied cell (col, row)).
-        # But we don't have center per-batch from the raw output directly.
-        #
-        # Cleanest solution: use the fact that the kernel also stores the raw
-        # cell index inside node_piece_types (upper bits) or use a separate
-        # extraction.  For now, reconstruct from global_features which contains
-        # queen positions and turn, but not centroid.
-        #
-        # FALLBACK: reconstruct centroid on the fly from the board positions.
-        # This is O(N_board) per game but runs on GPU.
-        #
-        # For the initial implementation we store 17×17 centred positions and
-        # will update the CUDA kernel to emit raw cell indices directly in a
-        # follow-up.  The position table size is set to 530 (BOARD_CELLS+1).
+        # compute_centroids_batch returns (B, 2) int32: [col_offset, row_offset]
+        # where col_offset = Cc - 11, row_offset = Cr - 11 (offset from board centre).
+        # Therefore:
+        #   abs_row = enc_row + centroid[1] + 3   (= enc_row - 8 + Cr)
+        #   abs_col = enc_col + centroid[0] + 3   (= enc_col - 8 + Cc)
+
+        centroids = self.ext.compute_centroids_batch(states_tensor, B)  # (B, 2) int32 on GPU
+        # centroid[b, 0] = col_offset, centroid[b, 1] = row_offset
+        cent_col = centroids[:, 0].to(torch.int64).view(B, 1)  # (B, 1)
+        cent_row = centroids[:, 1].to(torch.int64).view(B, 1)  # (B, 1)
 
         token_positions = torch.full(
             (B, max_seq), PRS_OFF_BOARD, dtype=torch.int64, device=device,
         )
 
         # node_grid_pos: (B, max_nodes, 2) — (row_enc, col_enc) in 17×17
-        # Recover absolute 23×23: need centroid per game.
-        # Compute centroid from board node positions (tokens 0..nb_i-1).
         board_rows = node_grid_pos[:, :max_nodes, 0].to(torch.int64)  # (B, max_nodes)
         board_cols = node_grid_pos[:, :max_nodes, 1].to(torch.int64)
 
         # Mask non-board nodes
         valid_board = node_idx < nb_col  # (B, max_nodes) bool
 
-        # Centroid in 17×17 space (already centred at 8,8)
-        # Un-centre to 23×23: abs_row = (row_enc - 8) + 11, abs_col = (col_enc - 8) + 11
-        # (The 23×23 board centre is at cell 11*23+11 = 264.)
-        ENC_HALF    = 8
-        BOARD_HALF  = 11  # 23 // 2
+        ENC_TO_ABS = 3   # = BOARD_HALF(11) - ENC_HALF(8)
 
-        abs_rows = board_rows - ENC_HALF + BOARD_HALF  # (B, max_nodes)
-        abs_cols = board_cols - ENC_HALF + BOARD_HALF
+        abs_rows = board_rows + cent_row + ENC_TO_ABS  # (B, max_nodes)
+        abs_cols = board_cols + cent_col + ENC_TO_ABS
 
         # Clamp to [0, 22] to handle any edge cases
         abs_rows = abs_rows.clamp(0, 22)
