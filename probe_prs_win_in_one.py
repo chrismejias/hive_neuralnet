@@ -222,14 +222,16 @@ for idx, (state1, win_bytes) in enumerate(win_list):
     )
     orch = PRSGumbelOrchestrator(net, cfg_tmp)
 
+    visits_per_cand = max(1, NUM_SIMS // max(n_rounds * eff_k, 1))
+    do_probe = visits_per_cand > 1
     for _rnd in range(n_rounds):
-        for _rep in range(evals_per_round):
-            q_sums, visit_cnt = orch._halving_round_batched(
-                state1, topk_global, cand_mask_h,
-                q_sums, visit_cnt,
-                legal_np, nlegal_np, occ_cpu, nocc_cpu,
-                [move_from_prs_local],
-            )
+        q_sums, visit_cnt = orch._halving_round_batched(
+            state1, topk_global, cand_mask_h,
+            q_sums, visit_cnt,
+            legal_np, nlegal_np, occ_cpu, nocc_cpu,
+            [move_from_prs_local],
+            do_reply_probe=do_probe,
+        )
 
         # Halve survivors
         num_cands = int(cand_mask_h.sum().item())

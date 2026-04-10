@@ -16,6 +16,7 @@ import torch
 import hive_gpu
 from hive_prs.action_space import (
     ACTION_SPACE_SIZE, moves_to_action_indices, batch_moves_to_action_indices,
+    MAX_BOARD,
 )
 from hive_prs.prs_encoder import PRSEncoder
 from hive_prs.prs_replay_buffer import PRSTrainingExample
@@ -149,19 +150,22 @@ class PRSGumbelOrchestrator:
                 if ek < max_k:
                     cand_mask[i, ek:] = False
 
-            # Sequential halving: evaluate each surviving candidate once per round,
-            # using ONE batched NN call (B × num_surviving states) per round.
-            # Each round halves the candidate set by score.
-            # Total NN calls = n_rounds (4 for k=16), not num_simulations.
+            # Sequential halving: ONE batched NN call per round evaluates all
+            # surviving (game × candidate) pairs simultaneously.
+            # When the simulation budget provides > 1 visit per candidate per round,
+            # we also apply a greedy 2-ply reply probe (opponent plays argmax of
+            # child policy, reusing logits already computed in the 1-ply call).
+            # This matches the original Gumbel orchestrator's _probe_child_replies.
             n_rounds = max(1, math.ceil(math.log2(max_k + 1e-9)))
-            evals_per_round = max(1, cfg.num_simulations // max(n_rounds * max_k, 1))
+            visits_per_cand = max(1, cfg.num_simulations // max(n_rounds * max_k, 1))
+            do_probe = visits_per_cand > 1
 
             for _ in range(n_rounds):
-                for _rep in range(evals_per_round):
-                    q_sums, visit_counts = self._halving_round_batched(
-                        states, topk_actions, cand_mask, q_sums, visit_counts,
-                        legal_np, nlegal_np, occ_cpu, nocc_cpu, move_from_prs,
-                    )
+                q_sums, visit_counts = self._halving_round_batched(
+                    states, topk_actions, cand_mask, q_sums, visit_counts,
+                    legal_np, nlegal_np, occ_cpu, nocc_cpu, move_from_prs,
+                    do_reply_probe=do_probe,
+                )
 
                 # Halve: keep top half by score
                 num_cands = int(cand_mask.sum(dim=1).max().item())
@@ -275,19 +279,26 @@ class PRSGumbelOrchestrator:
 
     def _halving_round_batched(
         self,
-        root_states:   torch.Tensor,         # (B, state_size)
-        topk_actions:  torch.Tensor,         # (B, max_k) PRS indices
-        cand_mask:     torch.Tensor,         # (B, max_k) bool
-        q_sums:        torch.Tensor,
-        visit_counts:  torch.Tensor,
-        legal_np:      np.ndarray,           # (B, MAX_L, move_size) from root
-        nlegal_np:     np.ndarray,           # (B,) int32
-        occ_cpu:       np.ndarray,           # (B, MAX_BOARD) int32
-        nocc_cpu:      np.ndarray,           # (B,) int32
-        move_from_prs: list[dict[int, int]], # B-length list of PRS→move_j dicts
+        root_states:    torch.Tensor,         # (B, state_size)
+        topk_actions:   torch.Tensor,         # (B, max_k) PRS indices
+        cand_mask:      torch.Tensor,         # (B, max_k) bool
+        q_sums:         torch.Tensor,
+        visit_counts:   torch.Tensor,
+        legal_np:       np.ndarray,           # (B, MAX_L, move_size) from root
+        nlegal_np:      np.ndarray,           # (B,) int32
+        occ_cpu:        np.ndarray,           # (B, MAX_BOARD) int32
+        nocc_cpu:       np.ndarray,           # (B,) int32
+        move_from_prs:  list[dict[int, int]], # B-length list of PRS→move_j dicts
+        do_reply_probe: bool = False,         # apply greedy 2-ply when True
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate every surviving candidate for every game in one NN batch."""
+        """Evaluate every surviving candidate for every game in one NN batch.
 
+        When do_reply_probe=True, applies the opponent's greedy best reply
+        (argmax of child policy logits) for non-terminal children, matching the
+        original Gumbel orchestrator's _probe_child_replies.  The child policy
+        logits come from the 1-ply NN call already performed here — no extra
+        forward pass needed to select the reply.
+        """
         # Collect surviving (game_i, local_k_j) pairs
         game_idx, k_idx = torch.where(cand_mask)   # both (N,) int64  (on CUDA)
         N = game_idx.shape[0]
@@ -297,8 +308,7 @@ class PRSGumbelOrchestrator:
         game_idx_np = game_idx.cpu().numpy()
         cand_prs_np = topk_actions[game_idx, k_idx].cpu().numpy()   # (N,) PRS indices
 
-        # Build N child states: root_states[game_idx[n]] + apply cand action
-        # Keep indexing on GPU — avoids D2H + H2D roundtrip
+        # Build N child states: root_states[game_idx[n]] + apply candidate action
         child_states = root_states[game_idx].clone()    # (N, state_size) on CUDA
 
         move_bytes_np = np.zeros((N, self._move_size), dtype=np.uint8)
@@ -314,18 +324,19 @@ class PRSGumbelOrchestrator:
         move_bytes_t = torch.from_numpy(move_bytes_np).cuda()
         self.ext.apply_moves_batch(child_states, move_bytes_t, N)
 
-        # Terminal detection — override NN value for won/drawn/lost positions
-        results_t = self.ext.check_results_batch(child_states, N)   # (N,) int32 on CUDA
+        # Terminal detection
+        results_t = self.ext.check_results_batch(child_states, N)   # (N,) int32
 
-        # ONE encode + ONE NN forward for all N child states
+        # ONE encode + ONE NN forward for all N child states.
+        # Capture policy logits too — they drive the greedy reply selection.
         child_prs = self.encoder.encode_batch(child_states, N)
         with torch.no_grad():
-            _, child_values = self.net(child_prs)
-        child_values = child_values.squeeze(-1).float()   # (N,)
+            child_logits, child_values = self.net(child_prs)
+        child_logits = child_logits.float()             # (N, ACTION_SPACE_SIZE)
+        child_values = child_values.squeeze(-1).float() # (N,)
 
-        # Vectorised terminal override (same logic as original Gumbel orchestrator)
-        # root_states[game_idx, _OFF_TURN] gives the turn byte BEFORE the move was applied,
-        # so it tells us which player just moved (= the root player for this candidate).
+        # root_states[game_idx, _OFF_TURN] is the turn byte BEFORE the candidate
+        # move was applied, so it identifies the root player (who just moved).
         root_turn_bytes = root_states[game_idx, _OFF_TURN]   # (N,) uint8
         root_is_white   = (root_turn_bytes % 2 == 0)
         root_won = ((results_t == 1) & root_is_white) | ((results_t == 2) & ~root_is_white)
@@ -340,59 +351,83 @@ class PRSGumbelOrchestrator:
         )
         child_values = torch.where(is_terminal, terminal_val, child_values)
 
-        # ── 2-ply reply probing ────────────────────────────────────────────────
-        # For non-terminal children, apply the opponent's first legal reply, then
-        # encode + NN eval the grandchild and replace child_values with the
-        # grandchild estimate.  Terminal grandchildren get exact ±1 values.
-        # This mirrors the original Gumbel orchestrator's _probe_child_replies and
-        # is essential for finding wins with an untrained network.
-        non_terminal_mask = ~is_terminal.bool()   # (N,) on CUDA
-        if non_terminal_mask.any():
-            nt_idx = non_terminal_mask.nonzero(as_tuple=True)[0]   # (M,)
-            M      = nt_idx.shape[0]
+        # ── Greedy 2-ply reply probe ───────────────────────────────────────────
+        # Mirrors the original Gumbel orchestrator's _probe_child_replies:
+        # the opponent plays their greedy best move (argmax of child policy),
+        # then we evaluate the resulting grandchild state.
+        # Only applied when do_reply_probe=True (simulation budget allows it).
+        if do_reply_probe:
+            non_terminal_mask = ~is_terminal.bool()   # (N,)
+            if non_terminal_mask.any():
+                nt_idx = non_terminal_mask.nonzero(as_tuple=True)[0]   # (M,)
+                M      = nt_idx.shape[0]
 
-            gc_legal_t, gc_nlegal_t = self.ext.generate_legal_moves_batch(child_states, N)
-            gc_states    = child_states[nt_idx].clone()     # (M, state_size)
-            gc_legal_sub = gc_legal_t[nt_idx]               # (M, MAX_L, move_size)
-            gc_n         = gc_nlegal_t[nt_idx].clamp(min=1).long()  # (M,)
-            # Random opponent reply — introduces per-call stochasticity so repeated
-            # evals_per_round evaluations yield independent Q estimates (MC sampling).
-            rand_j  = (torch.rand(M, device=gc_n.device) * gc_n.float()).long()
-            rand_j  = rand_j.clamp(0, gc_legal_sub.shape[1] - 1)
-            reply_t = gc_legal_sub[torch.arange(M, device=gc_n.device), rand_j, :].to(torch.uint8)
-            self.ext.apply_moves_batch(gc_states, reply_t, M)
+                # Legal moves at each non-terminal child state
+                gc_legal_t, gc_nlegal_t = self.ext.generate_legal_moves_batch(
+                    child_states, N
+                )
+                gc_states    = child_states[nt_idx].clone()  # (M, state_size)
+                gc_legal_sub = gc_legal_t[nt_idx]            # (M, MAX_L, move_size)
 
-            gc_results_t = self.ext.check_results_batch(gc_states, M)   # (M,)
+                # Convert child legal moves → PRS indices (vectorised)
+                gc_occ_np   = child_prs.occupied_cells[nt_idx].cpu().numpy()
+                gc_nocc_np  = child_prs.num_occupied[nt_idx].cpu().numpy()
+                gc_legal_np = gc_legal_sub.cpu().numpy()
+                gc_nlegal_np = gc_nlegal_t[nt_idx].cpu().numpy()
 
-            # Encode + NN forward for grandchild states
-            gc_prs = self.encoder.encode_batch(gc_states, M)
-            with torch.no_grad():
-                _, gc_values = self.net(gc_prs)
-            gc_values = gc_values.squeeze(-1).float()   # (M,)
+                gc_prs_arrs = batch_moves_to_action_indices(
+                    gc_legal_np, gc_nlegal_np, gc_occ_np, gc_nocc_np
+                )   # list[M] of int32 arrays
 
-            # Terminal override for grandchild (root player's turn again)
-            gc_is_terminal = gc_results_t != 0
-            gc_is_draw     = gc_results_t == 3
-            gc_root_iw     = root_is_white[nt_idx]
-            gc_root_won    = ((gc_results_t == 1) & gc_root_iw) | \
-                             ((gc_results_t == 2) & ~gc_root_iw)
-            gc_terminal_val = torch.where(
-                gc_is_draw,
-                torch.zeros(M, device="cuda"),
-                torch.where(gc_root_won,
-                            torch.ones(M, device="cuda"),
-                            torch.full((M,), -1.0, device="cuda")),
-            )
-            gc_values = torch.where(gc_is_terminal, gc_terminal_val, gc_values)
+                # Vectorised greedy best-reply: build (M, max_nl) PRS index table,
+                # gather child logits, take argmax per row.
+                max_nl   = int(gc_nlegal_t[nt_idx].max().item())
+                prs_pad  = np.full((M, max_nl), -1, dtype=np.int32)
+                for m in range(M):
+                    nl_m = len(gc_prs_arrs[m])
+                    prs_pad[m, :nl_m] = gc_prs_arrs[m]
 
-            # gc_values is already from ROOT's perspective (same as grandchild player).
-            # child_values is from CHILD/OPPONENT's perspective → child_q = -child_values.
-            # For 2-ply: we need child_q[nt_idx] = gc_values (not -gc_values).
-            # We store -gc_values so the final negation gives the right sign.
-            child_values = child_values.clone()
-            child_values[nt_idx] = -gc_values  # store negated so -child_values = gc_values
+                prs_pad_t   = torch.from_numpy(prs_pad).to("cuda")         # (M, max_nl)
+                valid_prs   = (prs_pad_t >= 0) & (prs_pad_t < ACTION_SPACE_SIZE)
+                safe_prs    = prs_pad_t.clamp(0, ACTION_SPACE_SIZE - 1).long()  # (M, max_nl)
+                nt_logits   = child_logits[nt_idx]                        # (M, A)
+                logit_grid  = nt_logits.gather(1, safe_prs)               # (M, max_nl)
+                logit_grid[~valid_prs] = float("-inf")
+                best_j      = logit_grid.argmax(dim=1).clamp(0, gc_legal_sub.shape[1] - 1)
 
-        child_q = -child_values   # negate: child perspective → root perspective
+                reply_t = gc_legal_sub[
+                    torch.arange(M, device="cuda"), best_j, :
+                ].to(torch.uint8)
+                self.ext.apply_moves_batch(gc_states, reply_t, M)
+
+                gc_results_t = self.ext.check_results_batch(gc_states, M)
+                gc_prs_batch = self.encoder.encode_batch(gc_states, M)
+                with torch.no_grad():
+                    _, gc_values = self.net(gc_prs_batch)
+                gc_values = gc_values.squeeze(-1).float()
+
+                # Terminal override for grandchild (root player's turn again)
+                gc_root_iw  = root_is_white[nt_idx]
+                gc_root_won = ((gc_results_t == 1) & gc_root_iw) | \
+                              ((gc_results_t == 2) & ~gc_root_iw)
+                gc_is_term  = gc_results_t != 0
+                gc_is_draw  = gc_results_t == 3
+                gc_term_val = torch.where(
+                    gc_is_draw,
+                    torch.zeros(M, device="cuda"),
+                    torch.where(gc_root_won,
+                                torch.ones(M, device="cuda"),
+                                torch.full((M,), -1.0, device="cuda")),
+                )
+                gc_values = torch.where(gc_is_term, gc_term_val, gc_values)
+
+                # gc_values: root perspective at grandchild.
+                # child_values is opponent perspective → child_q = -child_values.
+                # We want child_q[nt_idx] = gc_values, so store -gc_values.
+                child_values = child_values.clone()
+                child_values[nt_idx] = -gc_values
+
+        child_q = -child_values   # opponent → root perspective
 
         # Scatter back
         q_sums.index_put_((game_idx, k_idx), child_q, accumulate=True)
