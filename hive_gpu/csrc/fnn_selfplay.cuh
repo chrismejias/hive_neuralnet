@@ -330,33 +330,38 @@ __global__ void fnn_selfplay_kernel(
                 alive[k] = true;
             }
 
-            int remaining_sims = num_simulations;
+            // ── Sequential Halving budget ──
+            // nrounds = number of halving steps (ceil(log2(nc)) + 1 to include
+            // a final round for the surviving candidate).
+            // Each round gets an equal share: sims_each = n_sims / nrounds.
+            // This ensures halving actually happens instead of consuming the
+            // entire budget in round 0 and leaving nothing for later rounds.
             int nrounds = 1;
             { int tmp = nc; while (tmp > 1) { nrounds++; tmp = (tmp + 1) / 2; } }
 
-            for (int r = 0; r < nrounds && remaining_sims > 0; r++) {
+            int sims_each = num_simulations / nrounds;
+            if (sims_each < 1) sims_each = 1;
+
+            for (int r = 0; r < nrounds; r++) {
                 int alive_count = 0;
                 for (int k = 0; k < nc; k++)
                     if (alive[k]) alive_count++;
                 if (alive_count == 0) break;
 
-                int sims_each = remaining_sims / alive_count;
-                if (sims_each < 1) sims_each = 1;
-
+                // All alive candidates get the same budget this round
                 for (int k = 0; k < nc; k++) {
                     if (alive[k]) {
                         q_sums[k] += (-cand_values[k]) * (float)sims_each;
                         visits[k] += sims_each;
                     }
                 }
-                remaining_sims -= sims_each * alive_count;
-                if (remaining_sims < 0) remaining_sims = 0;
 
                 // Eliminate bottom half (except last round)
                 if (r < nrounds - 1 && alive_count > 1) {
                     float max_v = 1.0f;
                     for (int k = 0; k < nc; k++)
-                        if ((float)visits[k] > max_v) max_v = (float)visits[k];
+                        if (alive[k] && (float)visits[k] > max_v)
+                            max_v = (float)visits[k];
 
                     float sigma[MAX_GUMBEL_CANDIDATES];
                     for (int k = 0; k < nc; k++) {
