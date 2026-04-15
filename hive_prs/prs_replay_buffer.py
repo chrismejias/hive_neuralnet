@@ -45,11 +45,11 @@ class PRSTrainingBatch:
     policy_targets:  torch.Tensor   # (B, ACTION_SPACE_SIZE) float32
     value_targets:   torch.Tensor   # (B, 1) float32
 
-    def to(self, device) -> PRSTrainingBatch:
+    def to(self, device, non_blocking: bool = False) -> PRSTrainingBatch:
         return PRSTrainingBatch(
-            prs_batch      = self.prs_batch.to(device),
-            policy_targets = self.policy_targets.to(device),
-            value_targets  = self.value_targets.to(device),
+            prs_batch      = self.prs_batch.to(device, non_blocking=non_blocking),
+            policy_targets = self.policy_targets.to(device, non_blocking=non_blocking),
+            value_targets  = self.value_targets.to(device, non_blocking=non_blocking),
         )
 
 
@@ -109,19 +109,19 @@ def _collate(samples: list[PRSTrainingExample]) -> PRSTrainingBatch:
         value[i, 0]    = s.value_target
 
     prs = PRSTokenBatch(
-        token_features   = torch.from_numpy(feat),
-        token_positions  = torch.from_numpy(pos),
-        token_types      = torch.from_numpy(types),
-        attention_mask   = torch.from_numpy(mask),
-        num_board_tokens = torch.from_numpy(nb),
-        global_features  = torch.from_numpy(gf),
-        seq_lengths      = torch.from_numpy(sl),
-        occupied_cells   = torch.from_numpy(occ),
-        num_occupied     = torch.from_numpy(nocc),
+        token_features   = torch.from_numpy(feat).pin_memory(),
+        token_positions  = torch.from_numpy(pos).pin_memory(),
+        token_types      = torch.from_numpy(types).pin_memory(),
+        attention_mask   = torch.from_numpy(mask).pin_memory(),
+        num_board_tokens = torch.from_numpy(nb).pin_memory(),
+        global_features  = torch.from_numpy(gf).pin_memory(),
+        seq_lengths      = torch.from_numpy(sl).pin_memory(),
+        occupied_cells   = torch.from_numpy(occ).pin_memory(),
+        num_occupied     = torch.from_numpy(nocc).pin_memory(),
     )
 
     return PRSTrainingBatch(
         prs_batch      = prs,
-        policy_targets = torch.from_numpy(policy),
-        value_targets  = torch.from_numpy(value),
+        policy_targets = torch.from_numpy(policy).pin_memory(),
+        value_targets  = torch.from_numpy(value).pin_memory(),
     )

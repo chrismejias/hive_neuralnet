@@ -58,17 +58,17 @@ class PRSTokenBatch:
         self.occupied_cells   = occupied_cells
         self.num_occupied     = num_occupied
 
-    def to(self, device) -> PRSTokenBatch:
+    def to(self, device, non_blocking: bool = False) -> PRSTokenBatch:
         return PRSTokenBatch(
-            token_features   = self.token_features.to(device),
-            token_positions  = self.token_positions.to(device),
-            token_types      = self.token_types.to(device),
-            attention_mask   = self.attention_mask.to(device),
-            num_board_tokens = self.num_board_tokens.to(device),
-            global_features  = self.global_features.to(device),
-            seq_lengths      = self.seq_lengths.to(device),
-            occupied_cells   = self.occupied_cells.to(device),
-            num_occupied     = self.num_occupied.to(device),
+            token_features   = self.token_features.to(device, non_blocking=non_blocking),
+            token_positions  = self.token_positions.to(device, non_blocking=non_blocking),
+            token_types      = self.token_types.to(device, non_blocking=non_blocking),
+            attention_mask   = self.attention_mask.to(device, non_blocking=non_blocking),
+            num_board_tokens = self.num_board_tokens.to(device, non_blocking=non_blocking),
+            global_features  = self.global_features.to(device, non_blocking=non_blocking),
+            seq_lengths      = self.seq_lengths.to(device, non_blocking=non_blocking),
+            occupied_cells   = self.occupied_cells.to(device, non_blocking=non_blocking),
+            num_occupied     = self.num_occupied.to(device, non_blocking=non_blocking),
         )
 
     def slice_batch(self, start: int, end: int) -> PRSTokenBatch:

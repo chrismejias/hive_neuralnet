@@ -302,7 +302,7 @@ class PRSTrainer:
             batches_per_epoch = max(1, len(self.buffer) // cfg.batch_size)
             for _ in range(batches_per_epoch):
                 batch: PRSTrainingBatch = self.buffer.sample_batch(cfg.batch_size)
-                batch = batch.to(self.device)
+                batch = batch.to(self.device, non_blocking=True)
 
                 opt.zero_grad()
 

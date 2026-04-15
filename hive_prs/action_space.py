@@ -130,116 +130,120 @@ def moves_to_all_reps(
     n_legal:           int,
     occupied_cells:    np.ndarray,   # (N_board,) int32 ascending
     canonical_indices: np.ndarray,   # (N_legal,) int32 — from batch_moves_to_action_indices
-) -> dict[int, np.ndarray]:
+) -> np.ndarray:
     """
-    For each legal move, return ALL valid PRS indices (not just the canonical one).
-
-    A move ending at to_cell can be encoded using ANY occupied neighbour of
-    to_cell as the reference piece.  ``batch_moves_to_action_indices`` always
-    picks the smallest-token neighbour (canonical).  This function finds all
-    alternatives so training targets can be spread across every representation.
+    For each legal move, compute ALL valid PRS indices (not just canonical).
 
     Returns
     -------
-    dict mapping canonical_prs_index → np.ndarray of ALL PRS indices for that
-    physical move (canonical is always element 0).  Moves with a single
-    representation (first placement, beetle-stack) map to a length-1 array.
+    all_reps : (N_legal, 6) int32, padded with -1.
+        Column 0 is the canonical index, columns 1-5 are alternative reps.
     """
-    n_board = len(occupied_cells)
-
     if n_legal == 0:
-        return {}
+        return np.empty((0, 6), dtype=np.int32)
 
-    # Build cell→token lookup (size BOARD_CELLS, -1 = unoccupied)
+    n_board = len(occupied_cells)
+    all_reps = np.full((n_legal, 6), -1, dtype=np.int32)
+    all_reps[:, 0] = canonical_indices[:n_legal]
+
+    # Build cell→token lookup
     cell_to_tok = np.full(BOARD_CELLS, -1, dtype=np.int32)
     if n_board > 0:
         cell_to_tok[occupied_cells] = np.arange(n_board, dtype=np.int32)
 
     # Parse all moves at once
-    moves  = move_bytes[:n_legal].astype(np.int32)          # (N, 6)
-    mtype  = moves[:, 0]                                     # (N,)
-    pt     = (moves[:, 1] & 0x0F) - 1                       # (N,) 0-indexed piece type
-    fc     = moves[:, 2] | (moves[:, 3] << 8)               # (N,) from-cell
-    tc     = moves[:, 4] | (moves[:, 5] << 8)               # (N,) to-cell
+    moves  = move_bytes[:n_legal].astype(np.int32)
+    mtype  = moves[:, 0]
+    pt     = (moves[:, 1] & 0x0F) - 1
+    fc     = moves[:, 2] | (moves[:, 3] << 8)
+    tc     = moves[:, 4] | (moves[:, 5] << 8)
 
-    # Actor token for movement actions (clamped for safe indexing; guarded by mtype)
     fc_safe  = fc.clip(0, BOARD_CELLS - 1)
     tc_safe  = tc.clip(0, BOARD_CELLS - 1)
-    actor_tok = np.where(mtype == 1, cell_to_tok[fc_safe], -1)  # (N,)
+    actor_tok = np.where(mtype == 1, cell_to_tok[fc_safe], -1)
 
-    # Beetle-stack: to_cell was already occupied before the move
-    to_tok_at_dest = cell_to_tok[tc_safe]                       # (N,)
+    to_tok_at_dest = cell_to_tok[tc_safe]
     is_beetle_stack = (mtype == 1) & (to_tok_at_dest >= 0) & (to_tok_at_dest < MAX_BOARD)
 
-    # All 6 neighbours of to_cell
-    nb_all = tc[:, None] + _DIR_DELTA_NP[None, :]              # (N, 6)
-
-    # Validity: in bounds
-    in_bounds = (nb_all >= 0) & (nb_all < BOARD_CELLS)         # (N, 6)
-
-    # For movement actions, exclude the from-cell (it is vacated)
-    not_fc = nb_all != fc[:, None]                              # (N, 6)
-
-    # Token at each neighbour (clamp for safe indexing)
+    nb_all = tc[:, None] + _DIR_DELTA_NP[None, :]
+    in_bounds = (nb_all >= 0) & (nb_all < BOARD_CELLS)
+    not_fc = nb_all != fc[:, None]
     nb_safe = nb_all.clip(0, BOARD_CELLS - 1)
-    tok_nb  = cell_to_tok[nb_safe]                              # (N, 6)
+    tok_nb  = cell_to_tok[nb_safe]
     occupied_nb = (tok_nb >= 0) & (tok_nb < MAX_BOARD)
+    dir_nb = np.broadcast_to(_DIR_FROM_NB[None, :], (n_legal, 6))
 
-    # Direction FROM neighbour TO to_cell: opposite of the direction from tc TO neighbour
-    # _DIR_FROM_NB[d] = (d + 3) % 6
-    dir_nb = np.broadcast_to(_DIR_FROM_NB[None, :], (n_legal, 6))  # (N, 6)
-
-    # Valid placement neighbours
-    valid_place = in_bounds & occupied_nb & (mtype == 0)[:, None]  # (N, 6)
-
-    # Valid movement neighbours (non-stack): exclude from-cell
-    is_non_stack = (mtype == 1) & ~is_beetle_stack              # (N,)
-    valid_move   = in_bounds & not_fc & occupied_nb & is_non_stack[:, None]  # (N, 6)
-
-    # Precompute all (N, 6) PRS index arrays
+    # Compute (N, 6) PRS indices for each neighbour direction
     place_idx = (
         _PLACE_OFFSET
         + pt[:, None] * (MAX_BOARD * (DIRECTIONS - 1))
         + tok_nb * (DIRECTIONS - 1)
         + dir_nb
-    )   # (N, 6)
-
+    )
     move_idx = (
         actor_tok[:, None] * (MAX_BOARD * DIRECTIONS)
         + tok_nb * DIRECTIONS
         + dir_nb
-    )   # (N, 6)
+    )
 
-    # Assemble per-move result
-    canonical_to_all: dict[int, np.ndarray] = {}
+    # Build validity mask per neighbour: (N, 6)
+    valid_place = in_bounds & occupied_nb & (mtype == 0)[:, None]
+    is_non_stack = (mtype == 1) & ~is_beetle_stack
+    valid_move  = in_bounds & not_fc & occupied_nb & is_non_stack[:, None]
+    valid_any = valid_place | valid_move
 
-    for j in range(n_legal):
-        can = int(canonical_indices[j])
-        if can < 0 or can >= ACTION_SPACE_SIZE:
-            continue
+    # Select place or move indices
+    combined = np.where(valid_place, place_idx, np.where(valid_move, move_idx, -1))
+    # Filter out-of-range
+    combined[(combined < 0) | (combined >= ACTION_SPACE_SIZE)] = -1
+    # Beetle stacks and invalid canonical → only canonical rep (already in col 0)
+    combined[is_beetle_stack] = -1
 
-        if is_beetle_stack[j]:
-            # Only one representation: (actor, to_tok, direction=6)
-            canonical_to_all[can] = np.array([can], dtype=np.int32)
-            continue
+    # Pack valid alternative reps into columns 1-5 (canonical is col 0)
+    # For each row, gather valid values that differ from canonical
+    can = canonical_indices[:n_legal]
+    for d in range(6):
+        col = combined[:, d]
+        # Mark entries that equal canonical as -1 (already in col 0)
+        col = np.where(col == can, -1, col)
+        combined[:, d] = col
 
-        # Gather all valid PRS indices for this move
-        if mtype[j] == 0:   # placement
-            raw = place_idx[j, valid_place[j]]
-        else:                # regular movement
-            raw = move_idx[j, valid_move[j]]
+    # Compact valid entries into columns 1..5 per row
+    # Use vectorized argsort-based compaction
+    valid_mask = combined >= 0  # (N, 6)
+    n_valid = valid_mask.sum(axis=1)  # (N,)
+    has_alts = n_valid > 0
+    if has_alts.any():
+        # Sort so that valid entries come first (descending by validity)
+        # We negate the mask so valid=True sorts first
+        sort_key = (~valid_mask).astype(np.int32)
+        order = np.argsort(sort_key, axis=1, kind='stable')
+        rows = np.arange(n_legal)[:, None]
+        sorted_combined = combined[rows, order]
+        # Copy compacted alternatives into all_reps columns 1..5
+        max_alts = min(5, sorted_combined.shape[1])
+        all_reps[has_alts, 1:1+max_alts] = sorted_combined[np.ix_(has_alts, np.arange(max_alts))]
 
-        # Filter to valid range and deduplicate
-        raw = raw[(raw >= 0) & (raw < ACTION_SPACE_SIZE)]
-        if len(raw) == 0:
-            canonical_to_all[can] = np.array([can], dtype=np.int32)
-        else:
-            unique = np.unique(raw)
-            # Put canonical first; append remaining sorted
-            others = unique[unique != can]
-            canonical_to_all[can] = np.concatenate(([can], others)).astype(np.int32)
+    return all_reps
 
-    return canonical_to_all
+
+def batch_moves_to_all_reps(
+    legal_np:  np.ndarray,     # (B, MAX_L, 6) uint8
+    nlegal_np: np.ndarray,     # (B,) int32
+    occ_cpu:   np.ndarray,     # (B, MAX_BOARD) int32
+    nocc_cpu:  np.ndarray,     # (B,) int32
+    prs_from_move: list[np.ndarray],  # list of B arrays, each (n_legal_i,) int32
+) -> list[np.ndarray]:
+    """Compute all_reps for each game in the batch. Returns list of (n_legal_i, 6) arrays."""
+    B = len(nlegal_np)
+    result = []
+    for i in range(B):
+        nl_i = int(nlegal_np[i])
+        no_i = int(nocc_cpu[i])
+        result.append(moves_to_all_reps(
+            legal_np[i], nl_i, occ_cpu[i, :no_i], prs_from_move[i],
+        ))
+    return result
 
 
 # ── Batch vectorised conversion (fast path) ────────────────────────────────────

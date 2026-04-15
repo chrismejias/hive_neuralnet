@@ -15,8 +15,8 @@ import torch
 
 import hive_gpu
 from hive_prs.action_space import (
-    ACTION_SPACE_SIZE, moves_to_action_indices, batch_moves_to_action_indices,
-    MAX_BOARD,
+    ACTION_SPACE_SIZE, moves_to_action_indices, batch_moves_to_all_reps,
+    batch_moves_to_action_indices, MAX_BOARD,
 )
 from hive_prs.prs_encoder import PRSEncoder
 from hive_prs.prs_replay_buffer import PRSTrainingExample
@@ -101,6 +101,30 @@ class PRSGumbelOrchestrator:
                     vj = np.where(valid)[0].astype(np.int16)
                     prs_to_j[i, vp[::-1]] = vj[::-1]   # reverse: first j wins
 
+            # Extend prs_to_j with all reps (non-canonical → same move column j)
+            # all_reps_per_game[i] is (n_legal_i, 6) int32, col 0 = canonical
+            all_reps_per_game = batch_moves_to_all_reps(
+                legal_np, nlegal_np, occ_cpu, nocc_cpu, prs_from_move,
+            )
+            for i in range(B):
+                reps_i = all_reps_per_game[i]  # (n_legal_i, 6)
+                if reps_i.shape[0] == 0:
+                    continue
+                can_col = reps_i[:, 0]  # canonical PRS indices
+                valid_can = (can_col >= 0) & (can_col < ACTION_SPACE_SIZE)
+                j_vals = prs_to_j[i, can_col[valid_can].clip(0, ACTION_SPACE_SIZE - 1)]
+                has_j = j_vals >= 0
+                # Scatter alt reps (columns 1-5) into prs_to_j
+                for d in range(1, 6):
+                    alt_col = reps_i[valid_can, d]
+                    alt_valid = (alt_col >= 0) & (alt_col < ACTION_SPACE_SIZE) & has_j
+                    if alt_valid.any():
+                        alt_prs = alt_col[alt_valid]
+                        alt_j = j_vals[alt_valid]
+                        # Only set if not already mapped
+                        unmapped = prs_to_j[i, alt_prs] < 0
+                        prs_to_j[i, alt_prs[unmapped]] = alt_j[unmapped]
+
             prs_to_j_t = torch.from_numpy(prs_to_j).to("cuda")   # (B, A) int16
             prs_mask    = prs_to_j_t >= 0                          # (B, A) bool
 
@@ -134,6 +158,19 @@ class PRSGumbelOrchestrator:
             perturbed_topk, topk_actions = torch.topk(perturbed_dense, max_k, dim=1)
             # topk_actions: (B, max_k) global PRS indices — no extra gather needed
 
+            # Deduplicate Gumbel top-K by physical move
+            topk_j = prs_to_j[np.arange(B)[:, None], topk_actions.cpu().numpy()].astype(np.int32)
+            dedup_ok = np.ones((B, max_k), dtype=bool)
+            for b in range(B):
+                seen = set()
+                for k_i in range(max_k):
+                    j = int(topk_j[b, k_i])
+                    if j < 0 or j in seen:
+                        dedup_ok[b, k_i] = False
+                    else:
+                        seen.add(j)
+            cand_mask_dedup = torch.from_numpy(dedup_ok).cuda()
+
             # ── 6. Sequential halving ──
             q_sums       = torch.zeros(B, max_k, device="cuda")
             visit_counts = torch.zeros(B, max_k, dtype=torch.int32, device="cuda")
@@ -141,6 +178,7 @@ class PRSGumbelOrchestrator:
             # Vectorised cand_mask: replaces B .item() CUDA syncs with one comparison.
             k_range   = torch.arange(max_k, device="cuda").unsqueeze(0)  # (1, max_k)
             cand_mask = k_range < eff_k.to(torch.int64).unsqueeze(1)     # (B, max_k)
+            cand_mask = cand_mask & cand_mask_dedup  # remove duplicate reps of same physical move
 
             # Sequential halving: ONE batched NN call per round evaluates all
             # surviving (game × candidate) pairs simultaneously.
@@ -236,6 +274,7 @@ class PRSGumbelOrchestrator:
                     "nn_prior":         nn_prior_np[i].copy(), # (A,) float32
                     "turn":             int(turns_np[i]),
                     "prs_from_move":    prs_from_move[i].copy(),  # (n_legal,) int32
+                    "all_reps":         all_reps_per_game[i].copy(),  # (n_legal, 6) int32
                 })
 
             # ── 9. Apply selected moves ──
@@ -460,32 +499,69 @@ class PRSGumbelOrchestrator:
                 else:
                     value = -1.0 if player_is_white else 1.0
 
-                # Dense policy from sparse (topk_actions, probs)
-                topk = step["topk_actions"]
-                prob = step["probs"]
-                policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
-                for ai, p in zip(topk, prob):
-                    ai = int(ai)
-                    if 0 <= ai < ACTION_SPACE_SIZE:
-                        policy[ai] = float(p)
+                # Dense policy from sparse (topk_actions, probs),
+                # spread across all reps of each physical move
+                topk = step["topk_actions"]   # (max_k,)
+                prob = step["probs"]          # (max_k,) float32
+                all_reps = step["all_reps"]   # (n_legal, 6) int32
 
-                # Mark all legal moves with epsilon floor so loss masks correctly
-                prs_lm = step["prs_from_move"]  # (n_legal,) int32
-                valid_legal = np.array(
-                    [p for p in prs_lm if 0 <= p < ACTION_SPACE_SIZE], dtype=np.int32
-                )
-                if len(valid_legal) > 0:
-                    policy[valid_legal] = np.maximum(policy[valid_legal], 1e-4)
+                # Canonical index per legal move (col 0 of all_reps)
+                can_indices = all_reps[:, 0] if all_reps.shape[0] > 0 else np.empty(0, dtype=np.int32)
+
+                # Map topk PRS indices → prob, vectorized
+                policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+                canonical_policy = np.zeros(ACTION_SPACE_SIZE, dtype=np.float32)
+
+                # Scatter topk probs to canonical positions
+                topk_valid = (topk >= 0) & (topk < ACTION_SPACE_SIZE)
+                valid_topk = topk[topk_valid].astype(np.int32)
+                valid_prob = prob[topk_valid]
+                np.add.at(canonical_policy, valid_topk, valid_prob)
+
+                # For each canonical index with probability, spread across all reps
+                if all_reps.shape[0] > 0:
+                    # Build canonical→row lookup for legal moves
+                    can_to_row = np.full(ACTION_SPACE_SIZE, -1, dtype=np.int32)
+                    valid_can = (can_indices >= 0) & (can_indices < ACTION_SPACE_SIZE)
+                    can_to_row[can_indices[valid_can]] = np.where(valid_can)[0].astype(np.int32)
+
+                    for idx in range(len(valid_topk)):
+                        can_prs = int(valid_topk[idx])
+                        p_can = float(valid_prob[idx])
+                        row = can_to_row[can_prs]
+                        if row < 0:
+                            policy[can_prs] += p_can
+                            continue
+                        reps = all_reps[row]
+                        reps_valid = reps[(reps >= 0) & (reps < ACTION_SPACE_SIZE)]
+                        n_reps = len(reps_valid)
+                        if n_reps > 0:
+                            p_each = p_can / n_reps
+                            policy[reps_valid] += p_each
+                        else:
+                            policy[can_prs] += p_can
+                else:
+                    policy[valid_topk] += valid_prob
+
+                # Epsilon floor on all legal reps (vectorized)
+                all_legal = all_reps.ravel()
+                all_legal = all_legal[(all_legal >= 0) & (all_legal < ACTION_SPACE_SIZE)]
+                if len(all_legal) > 0:
+                    all_legal = np.unique(all_legal)
+                    policy[all_legal] = np.maximum(policy[all_legal], 1e-4)
                 psum = policy.sum()
                 if psum > 0:
                     policy /= psum
 
-                # Surprise weight
+                # Surprise weight — use canonical-aggregated policy for KL
                 nn_prior = step["nn_prior"]
-                mask = policy > 0
+                csum = canonical_policy.sum()
+                if csum > 0:
+                    canonical_policy /= csum
+                mask = canonical_policy > 0
                 sw = 1.0
                 if mask.any():
-                    p_pos = policy[mask]
+                    p_pos = canonical_policy[mask]
                     q_pos = np.clip(nn_prior[mask], 1e-8, 1.0)
                     kl = float(np.sum(p_pos * np.log(p_pos / q_pos)))
                     sw = max(0.1, 1.0 + kl)

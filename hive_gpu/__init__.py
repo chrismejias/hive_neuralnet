@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import warnings
 import torch
 from torch.utils.cpp_extension import load
 
@@ -82,11 +83,82 @@ def load_extension():
     # Initialize constant memory tables
     _extension.initialize_tables()
 
-    # Verify the extension has all required native methods.
-    if not hasattr(_extension, "legal_moves_to_actions_batch"):
-        raise RuntimeError(
-            "The compiled hive_gpu extension is missing 'legal_moves_to_actions_batch'. "
-            "Rebuild the extension: pip install -e hive_gpu/"
-        )
+    _patch_missing_methods(_extension)
 
     return _extension
+
+
+def _patch_missing_methods(ext) -> None:
+    """Attach Python fallbacks for methods missing from older compiled extensions."""
+    if hasattr(ext, "legal_moves_to_actions_batch"):
+        return
+
+    warnings.warn(
+        "hive_gpu extension missing 'legal_moves_to_actions_batch'; "
+        "falling back to a slower Python implementation. "
+        "Rebuild the extension for best Gumbel performance.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+    import numpy as np
+
+    BOARD_SIZE = ext.BOARD_SIZE
+    HALF = BOARD_SIZE // 2
+    ENC_GRID = ext.ENC_GRID
+    ENC_HALF = ENC_GRID // 2
+    NUM_ENC = ENC_GRID * ENC_GRID
+    PASS_IDX = ext.PASS_ACTION_INDEX
+    MOVE_OFFSET = ext.MOVEMENT_OFFSET
+    MAX_LEGAL = ext.MAX_LEGAL_MOVES
+
+    def _gpu_move_to_action(move_raw, center_q: int, center_r: int) -> int:
+        m_type = int(move_raw[0])
+        m_pt = int(move_raw[1])
+        m_from = int(move_raw[2]) | (int(move_raw[3]) << 8)
+        m_to = int(move_raw[4]) | (int(move_raw[5]) << 8)
+        if m_type == 2:
+            return PASS_IDX
+        if m_type == 0:
+            to_q = m_to % BOARD_SIZE - HALF
+            to_r = m_to // BOARD_SIZE - HALF
+            ec = to_q - center_q + ENC_HALF
+            er = to_r - center_r + ENC_HALF
+            if ec < 0 or ec >= ENC_GRID or er < 0 or er >= ENC_GRID:
+                return -1
+            return (m_pt - 1) * NUM_ENC + er * ENC_GRID + ec
+
+        fq = m_from % BOARD_SIZE - HALF
+        fr = m_from // BOARD_SIZE - HALF
+        tq = m_to % BOARD_SIZE - HALF
+        tr = m_to // BOARD_SIZE - HALF
+        sc = fq - center_q + ENC_HALF
+        sr = fr - center_r + ENC_HALF
+        dc = tq - center_q + ENC_HALF
+        dr = tr - center_r + ENC_HALF
+        if (
+            sc < 0 or sc >= ENC_GRID or sr < 0 or sr >= ENC_GRID
+            or dc < 0 or dc >= ENC_GRID or dr < 0 or dr >= ENC_GRID
+        ):
+            return -1
+        return MOVE_OFFSET + (sr * ENC_GRID + sc) * NUM_ENC + (dr * ENC_GRID + dc)
+
+    def legal_moves_to_actions_batch_py(
+        states_tensor: "torch.Tensor",
+        legal_moves_tensor: "torch.Tensor",
+        num_legal_tensor: "torch.Tensor",
+        batch_size: int,
+    ) -> "torch.Tensor":
+        centroids = ext.compute_centroids_batch(states_tensor, batch_size).cpu().numpy()
+        moves_np = legal_moves_tensor.cpu().numpy()
+        num_np = num_legal_tensor.cpu().numpy()
+        result = np.full((batch_size, MAX_LEGAL), -1, dtype=np.int32)
+        for i in range(batch_size):
+            cq = int(round(centroids[i, 0]))
+            cr = int(round(centroids[i, 1]))
+            n = int(num_np[i])
+            for m in range(n):
+                result[i, m] = _gpu_move_to_action(moves_np[i, m], cq, cr)
+        return torch.tensor(result, dtype=torch.int32, device="cuda")
+
+    ext.legal_moves_to_actions_batch = legal_moves_to_actions_batch_py

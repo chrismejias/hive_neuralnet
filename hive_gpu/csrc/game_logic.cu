@@ -21,6 +21,8 @@
 #include "state_encoder.cuh"
 #include "mobility.cuh"
 #include "mcts_tree.cuh"
+#include "fnn_features.cuh"
+#include "fnn_selfplay.cuh"
 
 namespace hive_gpu {
 
@@ -650,6 +652,103 @@ void mcts_apply_root_noise(
         static_cast<const int*>(root_nodes.data_ptr()),
         max_children_pad, dir_eps, root_policy_temp, B);
     // No sync: same-stream ordering; next op sees updated priors correctly.
+}
+
+/**
+ * Extract FNN board features directly from HiveState + legal moves.
+ * Bypasses full encode_states_batch pipeline for ~5x speedup.
+ * Returns: features [B, FNN_FEAT_DIM] float32
+ */
+at::Tensor extract_fnn_features_batch(
+    at::Tensor states_tensor,
+    at::Tensor legal_moves_tensor,
+    at::Tensor num_legal_tensor,
+    int batch_size
+) {
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto features = at::zeros({batch_size, (int64_t)FNN_FEAT_DIM}, opts_f);
+
+    HiveState* states_ptr = reinterpret_cast<HiveState*>(states_tensor.data_ptr());
+    GPUMove* moves_ptr = reinterpret_cast<GPUMove*>(legal_moves_tensor.data_ptr());
+    int* num_legal_ptr = static_cast<int*>(num_legal_tensor.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    extract_fnn_features_kernel<<<blocks, threads>>>(
+        states_ptr, moves_ptr, num_legal_ptr,
+        static_cast<float*>(features.data_ptr()),
+        batch_size);
+    // No sync: null-stream ordering sufficient for GPU-to-GPU.
+
+    return features;
+}
+
+/**
+ * GPU-native Gumbel AlphaZero self-play with FNN.
+ *
+ * Runs the complete self-play loop on GPU: move generation, feature
+ * extraction, FNN forward pass, Gumbel sequential halving, and move
+ * application — all in a single kernel launch.
+ *
+ * Returns: (states, policy_probs, policy_indices, num_legal,
+ *           num_candidates, lengths, results)
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor>
+fnn_selfplay_batch(
+    at::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    int batch_size, int max_game_length,
+    int num_simulations, int max_considered,
+    float c_visit, float c_scale,
+    int temperature_drop_move, int expansion_mask,
+    int64_t rng_seed
+) {
+    auto dev = weights.device();
+    auto opts_u8 = at::TensorOptions().dtype(c10::kByte).device(dev);
+    auto opts_f32 = at::TensorOptions().dtype(c10::kFloat).device(dev);
+    auto opts_i32 = at::TensorOptions().dtype(c10::kInt).device(dev);
+
+    int ss = (int)sizeof(HiveState);
+
+    auto out_states = at::zeros(
+        {batch_size, max_game_length, (int64_t)ss}, opts_u8);
+    auto out_policy_probs = at::zeros(
+        {batch_size, max_game_length, (int64_t)max_considered}, opts_f32);
+    auto out_policy_indices = at::full(
+        {batch_size, max_game_length, (int64_t)max_considered}, -1, opts_i32);
+    auto out_num_legal = at::zeros(
+        {batch_size, (int64_t)max_game_length}, opts_i32);
+    auto out_num_candidates = at::zeros(
+        {batch_size, (int64_t)max_game_length}, opts_i32);
+    auto out_lengths = at::zeros({batch_size}, opts_i32);
+    auto out_results = at::zeros({batch_size}, opts_i32);
+
+    dim3 grid(batch_size);
+    dim3 block(SELFPLAY_BLOCK_SIZE);
+
+    fnn_selfplay_kernel<<<grid, block>>>(
+        weights.data_ptr<float>(),
+        hidden_dim, embed_dim, action_hidden,
+        out_states.data_ptr<uint8_t>(),
+        out_policy_probs.data_ptr<float>(),
+        out_policy_indices.data_ptr<int>(),
+        out_num_legal.data_ptr<int>(),
+        out_num_candidates.data_ptr<int>(),
+        out_lengths.data_ptr<int>(),
+        out_results.data_ptr<int>(),
+        batch_size, max_game_length,
+        num_simulations, max_considered,
+        c_visit, c_scale,
+        temperature_drop_move, expansion_mask,
+        rng_seed, ss
+    );
+
+    // Synchronize — kernel may run for seconds
+    cudaDeviceSynchronize();
+
+    return {out_states, out_policy_probs, out_policy_indices,
+            out_num_legal, out_num_candidates, out_lengths, out_results};
 }
 
 }  // namespace hive_gpu

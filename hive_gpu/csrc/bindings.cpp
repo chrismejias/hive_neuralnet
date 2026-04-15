@@ -13,6 +13,7 @@
 #include <torch/extension.h>
 #include "hive_state.cuh"
 #include "state_encoder.cuh"  // for encoder constants (kernel guarded by __CUDACC__)
+#include "fnn_features.cuh"   // for FNN_FEAT_DIM constant
 #include "mcts_tree.cuh"     // for tree constants
 
 namespace hive_gpu {
@@ -41,6 +42,23 @@ torch::Tensor legal_moves_to_actions_batch(
     torch::Tensor legal_moves_tensor,
     torch::Tensor num_legal_tensor,
     int batch_size);
+torch::Tensor extract_fnn_features_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    int batch_size);
+
+// GPU-native FNN self-play
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor>
+fnn_selfplay_batch(
+    torch::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    int batch_size, int max_game_length,
+    int num_simulations, int max_considered,
+    float c_visit, float c_scale,
+    int temperature_drop_move, int expansion_mask,
+    int64_t rng_seed);
 
 // GPU-native MCTS
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -148,6 +166,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("states"), py::arg("legal_moves"), py::arg("num_legal"),
           py::arg("batch_size"));
 
+    m.def("extract_fnn_features_batch", &hive_gpu::extract_fnn_features_batch,
+          "Extract FNN board features directly from HiveState + legal moves",
+          py::arg("states"), py::arg("legal_moves"), py::arg("num_legal"),
+          py::arg("batch_size"));
+
+    // ── GPU-native FNN self-play ────────────────────────────────────
+    m.def("fnn_selfplay_batch", &hive_gpu::fnn_selfplay_batch,
+          "GPU-native Gumbel AlphaZero self-play with FNN",
+          py::arg("weights"), py::arg("hidden_dim"), py::arg("embed_dim"),
+          py::arg("action_hidden"), py::arg("batch_size"),
+          py::arg("max_game_length"), py::arg("num_simulations"),
+          py::arg("max_considered"), py::arg("c_visit"), py::arg("c_scale"),
+          py::arg("temperature_drop_move"), py::arg("expansion_mask"),
+          py::arg("rng_seed"));
+
     // ── GPU-native MCTS ────────────────────────────────────────────
     m.def("mcts_select_batch", &hive_gpu::mcts_select_batch,
           "MCTS PUCT selection (GPU-native) — root_nodes enables tree reuse");
@@ -182,4 +215,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MOVEMENT_OFFSET") = hive_gpu::MOVEMENT_OFFSET;
     m.attr("DEFAULT_MAX_TREE_NODES") = hive_gpu::DEFAULT_MAX_TREE_NODES;
     m.attr("MAX_TREE_DEPTH") = hive_gpu::MAX_TREE_DEPTH;
+    m.attr("FNN_FEAT_DIM") = hive_gpu::FNN_FEAT_DIM;
 }
