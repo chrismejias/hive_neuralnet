@@ -5,8 +5,7 @@ Tree priors come from the screening head (cheap, move-feature-conditioned).
 Leaf values come from the value head applied to root_cls.  The tree uses
 per-legal-move dense priors — no ACTION_SPACE indirection.
 
-Unlike the flat MCGumbelOrchestrator which only evaluates candidates once,
-this orchestrator performs true multi-ply MCTS: each simulation extends the
+This orchestrator performs true multi-ply MCTS: each simulation extends the
 tree by one node via PUCT selection, and Sequential Halving at the root is
 implemented via an alive-mask over root children.
 """

@@ -15,7 +15,6 @@ from hive_engine.device import get_device
 from hive_engine.elo import EloTracker
 from hive_gpu.gpu_encoder import GPUTransformerEncoder
 from hive_mc.mc_mcts_orchestrator import MCMCTSConfig, MCMCTSOrchestrator
-from hive_mc.mc_orchestrator import MCGumbelConfig, MCGumbelOrchestrator
 from hive_mc.mc_replay_buffer import MCReplayBuffer, MCTrainingBatch
 from hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
 from hive_mc.mc_utils import build_move_conditioned_batch, flat_to_padded
@@ -50,9 +49,6 @@ class MCTrainConfig:
     nn_max_batch: int = 0
     device: str | None = None
     use_amp: bool | None = None
-
-    # If True, use the legacy flat 1-ply Gumbel orchestrator; default is MCTS.
-    flat_gumbel: bool = False
 
 
 def _policy_cross_entropy(
@@ -164,32 +160,18 @@ class MCTrainer:
     def _self_play(self) -> tuple[list, dict]:
         cfg = self.config
         self.best_net.eval()
-        if cfg.flat_gumbel:
-            orch = MCGumbelOrchestrator(
-                self.best_net,
-                MCGumbelConfig(
-                    num_simulations=cfg.mcts_simulations,
-                    max_num_considered_actions=cfg.max_num_considered,
-                    temperature=cfg.temperature,
-                    temperature_drop_move=cfg.temperature_drop_move,
-                    batch_size=cfg.games_per_batch,
-                    max_game_length=cfg.max_game_length,
-                    expansion_mask=cfg.expansion_mask,
-                ),
-            )
-        else:
-            orch = MCMCTSOrchestrator(
-                self.best_net,
-                MCMCTSConfig(
-                    num_simulations=cfg.mcts_simulations,
-                    max_num_considered_actions=cfg.max_num_considered,
-                    temperature=cfg.temperature,
-                    temperature_drop_move=cfg.temperature_drop_move,
-                    batch_size=cfg.games_per_batch,
-                    max_game_length=cfg.max_game_length,
-                    expansion_mask=cfg.expansion_mask,
-                ),
-            )
+        orch = MCMCTSOrchestrator(
+            self.best_net,
+            MCMCTSConfig(
+                num_simulations=cfg.mcts_simulations,
+                max_num_considered_actions=cfg.max_num_considered,
+                temperature=cfg.temperature,
+                temperature_drop_move=cfg.temperature_drop_move,
+                batch_size=cfg.games_per_batch,
+                max_game_length=cfg.max_game_length,
+                expansion_mask=cfg.expansion_mask,
+            ),
+        )
         raw = orch.self_play_batch()
         flat = []
         stats = {"num_games": 0, "white_wins": 0, "black_wins": 0, "draws": 0}

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
-from hive_mc.mc_orchestrator import MCGumbelOrchestrator, MCGumbelConfig
+from hive_mc.mc_mcts_orchestrator import MCMCTSOrchestrator, MCMCTSConfig
 from hive_mc.mc_replay_buffer import MCReplayBuffer
 from hive_mc.mc_trainer import compute_mc_loss
 from hive_mc.mc_utils import build_move_conditioned_batch
@@ -25,7 +25,7 @@ def main():
 
     # Warm up
     print("Warming up...")
-    orch = MCGumbelOrchestrator(net, MCGumbelConfig(
+    orch = MCMCTSOrchestrator(net, MCMCTSConfig(
         batch_size=4, num_simulations=4, max_num_considered_actions=2, max_game_length=50,
     ))
     orch.self_play_batch()
@@ -33,7 +33,7 @@ def main():
     print("Warm-up done.\n")
 
     # --- Profile self-play ---
-    orch = MCGumbelOrchestrator(net, MCGumbelConfig(
+    orch = MCMCTSOrchestrator(net, MCMCTSConfig(
         batch_size=64, num_simulations=64, max_num_considered_actions=4, max_game_length=300,
     ))
 

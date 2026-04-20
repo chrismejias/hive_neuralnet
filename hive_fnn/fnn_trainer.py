@@ -18,9 +18,6 @@ from hive_engine.elo import EloTracker
 from hive_fnn.fnn_network import FNNConfig, HiveFNN
 from hive_fnn.fnn_mcts_orchestrator import FNNMCTSConfig, FNNMCTSOrchestrator
 from hive_fnn.fnn_puct_orchestrator import FNNPUCTConfig, FNNPUCTOrchestrator
-from hive_fnn.fnn_orchestrator import (
-    FNNCudaOrchestrator, FNNGumbelConfig, _flat_to_padded,
-)
 from hive_fnn.fnn_replay_buffer import FNNReplayBuffer, FNNTrainingBatch
 
 import hive_gpu
@@ -55,9 +52,29 @@ class FNNTrainConfig:
     device: str | None = None
     use_amp: bool | None = None
 
-    # If True, use the legacy flat 1-ply fused-kernel orchestrator; default is MCTS.
-    flat_gumbel: bool = False
     use_puct: bool = False
+
+
+def _flat_to_padded(
+    flat_values: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    pad_value: float = 0.0,
+) -> torch.Tensor:
+    """Convert a flat ragged vector into a padded [B, max_count] tensor."""
+    B = counts.shape[0]
+    if B == 0:
+        return flat_values.new_full((0, 0), pad_value)
+    max_count = int(counts.max().item())
+    if max_count == 0 or flat_values.numel() == 0:
+        return flat_values.new_full((B, max_count), pad_value)
+    col_idx = torch.arange(
+        max_count, device=counts.device, dtype=torch.int64,
+    ).unsqueeze(0)
+    mask = col_idx < counts.unsqueeze(1)
+    out = flat_values.new_full((B, max_count), pad_value)
+    out[mask] = flat_values
+    return out
 
 
 def _policy_cross_entropy(
@@ -164,20 +181,7 @@ class FNNTrainer:
     def _self_play(self) -> tuple[list, dict]:
         cfg = self.config
         self.best_net.eval()
-        if cfg.flat_gumbel:
-            orch = FNNCudaOrchestrator(
-                self.best_net,
-                FNNGumbelConfig(
-                    num_simulations=cfg.mcts_simulations,
-                    max_num_considered_actions=cfg.max_num_considered,
-                    temperature=cfg.temperature,
-                    temperature_drop_move=cfg.temperature_drop_move,
-                    batch_size=cfg.games_per_batch,
-                    max_game_length=cfg.max_game_length,
-                    expansion_mask=cfg.expansion_mask,
-                ),
-            )
-        elif cfg.use_puct:
+        if cfg.use_puct:
             orch = FNNPUCTOrchestrator(
                 self.best_net,
                 FNNPUCTConfig(

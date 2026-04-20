@@ -8,8 +8,8 @@ AlphaZero-style self-play training for the board game [Hive](https://en.wikipedi
 |-------|---------|--------|-----------|
 | Transformer | `hive_gpu` | ~9M | GPU-native batched Gumbel |
 | PRS Transformer | `hive_prs` | 1.3M / 9.7M | Gumbel-root MCTS (v2 default) |
-| FNN (HiveGo-style) | `hive_fnn` | 0.6K – 15K | Gumbel-root MCTS / PUCT MCTS / flat fused-kernel |
-| Move-Conditioned Transformer | `hive_mc` | ~1.1M / ~5M | Gumbel-root MCTS / flat Gumbel |
+| FNN (HiveGo-style) | `hive_fnn` | 0.6K – 15K | Gumbel-root MCTS / PUCT MCTS |
+| Move-Conditioned Transformer | `hive_mc` | ~1.1M / ~5M | Gumbel-root MCTS |
 
 All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels for move generation, state encoding, and legal move lookup.
 
@@ -251,7 +251,6 @@ The entire Gumbel AlphaZero game loop — move generation, feature extraction, F
 
 - **Default:** Gumbel-root MCTS tree search (`FNNMCTSOrchestrator`)
 - **Alternative:** plain PUCT MCTS (`FNNPUCTOrchestrator`) via `--puct`
-- **Legacy:** flat 1-ply fused-kernel Gumbel via `--flat-gumbel`
 
 ### Training
 
@@ -289,7 +288,6 @@ python -m hive_fnn.train_fnn \
 | `--simulations` | 128 | Gumbel simulation budget per move |
 | `--gumbel-considered` | 16 | Root actions considered (k) |
 | `--puct` | off | Use plain PUCT MCTS root policy instead of Gumbel root halving |
-| `--flat-gumbel` | off | Use legacy flat 1-ply fused-kernel Gumbel orchestrator |
 | `--checkpoint-dir` | checkpoints\_fnn | Checkpoint output directory |
 
 ---
@@ -311,7 +309,6 @@ This achieves 3–5× compute savings over evaluating all successors with the fu
 ### Search Patterns
 
 - **Default:** Gumbel-root MCTS tree search (`MCMCTSOrchestrator`)
-- **Legacy:** flat 1-ply Gumbel (`MCGumbelOrchestrator`) via `--flat-gumbel`
 
 ### Training
 
@@ -344,7 +341,6 @@ python -m hive_mc.train_mc \
 | `--iterations` | 1500 | Training iterations |
 | `--games` | 128 | Parallel self-play games per iteration |
 | `--simulations` | 128 | Gumbel simulation budget per move |
-| `--flat-gumbel` | off | Use legacy flat 1-ply Gumbel orchestrator |
 | `--checkpoint-dir` | checkpoints\_mc | Checkpoint output directory |
 
 ---
@@ -403,7 +399,6 @@ hive_gpu/          # CUDA extension, GPU-native MCTS/Gumbel, transformer trainer
     fnn_selfplay.cuh   # Fused Gumbel self-play kernel (FNN)
     state_encoder.cuh  # Transformer state encoding
     mcts_tree.cuh      # GPU-native MCTS tree
-hive_prs/          # PRS Transformer: piece-relative action space (6,841 actions)
 hive_prs/          # PRS v2 default (structured 813-slot head)
   prs_transformer_v2.py        # HivePRSTransformerV2
   prs_mcts_orchestrator_v2.py  # PRS v2 Gumbel-root MCTS
@@ -413,13 +408,11 @@ hive_fnn/          # HiveGo-style FNN with multiple search paths
   fnn_network.py       # HiveFNN: shared encoder + value head + action tower
   fnn_mcts_orchestrator.py  # Gumbel-root MCTS tree search
   fnn_puct_orchestrator.py  # Plain PUCT MCTS tree search
-  fnn_orchestrator.py       # Legacy flat fused-kernel Gumbel path
   fnn_trainer.py       # FNNTrainer training loop
   train_fnn.py         # CLI entry point
 hive_mc/           # Move-conditioned transformer (two-stage: screen → full)
   mc_transformer.py    # HiveMoveTransformer + screening + action heads
   mc_mcts_orchestrator.py  # Gumbel-root MCTS tree search
-  mc_orchestrator.py       # Legacy flat Gumbel path
   mc_trainer.py        # MCTrainer training loop
   train_mc.py          # CLI entry point
 tests/             # Test suite (250+ tests)

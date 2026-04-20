@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from hive_fnn.fnn_network import HiveFNN, FNNConfig
-from hive_fnn.fnn_orchestrator import FNNGumbelOrchestrator, FNNGumbelConfig
+from hive_fnn.fnn_mcts_orchestrator import FNNMCTSOrchestrator, FNNMCTSConfig
 from hive_fnn.fnn_replay_buffer import FNNReplayBuffer
 from hive_fnn.fnn_trainer import compute_fnn_loss
 
@@ -27,12 +27,12 @@ def profile_size(preset_name: str, config: FNNConfig, games: int, sims: int, gum
     print(f"\n{'#'*70}")
     print(f"  FNN {preset_name}: {n_params:,} params")
     print(f"  hidden={config.hidden_dim} embed={config.embed_dim} action_hidden={config.action_hidden}")
-    print(f"  Self-play: {games} games, {sims} sims, {gumbel} Gumbel")
+    print(f"  Self-play: {games} games, {sims} sims, {gumbel} considered")
     print(f"{'#'*70}")
 
     # Warm up
     print("Warming up...")
-    orch = FNNGumbelOrchestrator(net, FNNGumbelConfig(
+    orch = FNNMCTSOrchestrator(net, FNNMCTSConfig(
         batch_size=2, num_simulations=4, max_num_considered_actions=2, max_game_length=20,
     ))
     orch.self_play_batch()
@@ -40,7 +40,7 @@ def profile_size(preset_name: str, config: FNNConfig, games: int, sims: int, gum
     print("Warm-up done.\n")
 
     # --- Profile self-play ---
-    orch = FNNGumbelOrchestrator(net, FNNGumbelConfig(
+    orch = FNNMCTSOrchestrator(net, FNNMCTSConfig(
         batch_size=games, num_simulations=sims, max_num_considered_actions=gumbel,
         max_game_length=300,
     ))
@@ -165,7 +165,7 @@ def main():
         results[name] = (sp, tr)
 
     print(f"\n\n{'='*70}")
-    print(f"COMPARISON SUMMARY ({games} games, {sims} sims, {gumbel} Gumbel)")
+    print(f"COMPARISON SUMMARY ({games} games, {sims} sims, {gumbel} considered)")
     print(f"{'='*70}")
     print(f"{'Preset':<10} {'Params':>8} {'Self-play':>12} {'Training':>12} {'Total':>12}")
     print(f"{'-'*54}")

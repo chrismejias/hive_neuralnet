@@ -10,8 +10,7 @@ successor state, score each successor relative to the root, softmax over
 legal slots. Leaf value comes from the value head applied to the leaf
 root embedding.
 
-Unlike the flat FNNCudaOrchestrator which only evaluates candidates once,
-this orchestrator performs true multi-ply MCTS: each simulation extends
+This orchestrator performs true multi-ply MCTS: each simulation extends
 the tree by one node via PUCT selection, and Sequential Halving at the
 root is implemented via an alive-mask over root children.
 """
