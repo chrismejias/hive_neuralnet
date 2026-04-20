@@ -54,6 +54,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--expansion-mask", type=int, default=0)
     p.add_argument("--draw-keep-rate", type=float, default=1.0)
     p.add_argument("--nn-max-batch",   type=int, default=0)
+    p.add_argument("--flat-gumbel",    action="store_true",
+                   help="Use the legacy flat 1-ply Gumbel orchestrator "
+                        "(no tree search). Default: true MCTS tree search.")
 
     return p.parse_args()
 
@@ -87,6 +90,7 @@ def main() -> None:
         expansion_mask         = args.expansion_mask,
         draw_keep_rate         = args.draw_keep_rate,
         nn_max_batch           = args.nn_max_batch,
+        flat_gumbel            = args.flat_gumbel,
     )
 
     # Print model info

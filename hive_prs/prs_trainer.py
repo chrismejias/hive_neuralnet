@@ -29,6 +29,7 @@ from hive_engine.elo import EloTracker
 from hive_prs.prs_transformer import HivePRSTransformer, PRSConfig
 from hive_prs.prs_replay_buffer import PRSReplayBuffer, PRSTrainingBatch
 from hive_prs.prs_orchestrator import PRSGumbelOrchestrator, PRSGumbelConfig
+from hive_prs.prs_mcts_orchestrator import PRSMCTSOrchestrator, PRSMCTSConfig
 from hive_prs.action_space import ACTION_SPACE_SIZE
 
 
@@ -74,6 +75,9 @@ class PRSTrainConfig:
     draw_keep_rate:            float = 1.0
     expansion_mask:            int   = 0
     nn_max_batch:              int   = 0
+
+    # Gumbel search mode: True = flat 1-ply (legacy), False = true MCTS tree
+    flat_gumbel:               bool  = False
 
     device:                    str | None = None
     use_amp:                   bool | None = None
@@ -231,17 +235,30 @@ class PRSTrainer:
         cfg = self.config
         self.best_net.eval()
 
-        gumbel_cfg = PRSGumbelConfig(
-            num_simulations            = cfg.mcts_simulations,
-            max_num_considered_actions = cfg.max_num_considered,
-            temperature                = cfg.temperature,
-            temperature_drop_move      = cfg.temperature_drop_move,
-            batch_size                 = cfg.games_per_batch,
-            max_game_length            = cfg.max_game_length,
-            expansion_mask             = cfg.expansion_mask,
-            nn_max_batch               = cfg.nn_max_batch,
-        )
-        orchestrator = PRSGumbelOrchestrator(self.best_net, gumbel_cfg)
+        if cfg.flat_gumbel:
+            gumbel_cfg = PRSGumbelConfig(
+                num_simulations            = cfg.mcts_simulations,
+                max_num_considered_actions = cfg.max_num_considered,
+                temperature                = cfg.temperature,
+                temperature_drop_move      = cfg.temperature_drop_move,
+                batch_size                 = cfg.games_per_batch,
+                max_game_length            = cfg.max_game_length,
+                expansion_mask             = cfg.expansion_mask,
+                nn_max_batch               = cfg.nn_max_batch,
+            )
+            orchestrator = PRSGumbelOrchestrator(self.best_net, gumbel_cfg)
+        else:
+            mcts_cfg = PRSMCTSConfig(
+                num_simulations            = cfg.mcts_simulations,
+                max_num_considered_actions = cfg.max_num_considered,
+                temperature                = cfg.temperature,
+                temperature_drop_move      = cfg.temperature_drop_move,
+                batch_size                 = cfg.games_per_batch,
+                max_game_length            = cfg.max_game_length,
+                expansion_mask             = cfg.expansion_mask,
+                nn_max_batch               = cfg.nn_max_batch,
+            )
+            orchestrator = PRSMCTSOrchestrator(self.best_net, mcts_cfg)
         raw_examples = orchestrator.self_play_batch()
 
         stats = {"num_games": 0, "white_wins": 0, "black_wins": 0, "draws": 0}

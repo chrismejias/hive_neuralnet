@@ -5,17 +5,20 @@
  * bypassing the full encode_states_batch pipeline (no per-node features,
  * no edges, no graph construction).
  *
- * Feature layout (FNN_FEAT_DIM = 88):
+ * Feature layout (FNN_FEAT_DIM = 94):
  *   [0:16]   count_on_board    — visible top pieces per type(8) × color(2)
  *   [16:32]  count_in_hand     — hand piece counts per type(8) × color(2)
  *   [32:48]  queen_neighbors   — top pieces adjacent to opponent queen, per type(8) × color(2)
  *   [48:64]  avg_dist_to_opp_q — avg hex distance to opponent queen, per type(8) × color(2)
- *   [64:80]  can_move          — piece type has ≥1 legal MOVE, per type(8) × color(2)
+ *   [64:80]  can_move          — piece type has ≥1 legal MOVE attributable to owner, per type(8) × color(2)
  *   [80:82]  num_single        — board pieces with 0 occupied neighbors, per color(2)
  *   [82:84]  queen_covered     — queen not on top (beetle covering), per color(2)
  *   [84:86]  num_placement_pos — unique placement destinations from legal moves, per color(2)
  *   [86]     moves_to_draw     — normalized turn count
  *   [87]     move_number       — turn / 100
+ *   [88:90]  pillbug_capable   — owner has an uncovered pillbug OR ground mosquito adjacent to a pillbug, per color(2)
+ *   [90:92]  throwable_own     — own-color pieces adjacent to own pillbug-capable cell, per color(2)
+ *   [92:94]  throwable_opp     — own-color pieces adjacent to opposing pillbug-capable cell (threatened), per color(2)
  *
  * Must be included from game_logic.cu (needs NEIGHBORS constant memory).
  */
@@ -27,7 +30,7 @@
 
 namespace hive_gpu {
 
-constexpr int FNN_FEAT_DIM = 88;
+constexpr int FNN_FEAT_DIM = 94;
 // Draw is at move 200 in standard Hive
 constexpr int DRAW_MOVE_LIMIT = 200;
 
@@ -176,9 +179,18 @@ __device__ inline void extract_fnn_features_device(
         const GPUMove& mv = my_moves[m];
 
         if (mv.type == MOVE_MOVE) {
-            // Mark this piece type × color as "can move"
+            // Mark this piece type × owner-color as "can move". Pillbug throws
+            // (and mosquito-as-pillbug throws) move opponent pieces, so the
+            // piece's actual owner must be read from the board — we cannot
+            // assume the mover equals the current player.
             int pt_idx = (int)mv.piece_type - 1;
-            int flag_bit = pt_idx * 2 + (int)cur;
+            int src_h = s.height[mv.from_cell];
+            Color mover_color = cur;
+            if (src_h > 0) {
+                uint8_t packed = s.pieces[src_h - 1][mv.from_cell];
+                mover_color = cell_color(packed);
+            }
+            int flag_bit = pt_idx * 2 + (int)mover_color;
             can_move_flags |= (1u << flag_bit);
         } else if (mv.type == MOVE_PLACE) {
             // Count unique placement destinations
@@ -215,6 +227,78 @@ __device__ inline void extract_fnn_features_device(
     // ── move_number [87] ────────────────────────────────────
     float t = (float)s.turn / 100.0f;
     f[87] = t < 1.0f ? t : 1.0f;
+
+    // ── pillbug_capable [88:90], throwable_own [90:92], throwable_opp [92:94] ──
+    //
+    // A cell is "pillbug-capable" for color c if:
+    //   (a) c owns a pillbug on top of its stack, OR
+    //   (b) c owns a ground-level mosquito adjacent to ANY pillbug (friendly
+    //       or enemy) — per Hive rules, mosquitoes copy any adjacent piece's
+    //       ability, so such a mosquito inherits the pillbug's throw ability
+    //       for its owner's turn.
+    //
+    // Gate/pin/stun legality is intentionally NOT enforced here — this is a
+    // structural board feature. The `can_move` block already captures the
+    // turn-specific legality for the current player.
+    //
+    // throwable_own[c] = count of c-color top pieces adjacent to c's own
+    //                    pillbug-capable cells (repositioning material).
+    // throwable_opp[c] = count of c-color top pieces adjacent to (1−c)'s
+    //                    pillbug-capable cells (threatened pieces).
+    //
+    // Pieces adjacent to both sides' pillbugs get counted in both buckets,
+    // which is the intended signal (double pressure).
+    constexpr int PB_CELLS_PER_COLOR = 8;   // generous; real games see ≤ 2
+    uint16_t pb_cells[2][PB_CELLS_PER_COLOR];
+    int      pb_count[2] = {0, 0};
+
+    for (int cell = 0; cell < NUM_CELLS; cell++) {
+        int h = s.height[cell];
+        if (h == 0) continue;
+        uint8_t top = s.pieces[h - 1][cell];
+        PieceType pt = cell_piece_type(top);
+        Color pc     = cell_color(top);
+
+        bool is_capable = (pt == PT_PILLBUG);
+
+        if (!is_capable && pt == PT_MOSQUITO && h == 1) {
+            for (int d = 0; d < NUM_DIRS; d++) {
+                int16_t nb = NEIGHBORS[cell][d];
+                if (nb < 0 || s.height[nb] == 0) continue;
+                if (top_piece_type_at(s, nb) == PT_PILLBUG) {
+                    is_capable = true;
+                    break;
+                }
+            }
+        }
+
+        if (is_capable) {
+            f[88 + (int)pc] = 1.0f;
+            if (pb_count[(int)pc] < PB_CELLS_PER_COLOR) {
+                pb_cells[(int)pc][pb_count[(int)pc]++] = (uint16_t)cell;
+            }
+        }
+    }
+
+    for (int c = 0; c < 2; c++) {
+        for (int pi = 0; pi < pb_count[c]; pi++) {
+            int pbc = (int)pb_cells[c][pi];
+            for (int d = 0; d < NUM_DIRS; d++) {
+                int16_t nb = NEIGHBORS[pbc][d];
+                if (nb < 0 || s.height[nb] == 0) continue;
+                uint8_t ntop = s.pieces[s.height[nb] - 1][nb];
+                Color nc = cell_color(ntop);
+                if ((int)nc == c) {
+                    // c's own piece adjacent to c's pillbug — c could reposition it
+                    f[90 + c] += 1.0f;
+                } else {
+                    // Piece owned by nc adjacent to c's pillbug — nc's piece is
+                    // under threat from c's pillbug.
+                    f[92 + (int)nc] += 1.0f;
+                }
+            }
+        }
+    }
 }
 
 __global__ void extract_fnn_features_kernel(

@@ -40,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
     p.add_argument("--expansion-mask", type=int, default=0)
     p.add_argument("--draw-keep-rate", type=float, default=1.0)
+    p.add_argument("--flat-gumbel", action="store_true",
+                   help="Use the legacy flat 1-ply fused-kernel orchestrator "
+                        "(no tree search). Default: MCTS tree search.")
+    p.add_argument("--puct", action="store_true",
+                   help="Use plain PUCT MCTS at the root instead of Gumbel root "
+                        "halving. Implemented in a separate orchestrator file.")
     return p.parse_args()
 
 
@@ -70,6 +76,8 @@ def main() -> None:
         checkpoint_keep_every=args.checkpoint_keep_every,
         expansion_mask=args.expansion_mask,
         draw_keep_rate=args.draw_keep_rate,
+        flat_gumbel=args.flat_gumbel,
+        use_puct=args.puct,
     )
 
     net = HiveFNN(net_config)
@@ -78,6 +86,12 @@ def main() -> None:
     print(f"  Board encoder: {net_config.feat_dim} -> {net_config.hidden_dim} -> {net_config.embed_dim}")
     print(f"  Action tower: {net_config.embed_dim * 2} -> {net_config.action_hidden} -> 1")
     print(f"  Value head: {net_config.embed_dim} -> 1 -> tanh")
+    if args.flat_gumbel:
+        print("  Search: flat Gumbel (legacy fused kernel)")
+    elif args.puct:
+        print("  Search: plain PUCT MCTS")
+    else:
+        print("  Search: Gumbel-root MCTS")
     del net
 
     trainer = FNNTrainer(train_config, net_config)

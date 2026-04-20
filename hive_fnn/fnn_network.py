@@ -23,7 +23,7 @@ from hive_fnn.fnn_features import FEAT_DIM
 
 @dataclass
 class FNNConfig:
-    feat_dim: int = 88  # FNN_FEAT_DIM from CUDA kernel
+    feat_dim: int = 94  # FNN_FEAT_DIM from CUDA kernel
     hidden_dim: int = 32
     embed_dim: int = 32
     action_hidden: int = 32

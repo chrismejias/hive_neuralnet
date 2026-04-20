@@ -109,6 +109,34 @@ torch::Tensor mcts_extract_policy_batch(
     float temperature, int temp_drop_move, float pruning_threshold,
     int B, int max_nodes);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mcts_select_with_root_mask_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor game_active, torch::Tensor root_nodes,
+    torch::Tensor alive_mask, int max_root_children,
+    float c_puct, int B, int W, int max_nodes);
+
+torch::Tensor mcts_expand_dense_priors_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor leaf_indices, torch::Tensor leaf_states,
+    torch::Tensor legal_moves, torch::Tensor num_legal,
+    torch::Tensor priors_per_legal, torch::Tensor results,
+    int B, int total, int max_nodes);
+
+void mcts_expand_and_backprop_dense_priors_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor leaf_indices, torch::Tensor leaf_states,
+    torch::Tensor legal_moves, torch::Tensor num_legal,
+    torch::Tensor priors_per_legal, torch::Tensor results,
+    torch::Tensor nn_values, torch::Tensor vl_paths, torch::Tensor vl_lengths,
+    int B, int total, int max_nodes);
+
 void mcts_apply_root_noise(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
     torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
@@ -116,6 +144,17 @@ void mcts_apply_root_noise(
     torch::Tensor noise, torch::Tensor root_nodes, int max_children_pad,
     float dir_eps, float root_policy_temp,
     int B, int max_nodes);
+
+// PRS v2: slot mapping + head-input bridge (15-tuple of GPU tensors)
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor>
+prs_v2_classify_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    int batch_size, int max_legal);
 
 }  // namespace hive_gpu
 
@@ -196,6 +235,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Extract MCTS policy from root visit counts");
     m.def("mcts_apply_root_noise", &hive_gpu::mcts_apply_root_noise,
           "Apply root policy temperature + Dirichlet noise");
+    m.def("mcts_select_with_root_mask_batch", &hive_gpu::mcts_select_with_root_mask_batch,
+          "MCTS PUCT selection with root alive-mask (Gumbel Sequential Halving)");
+    m.def("mcts_expand_dense_priors_batch", &hive_gpu::mcts_expand_dense_priors_batch,
+          "MCTS expand with per-legal-move priors (no ACTION_SPACE indirection)");
+    m.def("mcts_expand_and_backprop_dense_priors_batch",
+          &hive_gpu::mcts_expand_and_backprop_dense_priors_batch,
+          "Fused MCTS expand + backprop with per-legal-move priors");
+
+    // ── PRS v2: slot mapping + head-input bridge ────────────────────
+    m.def("prs_v2_classify_batch", &hive_gpu::prs_v2_classify_batch,
+          "PRS v2: classify legal moves into 813 slots and build head inputs",
+          py::arg("states"), py::arg("legal_moves"), py::arg("num_legal"),
+          py::arg("batch_size"), py::arg("max_legal"));
 
     // Export constants for Python use
     m.attr("BOARD_SIZE") = hive_gpu::BOARD_SIZE;

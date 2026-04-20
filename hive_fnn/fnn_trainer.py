@@ -16,6 +16,8 @@ import torch.optim as optim
 from hive_engine.device import get_device
 from hive_engine.elo import EloTracker
 from hive_fnn.fnn_network import FNNConfig, HiveFNN
+from hive_fnn.fnn_mcts_orchestrator import FNNMCTSConfig, FNNMCTSOrchestrator
+from hive_fnn.fnn_puct_orchestrator import FNNPUCTConfig, FNNPUCTOrchestrator
 from hive_fnn.fnn_orchestrator import (
     FNNCudaOrchestrator, FNNGumbelConfig, _flat_to_padded,
 )
@@ -52,6 +54,10 @@ class FNNTrainConfig:
     expansion_mask: int = 0
     device: str | None = None
     use_amp: bool | None = None
+
+    # If True, use the legacy flat 1-ply fused-kernel orchestrator; default is MCTS.
+    flat_gumbel: bool = False
+    use_puct: bool = False
 
 
 def _policy_cross_entropy(
@@ -158,18 +164,45 @@ class FNNTrainer:
     def _self_play(self) -> tuple[list, dict]:
         cfg = self.config
         self.best_net.eval()
-        orch = FNNCudaOrchestrator(
-            self.best_net,
-            FNNGumbelConfig(
-                num_simulations=cfg.mcts_simulations,
-                max_num_considered_actions=cfg.max_num_considered,
-                temperature=cfg.temperature,
-                temperature_drop_move=cfg.temperature_drop_move,
-                batch_size=cfg.games_per_batch,
-                max_game_length=cfg.max_game_length,
-                expansion_mask=cfg.expansion_mask,
-            ),
-        )
+        if cfg.flat_gumbel:
+            orch = FNNCudaOrchestrator(
+                self.best_net,
+                FNNGumbelConfig(
+                    num_simulations=cfg.mcts_simulations,
+                    max_num_considered_actions=cfg.max_num_considered,
+                    temperature=cfg.temperature,
+                    temperature_drop_move=cfg.temperature_drop_move,
+                    batch_size=cfg.games_per_batch,
+                    max_game_length=cfg.max_game_length,
+                    expansion_mask=cfg.expansion_mask,
+                ),
+            )
+        elif cfg.use_puct:
+            orch = FNNPUCTOrchestrator(
+                self.best_net,
+                FNNPUCTConfig(
+                    num_simulations=cfg.mcts_simulations,
+                    c_puct=1.25,
+                    temperature=cfg.temperature,
+                    temperature_drop_move=cfg.temperature_drop_move,
+                    batch_size=cfg.games_per_batch,
+                    max_game_length=cfg.max_game_length,
+                    expansion_mask=cfg.expansion_mask,
+                ),
+            )
+        else:
+            orch = FNNMCTSOrchestrator(
+                self.best_net,
+                FNNMCTSConfig(
+                    num_simulations=cfg.mcts_simulations,
+                    max_num_considered_actions=cfg.max_num_considered,
+                    temperature=cfg.temperature,
+                    temperature_drop_move=cfg.temperature_drop_move,
+                    batch_size=cfg.games_per_batch,
+                    max_game_length=cfg.max_game_length,
+                    expansion_mask=cfg.expansion_mask,
+                ),
+            )
         raw = orch.self_play_batch()
         flat = []
         stats = {"num_games": 0, "white_wins": 0, "black_wins": 0, "draws": 0}

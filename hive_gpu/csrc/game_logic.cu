@@ -23,6 +23,7 @@
 #include "mcts_tree.cuh"
 #include "fnn_features.cuh"
 #include "fnn_selfplay.cuh"
+#include "prs_v2_slot.cuh"
 
 namespace hive_gpu {
 
@@ -576,6 +577,110 @@ void mcts_expand_and_backprop_batch(
 }
 
 /**
+ * MCTS select with root alive-mask (for Gumbel Sequential Halving).
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mcts_select_with_root_mask_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor game_active, at::Tensor root_nodes,
+    at::Tensor alive_mask, int max_root_children,
+    float c_puct, int B, int W, int max_nodes
+) {
+    int total = W * B;
+    auto oi = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto ou = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+
+    auto leaf_idx   = at::zeros({total}, oi);
+    auto move_paths = at::zeros({total, MAX_TREE_DEPTH, (int64_t)sizeof(GPUMove)}, ou);
+    auto path_lens  = at::zeros({total}, oi);
+    auto vl_paths   = at::zeros({total, MAX_TREE_DEPTH}, oi);
+    auto vl_lens    = at::zeros({total}, oi);
+
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    mcts_select_with_root_mask_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<int*>(leaf_idx.data_ptr()),
+        static_cast<uint8_t*>(move_paths.data_ptr()),
+        static_cast<int*>(path_lens.data_ptr()),
+        static_cast<int*>(vl_paths.data_ptr()),
+        static_cast<int*>(vl_lens.data_ptr()),
+        static_cast<const int8_t*>(game_active.data_ptr()),
+        static_cast<const int*>(root_nodes.data_ptr()),
+        static_cast<const int8_t*>(alive_mask.data_ptr()),
+        max_root_children,
+        c_puct, B, total);
+
+    return std::make_tuple(leaf_idx, move_paths, path_lens, vl_paths, vl_lens);
+}
+
+/**
+ * MCTS expand with dense per-legal-move priors (no ACTION_SPACE indirection).
+ */
+at::Tensor mcts_expand_dense_priors_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor leaf_indices, at::Tensor leaf_states,
+    at::Tensor legal_moves, at::Tensor num_legal,
+    at::Tensor priors_per_legal, at::Tensor results,
+    int B, int total, int max_nodes
+) {
+    auto was_expanded = at::zeros({total}, at::TensorOptions().dtype(c10::kChar).device(c10::kCUDA));
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    mcts_expand_dense_priors_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<const int*>(leaf_indices.data_ptr()),
+        reinterpret_cast<const HiveState*>(leaf_states.data_ptr()),
+        reinterpret_cast<const GPUMove*>(legal_moves.data_ptr()),
+        static_cast<const int*>(num_legal.data_ptr()),
+        static_cast<const float*>(priors_per_legal.data_ptr()),
+        static_cast<const int*>(results.data_ptr()),
+        static_cast<int8_t*>(was_expanded.data_ptr()),
+        B, total);
+
+    return was_expanded;
+}
+
+/**
+ * MCTS expand + backprop fused (dense-priors variant).
+ */
+void mcts_expand_and_backprop_dense_priors_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor leaf_indices, at::Tensor leaf_states,
+    at::Tensor legal_moves, at::Tensor num_legal,
+    at::Tensor priors_per_legal, at::Tensor results,
+    at::Tensor nn_values, at::Tensor vl_paths, at::Tensor vl_lengths,
+    int B, int total, int max_nodes
+) {
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    mcts_expand_and_backprop_dense_priors_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<const int*>(leaf_indices.data_ptr()),
+        reinterpret_cast<const HiveState*>(leaf_states.data_ptr()),
+        reinterpret_cast<const GPUMove*>(legal_moves.data_ptr()),
+        static_cast<const int*>(num_legal.data_ptr()),
+        static_cast<const float*>(priors_per_legal.data_ptr()),
+        static_cast<const int*>(results.data_ptr()),
+        static_cast<const float*>(nn_values.data_ptr()),
+        static_cast<const int*>(vl_paths.data_ptr()),
+        static_cast<const int*>(vl_lengths.data_ptr()),
+        B, total);
+}
+
+/**
  * MCTS backprop: undo virtual loss, propagate values from leaf to root.
  */
 void mcts_backprop_batch(
@@ -749,6 +854,96 @@ fnn_selfplay_batch(
 
     return {out_states, out_policy_probs, out_policy_indices,
             out_num_legal, out_num_candidates, out_lengths, out_results};
+}
+
+// ── PRS v2 slot mapping + head-input bridge ─────────────────────────
+
+/**
+ * One-shot batched build of all PRS v2 head inputs + per-legal slot indices.
+ *
+ * Inputs:
+ *   states_tensor       : [B, sizeof(HiveState)]  uint8
+ *   legal_moves_tensor  : [B, max_legal, sizeof(GPUMove)] uint8
+ *   num_legal_tensor    : [B]  int32
+ *
+ * Returns a 9-tuple (all on CUDA):
+ *   dir_piece_idx   [B, 8]            int64
+ *   throw_piece_idx [B, 2]            int64
+ *   long_piece_idx  [B, 7]            int64
+ *   move_nbrs       [B, 64, 6]        int64
+ *   place_nbrs      [B, 32, 6]        int64
+ *   move_mask       [B, 64]           bool
+ *   place_mask      [B, 32]           bool
+ *   current_color   [B]               int64
+ *   slot_of_legal   [B, max_legal]    int32   (-1 = padding / un-mappable)
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor>
+prs_v2_classify_batch(
+    at::Tensor states_tensor,
+    at::Tensor legal_moves_tensor,
+    at::Tensor num_legal_tensor,
+    int batch_size, int max_legal
+) {
+    auto opts_i64  = at::TensorOptions().dtype(c10::kLong).device(c10::kCUDA);
+    auto opts_i32  = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto opts_bool = at::TensorOptions().dtype(c10::kBool).device(c10::kCUDA);
+
+    auto dir_piece_idx      = at::full({batch_size, PRS_V2_N_DIR_PIECES},   -1, opts_i64);
+    auto throw_piece_idx    = at::full({batch_size, PRS_V2_N_THROW_PIECES}, -1, opts_i64);
+    auto long_piece_idx     = at::full({batch_size, PRS_V2_N_LONG_PIECES},  -1, opts_i64);
+    auto move_nbrs          = at::full({batch_size, PRS_V2_C_MOVE, NUM_DIRS}, -1, opts_i64);
+    auto place_nbrs         = at::full({batch_size, PRS_V2_C_HAND, NUM_DIRS}, -1, opts_i64);
+    auto move_mask          = at::zeros({batch_size, PRS_V2_C_MOVE}, opts_bool);
+    auto place_mask         = at::zeros({batch_size, PRS_V2_C_HAND}, opts_bool);
+    auto current_color      = at::zeros({batch_size}, opts_i64);
+    auto slot_of_legal      = at::full({batch_size, max_legal}, -1, opts_i32);
+    auto move_cell_ids      = at::full({batch_size, PRS_V2_C_MOVE}, -1, opts_i32);
+    auto place_cell_ids     = at::full({batch_size, PRS_V2_C_HAND}, -1, opts_i32);
+    auto dir_dest_cell      = at::full({batch_size, PRS_V2_N_DIR_PIECES, NUM_DIRS}, -1, opts_i32);
+    auto dir_dest_board_idx = at::full({batch_size, PRS_V2_N_DIR_PIECES, NUM_DIRS}, -1, opts_i64);
+    auto throw_dest_cell    = at::full({batch_size, PRS_V2_N_THROW_PIECES, 30}, -1, opts_i32);
+    auto hand_token_idx     = at::full({batch_size, 16}, -1, opts_i64);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(
+        states_tensor.data_ptr());
+    const GPUMove* moves_ptr = reinterpret_cast<const GPUMove*>(
+        legal_moves_tensor.data_ptr());
+    const int* num_legal_ptr = static_cast<const int*>(num_legal_tensor.data_ptr());
+
+    dim3 grid(batch_size);
+    dim3 block(32);
+    prs_v2_classify_kernel<<<grid, block>>>(
+        states_ptr, moves_ptr, num_legal_ptr,
+        batch_size, max_legal,
+        static_cast<int64_t*>(dir_piece_idx.data_ptr()),
+        static_cast<int64_t*>(throw_piece_idx.data_ptr()),
+        static_cast<int64_t*>(long_piece_idx.data_ptr()),
+        static_cast<int64_t*>(move_nbrs.data_ptr()),
+        static_cast<int64_t*>(place_nbrs.data_ptr()),
+        static_cast<bool*>(move_mask.data_ptr()),
+        static_cast<bool*>(place_mask.data_ptr()),
+        static_cast<int64_t*>(current_color.data_ptr()),
+        static_cast<int32_t*>(slot_of_legal.data_ptr()),
+        static_cast<int32_t*>(move_cell_ids.data_ptr()),
+        static_cast<int32_t*>(place_cell_ids.data_ptr()),
+        static_cast<int32_t*>(dir_dest_cell.data_ptr()),
+        static_cast<int64_t*>(dir_dest_board_idx.data_ptr()),
+        static_cast<int32_t*>(throw_dest_cell.data_ptr()),
+        static_cast<int64_t*>(hand_token_idx.data_ptr())
+    );
+    // No explicit sync; PyTorch null-stream ordering serializes the next op.
+
+    return std::make_tuple(
+        dir_piece_idx, throw_piece_idx, long_piece_idx,
+        move_nbrs, place_nbrs, move_mask, place_mask,
+        current_color, slot_of_legal,
+        move_cell_ids, place_cell_ids,
+        dir_dest_cell, dir_dest_board_idx, throw_dest_cell,
+        hand_token_idx
+    );
 }
 
 }  // namespace hive_gpu

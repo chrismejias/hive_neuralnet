@@ -29,6 +29,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
     p.add_argument("--expansion-mask", type=int, default=0)
     p.add_argument("--draw-keep-rate", type=float, default=1.0)
+    p.add_argument("--flat-gumbel", action="store_true",
+                   help="Use the legacy flat 1-ply Gumbel orchestrator "
+                        "(no tree search). Default: MCTS tree search.")
     return p.parse_args()
 
 
@@ -56,6 +59,7 @@ def main() -> None:
         checkpoint_keep_every=args.checkpoint_keep_every,
         expansion_mask=args.expansion_mask,
         draw_keep_rate=args.draw_keep_rate,
+        flat_gumbel=args.flat_gumbel,
     )
 
     net = HiveMoveTransformer(net_config)
