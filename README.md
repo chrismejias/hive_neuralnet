@@ -155,22 +155,17 @@ docker run --gpus all \
 
 ---
 
-## PRS Transformer (Piece-Relative Space)
+## PRS Transformer (Piece-Relative Space, v2 default)
 
-A smaller model that operates in a **piece-relative action space** of 6,841 actions instead of the engine's position-absolute actions. Each action is encoded as *(actor token, reference token, direction)* — a representation that is invariant to board translation and rotation, generalising better from limited data.
+The default PRS training path now uses **PRS v2**: a structured **813-slot legal-masked head** over dynamic legal move structure. This replaced the old fixed 6,841-action v1 head as the default `train_prs` path.
 
 ### Architecture
 
-- **Action space**: 6,841 = 5,488 MOVE (28×28×7) + 1,344 PLACE (8×28×6) + 8 FIRST\_PLACE + 1 PASS
-- **Policy head**: Factored bilinear scoring — `score(actor, ref, dir) = (Wₐ hᵢ) · ((W_r hⱼ) ⊙ dir_emb[k])` — two `bmm` calls, O(B × tokens × 7 × dk) memory
+- **Policy head**: Structured 813-slot legal-masked head (dynamic legal mapping per state)
 - **Small config** (default): 1.3M parameters — d\_model=128, heads=8, layers=6, dim\_ff=512
 - **Large config**: 9.7M parameters — d\_model=256, heads=16, layers=8, dim\_ff=1024
 
-### Recent Fixes
-
-- **Multi-representation fix**: Each board position can correspond to multiple PRS actions; policy targets now correctly aggregate probability mass across all representations of the same board move, preventing conflicting gradients
-- **Gumbel Q-transform fix**: Corrected inversion sign and temperature sampling logic
-- **~2.5× self-play speedup**: Fused NN evaluation, sparse Gumbel topk, GPU-to-GPU state indexing
+Legacy PRS v1 modules are archived under `archive/legacy_prs_v1`.
 
 ### Training
 
@@ -182,7 +177,7 @@ python -m hive_prs.train_prs \
 # Full training run
 python -m hive_prs.train_prs \
   --iterations 1500 --games 128 --simulations 512 --max-considered 16 \
-  --checkpoint-dir checkpoints_prs
+  --checkpoint-dir checkpoints_prs_v2
 
 # Large model
 python -m hive_prs.train_prs \
@@ -210,7 +205,7 @@ python -m hive_prs.train_prs \
 | `--num-layers` | 6 | Transformer layers |
 | `--dim-ff` | 512 | Feed-forward hidden dimension |
 | `--d-key` | 64 | Bilinear key dimension in policy head |
-| `--checkpoint-dir` | checkpoints\_prs | Checkpoint output directory |
+| `--checkpoint-dir` | checkpoints\_prs\_v2 | Checkpoint output directory |
 | `--resume` | — | Path to checkpoint to resume from |
 
 ---
