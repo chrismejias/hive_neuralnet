@@ -7,9 +7,9 @@ AlphaZero-style self-play training for the board game [Hive](https://en.wikipedi
 | Model | Package | Params | Self-play |
 |-------|---------|--------|-----------|
 | Transformer | `hive_gpu` | ~9M | GPU-native batched Gumbel |
-| PRS Transformer | `hive_prs` | 1.3M / 9.7M | GPU-native batched Gumbel |
-| FNN (HiveGo-style) | `hive_fnn` | 0.6K – 15K | **Fused CUDA kernel** (5.9× faster) |
-| Move-Conditioned Transformer | `hive_mc` | ~1.1M / ~5M | GPU-native batched Gumbel |
+| PRS Transformer | `hive_prs` | 1.3M / 9.7M | Gumbel-root MCTS (v2 default) |
+| FNN (HiveGo-style) | `hive_fnn` | 0.6K – 15K | Gumbel-root MCTS / PUCT MCTS / flat fused-kernel |
+| Move-Conditioned Transformer | `hive_mc` | ~1.1M / ~5M | Gumbel-root MCTS / flat Gumbel |
 
 All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels for move generation, state encoding, and legal move lookup.
 
@@ -167,6 +167,11 @@ The default PRS training path now uses **PRS v2**: a structured **813-slot legal
 
 Legacy PRS v1 modules are archived under `archive/legacy_prs_v1`.
 
+### Search Pattern
+
+- **Default:** Gumbel-root MCTS tree search (`PRSMCTSOrchestratorV2`)
+- Current `train_prs` path is v2-only; legacy PRS-v1 search paths are archived.
+
 ### Training
 
 ```bash
@@ -204,7 +209,8 @@ python -m hive_prs.train_prs \
 | `--num-heads` | 8 | Attention heads |
 | `--num-layers` | 6 | Transformer layers |
 | `--dim-ff` | 512 | Feed-forward hidden dimension |
-| `--d-key` | 64 | Bilinear key dimension in policy head |
+| `--expansion-mask` | 7 | Expansion piece mask: 0=base, 1=+Mosquito, 2=+Ladybug, 4=+Pillbug, 7=all |
+| `--augment-prob` | 0.5 | Probability of C6 rotational augmentation per training batch |
 | `--checkpoint-dir` | checkpoints\_prs\_v2 | Checkpoint output directory |
 | `--resume` | — | Path to checkpoint to resume from |
 
@@ -241,6 +247,12 @@ The entire Gumbel AlphaZero game loop — move generation, feature extraction, F
 |-------|--------------------:|------------:|---------|
 | Self-play | 3.63s | 0.61s | **5.9×** |
 
+### Search Patterns
+
+- **Default:** Gumbel-root MCTS tree search (`FNNMCTSOrchestrator`)
+- **Alternative:** plain PUCT MCTS (`FNNPUCTOrchestrator`) via `--puct`
+- **Legacy:** flat 1-ply fused-kernel Gumbel via `--flat-gumbel`
+
 ### Training
 
 ```bash
@@ -276,6 +288,8 @@ python -m hive_fnn.train_fnn \
 | `--games` | 128 | Parallel self-play games per iteration |
 | `--simulations` | 128 | Gumbel simulation budget per move |
 | `--gumbel-considered` | 16 | Root actions considered (k) |
+| `--puct` | off | Use plain PUCT MCTS root policy instead of Gumbel root halving |
+| `--flat-gumbel` | off | Use legacy flat 1-ply fused-kernel Gumbel orchestrator |
 | `--checkpoint-dir` | checkpoints\_fnn | Checkpoint output directory |
 
 ---
@@ -293,6 +307,11 @@ A two-stage transformer that avoids full successor encoding for every candidate 
 - **Large** (~5M params): d=256, heads=8, layers=6, ff=1024
 
 This achieves 3–5× compute savings over evaluating all successors with the full transformer.
+
+### Search Patterns
+
+- **Default:** Gumbel-root MCTS tree search (`MCMCTSOrchestrator`)
+- **Legacy:** flat 1-ply Gumbel (`MCGumbelOrchestrator`) via `--flat-gumbel`
 
 ### Training
 
@@ -325,6 +344,7 @@ python -m hive_mc.train_mc \
 | `--iterations` | 1500 | Training iterations |
 | `--games` | 128 | Parallel self-play games per iteration |
 | `--simulations` | 128 | Gumbel simulation budget per move |
+| `--flat-gumbel` | off | Use legacy flat 1-ply Gumbel orchestrator |
 | `--checkpoint-dir` | checkpoints\_mc | Checkpoint output directory |
 
 ---
@@ -384,25 +404,25 @@ hive_gpu/          # CUDA extension, GPU-native MCTS/Gumbel, transformer trainer
     state_encoder.cuh  # Transformer state encoding
     mcts_tree.cuh      # GPU-native MCTS tree
 hive_prs/          # PRS Transformer: piece-relative action space (6,841 actions)
-  action_space.py      # Action encoding/decoding, vectorised batch conversion
-  prs_encoder.py       # PRSEncoder: board state → token sequence
-  prs_transformer.py   # HivePRSTransformer + bilinear policy head
-  prs_orchestrator.py  # PRSGumbelOrchestrator: batched Gumbel self-play
-  prs_trainer.py       # PRSTrainer training loop
-  train_prs.py         # CLI entry point
-hive_fnn/          # HiveGo-style FNN with GPU-native fused self-play
+hive_prs/          # PRS v2 default (structured 813-slot head)
+  prs_transformer_v2.py        # HivePRSTransformerV2
+  prs_mcts_orchestrator_v2.py  # PRS v2 Gumbel-root MCTS
+  prs_trainer_v2.py            # PRS v2 trainer
+  train_prs.py                 # CLI entry point (v2 default)
+hive_fnn/          # HiveGo-style FNN with multiple search paths
   fnn_network.py       # HiveFNN: shared encoder + value head + action tower
-  fnn_features.py      # Python feature encoder (calls CUDA kernel)
-  fnn_orchestrator.py  # FNNCudaOrchestrator: calls fused CUDA self-play kernel
+  fnn_mcts_orchestrator.py  # Gumbel-root MCTS tree search
+  fnn_puct_orchestrator.py  # Plain PUCT MCTS tree search
+  fnn_orchestrator.py       # Legacy flat fused-kernel Gumbel path
   fnn_trainer.py       # FNNTrainer training loop
   train_fnn.py         # CLI entry point
 hive_mc/           # Move-conditioned transformer (two-stage: screen → full)
   mc_transformer.py    # HiveMoveTransformer + screening + action heads
-  mc_orchestrator.py   # MCGumbelOrchestrator: batched Gumbel self-play
+  mc_mcts_orchestrator.py  # Gumbel-root MCTS tree search
+  mc_orchestrator.py       # Legacy flat Gumbel path
   mc_trainer.py        # MCTrainer training loop
   train_mc.py          # CLI entry point
 tests/             # Test suite (250+ tests)
-checkpoints/       # Pretrained checkpoints
 archive/           # Archived CPU training code (GNN, NNUE, CPU MCTS)
 Dockerfile         # Container for cloud/RunPod deployment
 ```
