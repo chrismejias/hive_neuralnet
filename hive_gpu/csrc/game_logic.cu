@@ -866,7 +866,7 @@ fnn_selfplay_batch(
  *   legal_moves_tensor  : [B, max_legal, sizeof(GPUMove)] uint8
  *   num_legal_tensor    : [B]  int32
  *
- * Returns a 9-tuple (all on CUDA):
+ * Returns a 16-tuple (all on CUDA):
  *   dir_piece_idx   [B, 8]            int64
  *   throw_piece_idx [B, 2]            int64
  *   long_piece_idx  [B, 7]            int64
@@ -878,7 +878,7 @@ fnn_selfplay_batch(
  *   slot_of_legal   [B, max_legal]    int32   (-1 = padding / un-mappable)
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-           at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>
 prs_v2_classify_batch(
@@ -904,6 +904,7 @@ prs_v2_classify_batch(
     auto place_cell_ids     = at::full({batch_size, PRS_V2_C_HAND}, -1, opts_i32);
     auto dir_dest_cell      = at::full({batch_size, PRS_V2_N_DIR_PIECES, NUM_DIRS}, -1, opts_i32);
     auto dir_dest_board_idx = at::full({batch_size, PRS_V2_N_DIR_PIECES, NUM_DIRS}, -1, opts_i64);
+    auto dir_dest_nbrs      = at::full({batch_size, PRS_V2_N_DIR_PIECES, NUM_DIRS, NUM_DIRS}, -1, opts_i64);
     auto throw_dest_cell    = at::full({batch_size, PRS_V2_N_THROW_PIECES, 30}, -1, opts_i32);
     auto hand_token_idx     = at::full({batch_size, 16}, -1, opts_i64);
 
@@ -931,6 +932,7 @@ prs_v2_classify_batch(
         static_cast<int32_t*>(place_cell_ids.data_ptr()),
         static_cast<int32_t*>(dir_dest_cell.data_ptr()),
         static_cast<int64_t*>(dir_dest_board_idx.data_ptr()),
+        static_cast<int64_t*>(dir_dest_nbrs.data_ptr()),
         static_cast<int32_t*>(throw_dest_cell.data_ptr()),
         static_cast<int64_t*>(hand_token_idx.data_ptr())
     );
@@ -941,7 +943,7 @@ prs_v2_classify_batch(
         move_nbrs, place_nbrs, move_mask, place_mask,
         current_color, slot_of_legal,
         move_cell_ids, place_cell_ids,
-        dir_dest_cell, dir_dest_board_idx, throw_dest_cell,
+        dir_dest_cell, dir_dest_board_idx, dir_dest_nbrs, throw_dest_cell,
         hand_token_idx
     );
 }

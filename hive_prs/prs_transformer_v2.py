@@ -1,10 +1,10 @@
 """
 PRS v2 transformer: trunk + structured 813-slot policy head.
 
-The trunk body (token embeddings + TransformerEncoder + value head) is
-identical to v1; only the policy head is replaced. This module exposes a
-split API because the new head needs per-state SlotMapper inputs that the
-caller builds on CPU from raw state bytes:
+    The trunk body (token embeddings + TransformerEncoder + value head) is
+    identical to v1; only the policy head is replaced. This module exposes a
+    split API because the new head needs per-state SlotMapper inputs that the
+    caller builds on CPU from raw state bytes:
 
     board_h, cls_h, value = net.forward_trunk(prs_batch)
     inp = build_head_inputs_from_states(state_bytes, board_h, cls_h)

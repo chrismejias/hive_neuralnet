@@ -348,7 +348,7 @@ class PRSTrainerV2:
         print(f"  Saved: {path}")
 
     def load_checkpoint(self, path: str) -> None:
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.best_net.load_state_dict(ckpt["model_state"])
         self._start_iter = ckpt["iteration"] + 1
         print(f"Resumed from {path} (iter {ckpt['iteration']})")

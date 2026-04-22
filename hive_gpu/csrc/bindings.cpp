@@ -145,9 +145,9 @@ void mcts_apply_root_noise(
     float dir_eps, float root_policy_temp,
     int B, int max_nodes);
 
-// PRS v2: slot mapping + head-input bridge (15-tuple of GPU tensors)
+// PRS v2: slot mapping + head-input bridge (16-tuple of GPU tensors)
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor>
 prs_v2_classify_batch(

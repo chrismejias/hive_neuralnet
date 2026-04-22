@@ -190,6 +190,7 @@ def build_head_inputs_from_states(
     place_cellid_np = np.full((B, C_HAND),         -1, dtype=np.int32)
     dir_dest_np     = np.full((B, 8, 6),           -1, dtype=np.int32)
     dir_destb_np    = np.full((B, 8, 6),           -1, dtype=np.int64)
+    dir_destnbr_np  = np.full((B, 8, 6, 6),        -1, dtype=np.int64)
     throw_dest_np   = np.full((B, 2, 30),          -1, dtype=np.int32)
     hand_tokidx_np  = np.full((B, 16),             -1, dtype=np.int64)
     current_color_np = np.zeros(B, dtype=np.int64)
@@ -225,6 +226,9 @@ def build_head_inputs_from_states(
         place_cellid_np[b] = pci
 
         # dir-destination per piece slot
+        cell_to_board_idx = np.full(529, -1, dtype=np.int64)
+        for i, c in enumerate(occ_cells):
+            cell_to_board_idx[c] = i
         for slot_i, (pt, rank) in enumerate(dir_layout):
             cells = mapper.by_type.get(pt, [])
             if rank < len(cells):
@@ -232,6 +236,14 @@ def build_head_inputs_from_states(
                 dc, db = _dir_dest_for_piece(fc, pt, heights, occ_cells)
                 dir_dest_np[b, slot_i]  = dc
                 dir_destb_np[b, slot_i] = db
+                for d in range(6):
+                    dest = int(dc[d])
+                    if dest < 0:
+                        continue
+                    for nd in range(6):
+                        nb = NEIGHBORS[dest, nd]
+                        if nb >= 0:
+                            dir_destnbr_np[b, slot_i, d, nd] = cell_to_board_idx[nb]
 
         # throw-destination per thrower (P at slot 0, M at slot 1)
         for slot_i, pt in enumerate((PT_PILLBUG, PT_MOSQUITO)):
@@ -259,6 +271,7 @@ def build_head_inputs_from_states(
         place_cell_ids     = to_dev(place_cellid_np, dt=torch.int32),
         dir_dest_cell      = to_dev(dir_dest_np, dt=torch.int32),
         dir_dest_board_idx = to_dev(dir_destb_np),
+        dir_dest_nbrs      = to_dev(dir_destnbr_np),
         throw_dest_cell    = to_dev(throw_dest_np, dt=torch.int32),
         hand_token_idx     = to_dev(hand_tokidx_np),
         current_color      = to_dev(current_color_np),
@@ -282,7 +295,7 @@ def build_head_inputs_from_kernel(
      move_nbrs, place_nbrs, move_mask, place_mask,
      current_color, slot_of_legal,
      move_cell_ids, place_cell_ids,
-     dir_dest_cell, dir_dest_board_idx, throw_dest_cell,
+     dir_dest_cell, dir_dest_board_idx, dir_dest_nbrs, throw_dest_cell,
      hand_token_idx) = kernel_out
     inp = PRSv2HeadInputs(
         board_h            = board_h,
@@ -299,6 +312,7 @@ def build_head_inputs_from_kernel(
         place_cell_ids     = place_cell_ids,
         dir_dest_cell      = dir_dest_cell,
         dir_dest_board_idx = dir_dest_board_idx,
+        dir_dest_nbrs      = dir_dest_nbrs,
         throw_dest_cell    = throw_dest_cell,
         hand_token_idx     = hand_token_idx,
         current_color      = current_color,

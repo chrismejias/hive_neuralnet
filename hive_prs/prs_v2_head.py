@@ -88,6 +88,7 @@ class PRSv2HeadInputs:
     # Destination info for dir / throw heads
     dir_dest_cell:      torch.Tensor      # (B, 8, 6)   int32 cell or -1
     dir_dest_board_idx: torch.Tensor      # (B, 8, 6)   int64 board-token idx or -1
+    dir_dest_nbrs:      torch.Tensor      # (B, 8, 6, 6) int64 adjacent board-token idx
     throw_dest_cell:    torch.Tensor      # (B, 2, 30)  int32 cell or -1
 
     # Trunk seq position per (color*8 + type) hand slot; -1 if hand count==0
@@ -240,6 +241,30 @@ class PRSv2PolicyHead(nn.Module):
         active = (cell_ids >= 0).to(pooled.dtype).unsqueeze(-1)
         return pooled * active
 
+    def _attn_pool_generic(
+        self,
+        board_h: torch.Tensor,       # (B, MB, d)
+        cell_ids: torch.Tensor,      # (B, ..., ) int
+        nbrs: torch.Tensor,          # (B, ..., 6) int64
+    ) -> torch.Tensor:
+        """Neighborhood-pool arbitrary destination cells, preserving shape."""
+        d = self.d
+        safe_ids = cell_ids.clamp(min=0).to(torch.long)
+        q_cell = self.E_cell(safe_ids)                         # (B, ..., d)
+        K_nbrs = _safe_gather(board_h, nbrs)                   # (B, ..., 6, d)
+        Q = self.pool_wq(q_cell)
+        K = self.pool_wk(K_nbrs)
+        V = self.pool_wv(K_nbrs)
+        scores = (Q.unsqueeze(-2) * K).sum(-1) / (d ** 0.5)    # (B, ..., 6)
+        scores = scores.masked_fill(nbrs < 0, float("-inf"))
+        all_masked = (nbrs < 0).all(dim=-1, keepdim=True)
+        scores = torch.where(all_masked.expand_as(scores), torch.zeros_like(scores), scores)
+        weights = scores.softmax(dim=-1)
+        pooled = (weights.unsqueeze(-1) * V).sum(dim=-2)       # (B, ..., d)
+        pooled = pooled + q_cell
+        active = (cell_ids >= 0).to(pooled.dtype).unsqueeze(-1)
+        return pooled * active
+
     # ── Hand-type token gather ──
 
     def _hand_tokens(
@@ -309,11 +334,14 @@ class PRSv2PolicyHead(nn.Module):
         ddc = inp.dir_dest_cell.to(torch.long)                       # (B, 8, 6)
         # Map -1 → PAD_CELL_ID so E_cell has a stable pad row
         ddc_safe = torch.where(ddc >= 0, ddc, torch.full_like(ddc, PAD_CELL_ID))
-        dest_cell_emb = self.E_cell(ddc_safe)                        # (B, 8, 6, d)
-
-        # Optional board-token contribution (for beetles climbing occupied cells)
+        # Use the same neighborhood-aware destination encoding style as the
+        # long head's move-cell tokens, then retain occupied-destination board
+        # content for beetle-like cases as an extra residual.
+        dest_cell_vec = self._attn_pool_generic(
+            inp.board_h, ddc_safe, inp.dir_dest_nbrs,
+        )                                                           # (B, 8, 6, d)
         dest_board = _safe_gather(inp.board_h, inp.dir_dest_board_idx)  # (B, 8, 6, d)
-        dest_vec = dest_cell_emb + self.dir_dest_board(dest_board)      # (B, 8, 6, d)
+        dest_vec = dest_cell_vec + self.dir_dest_board(dest_board)      # (B, 8, 6, d)
         dest_vec = _film(dest_vec, inp.cls_h, self.film_dir)
 
         dir_l = (dir_tok.unsqueeze(2) * dest_vec).sum(-1) * scale    # (B, 8, 6)

@@ -15,6 +15,7 @@
  *   * place_cell_ids[B, 32]        int32 — absolute cell index per place-cell
  *   * dir_dest_cell[B, 8, 6]       int32 — dest cell for (dir-piece-slot, dir); -1 invalid
  *   * dir_dest_board_idx[B, 8, 6]  int64 — board-token idx of dest if occupied, -1 otherwise
+ *   * dir_dest_nbrs[B, 8, 6, 6]     int64 — adjacent board-token idx for each dir destination
  *   * throw_dest_cell[B, 2, 30]    int32 — dest cell for (thrower-slot, throw-slot); -1 invalid
  *   * hand_token_idx[B, 16]        int64 — trunk seq position of hand token per
  *                                  (color*8 + type) slot; -1 if hand count==0
@@ -429,6 +430,7 @@ __global__ void prs_v2_classify_kernel(
     int32_t* place_cell_ids,      // [B, 32]       absolute cell index; -1 pad
     int32_t* dir_dest_cell,       // [B, 8, 6]     dest cell; -1 invalid
     int64_t* dir_dest_board_idx,  // [B, 8, 6]     board-token idx if occupied; -1 otherwise
+    int64_t* dir_dest_nbrs,       // [B, 8, 6, 6]  adjacent board-token idx for each dest
     int32_t* throw_dest_cell,     // [B, 2, 30]    dest cell; -1 invalid
     int64_t* hand_token_idx       // [B, 16]       trunk seq pos per (color*8+type); -1 if count=0
 ) {
@@ -502,9 +504,13 @@ __global__ void prs_v2_classify_kernel(
         // Ordered: Q1, B1, B2, G1, G2, G3, P1, M1 (mirror dir_piece_idx).
         int32_t* ddc = dir_dest_cell      + (int64_t)b * 8 * NUM_DIRS;
         int64_t* ddb = dir_dest_board_idx + (int64_t)b * 8 * NUM_DIRS;
+        int64_t* ddn = dir_dest_nbrs      + (int64_t)b * 8 * NUM_DIRS * NUM_DIRS;
         for (int i = 0; i < 8 * NUM_DIRS; i++) {
             ddc[i] = -1;
             ddb[i] = -1;
+        }
+        for (int i = 0; i < 8 * NUM_DIRS * NUM_DIRS; i++) {
+            ddn[i] = -1;
         }
         const int dir_pts_all[5] = {PT_QUEEN, PT_BEETLE, PT_GRASSHOPPER, PT_PILLBUG, PT_MOSQUITO};
         for (int k = 0; k < 5; k++) {
@@ -536,6 +542,11 @@ __global__ void prs_v2_classify_kernel(
                         ddb[slot] = (heights[dest] != 0)
                             ? (int64_t)aux.cell_to_board_idx[dest]
                             : (int64_t)-1;
+                        for (int nd = 0; nd < NUM_DIRS; nd++) {
+                            int nb = NEIGHBORS[dest][nd];
+                            ddn[slot * NUM_DIRS + nd] =
+                                (nb >= 0) ? (int64_t)aux.cell_to_board_idx[nb] : (int64_t)-1;
+                        }
                     }
                 }
             }
