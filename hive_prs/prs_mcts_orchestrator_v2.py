@@ -822,6 +822,7 @@ class PRSMCTSOrchestratorV2:
         all_examples: list[list[PRSTrainingExampleV2]] = []
         for i, history in enumerate(histories):
             result = int(final_results[i])
+            use_for_value = (result != 0)
             game_exs: list[PRSTrainingExampleV2] = []
             for step in history:
                 turn = step["turn"]
@@ -849,6 +850,7 @@ class PRSMCTSOrchestratorV2:
                     slot_target      = step["slot_target"],
                     legal_mask       = step["legal_mask"],
                     value_target     = value,
+                    use_for_value    = use_for_value,
                 ))
             all_examples.append(game_exs)
         return all_examples

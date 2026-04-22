@@ -55,6 +55,7 @@ class PRSTrainingExampleV2(NamedTuple):
     legal_mask:       np.ndarray   # (N_SLOTS,) bool    — True for legal slots
 
     value_target:     float
+    use_for_value:    bool
 
 
 @dataclass
@@ -66,6 +67,7 @@ class PRSTrainingBatchV2:
     slot_targets:    torch.Tensor     # (B, N_SLOTS) float32
     legal_masks:     torch.Tensor     # (B, N_SLOTS) bool
     value_targets:   torch.Tensor     # (B, 1) float32
+    value_masks:     torch.Tensor     # (B, 1) float32, 1 = include in value loss
     augmentation_k:  int = 0          # rotation applied to this batch (0..5)
 
     def to(self, device, non_blocking: bool = False) -> "PRSTrainingBatchV2":
@@ -75,6 +77,7 @@ class PRSTrainingBatchV2:
             slot_targets   = self.slot_targets.to(device, non_blocking=non_blocking),
             legal_masks    = self.legal_masks.to(device, non_blocking=non_blocking),
             value_targets  = self.value_targets.to(device, non_blocking=non_blocking),
+            value_masks    = self.value_masks.to(device, non_blocking=non_blocking),
             augmentation_k = self.augmentation_k,
         )
 
@@ -132,6 +135,7 @@ def _collate_noaug(samples: list[PRSTrainingExampleV2]) -> PRSTrainingBatchV2:
     slot_t  = np.zeros((B, N_SLOTS),      dtype=np.float32)
     lmask   = np.zeros((B, N_SLOTS),      dtype=bool)
     value   = np.zeros((B, 1),            dtype=np.float32)
+    vmask   = np.zeros((B, 1),            dtype=np.float32)
 
     for i, s in enumerate(samples):
         S = s.seq_length
@@ -149,6 +153,7 @@ def _collate_noaug(samples: list[PRSTrainingExampleV2]) -> PRSTrainingBatchV2:
         slot_t[i]     = s.slot_target
         lmask[i]      = s.legal_mask
         value[i, 0]   = s.value_target
+        vmask[i, 0]   = float(s.use_for_value)
 
     prs = PRSTokenBatch(
         token_features   = torch.from_numpy(feat).pin_memory(),
@@ -168,6 +173,7 @@ def _collate_noaug(samples: list[PRSTrainingExampleV2]) -> PRSTrainingBatchV2:
         slot_targets   = torch.from_numpy(slot_t).pin_memory(),
         legal_masks    = torch.from_numpy(lmask).pin_memory(),
         value_targets  = torch.from_numpy(value).pin_memory(),
+        value_masks    = torch.from_numpy(vmask).pin_memory(),
         augmentation_k = 0,
     )
 
@@ -266,6 +272,7 @@ def _collate_rotated(
     )
 
     value = np.array([[s.value_target] for s in samples], dtype=np.float32)
+    vmask = np.array([[float(s.use_for_value)] for s in samples], dtype=np.float32)
 
     return PRSTrainingBatchV2(
         prs_batch      = prs_batch,
@@ -273,5 +280,6 @@ def _collate_rotated(
         slot_targets   = torch.from_numpy(slot_t),
         legal_masks    = torch.from_numpy(lmask),
         value_targets  = torch.from_numpy(value),
+        value_masks    = torch.from_numpy(vmask),
         augmentation_k = k,
     )

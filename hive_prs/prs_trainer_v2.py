@@ -100,6 +100,7 @@ def compute_prs_v2_loss(
     slot_targets:  torch.Tensor,     # (B, N_SLOTS) float32 — sums to 1 per row
     legal_mask:    torch.Tensor,     # (B, N_SLOTS) bool
     value_targets: torch.Tensor,     # (B, 1) float32
+    value_mask:    torch.Tensor,     # (B, 1) float32, 1 = include in value loss
 ) -> tuple[torch.Tensor, dict]:
     """Masked CE over legal slots + value MSE.
 
@@ -123,7 +124,12 @@ def compute_prs_v2_loss(
     else:
         policy_loss = per_sample.mean()
 
-    value_loss = F.mse_loss(value_pred.squeeze(-1), value_targets.squeeze(-1))
+    value_diff = (value_pred.squeeze(-1) - value_targets.squeeze(-1)) ** 2
+    mask_1d = value_mask.squeeze(-1)
+    if mask_1d.sum() > 0:
+        value_loss = (value_diff * mask_1d).sum() / mask_1d.sum()
+    else:
+        value_loss = torch.tensor(0.0, device=policy_logits.device)
     total_loss = policy_loss + value_loss
     return total_loss, {"policy_loss": policy_loss, "value_loss": value_loss}
 
@@ -260,7 +266,7 @@ class PRSTrainerV2:
                         loss, ld = compute_prs_v2_loss(
                             logits, value,
                             batch.slot_targets, batch.legal_masks,
-                            batch.value_targets,
+                            batch.value_targets, batch.value_masks,
                         )
                     self._scaler.scale(loss).backward()
                     if cfg.max_grad_norm > 0:
@@ -275,7 +281,7 @@ class PRSTrainerV2:
                     loss, ld = compute_prs_v2_loss(
                         logits, value,
                         batch.slot_targets, batch.legal_masks,
-                        batch.value_targets,
+                        batch.value_targets, batch.value_masks,
                     )
                     loss.backward()
                     if cfg.max_grad_norm > 0:
