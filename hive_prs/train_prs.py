@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-4)
 
     # Buffer & checkpoints
-    p.add_argument("--buffer-size", type=int, default=100_000)
+    p.add_argument("--buffer-size", type=int, default=150_000)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints_prs_v2")
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
     p.add_argument(
@@ -65,6 +65,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Use the hard-coded Gumbel per-round wave schedule "
             "(PRS v2: 1,2,4,8). Use --no-wave-parallel for pure serial waves."
+        ),
+    )
+    p.add_argument(
+        "--compile-forward",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Opt in to torch.compile for tensor-only trunk/head paths. "
+            "Disabled by default because some environments have unstable "
+            "Inductor subprocess compilation."
         ),
     )
     p.add_argument(
@@ -106,6 +116,7 @@ def main() -> None:
         draw_keep_rate=args.draw_keep_rate,
         nn_max_batch=args.nn_max_batch,
         wave_parallel=args.wave_parallel,
+        compile_forward=args.compile_forward,
         augment_prob=args.augment_prob,
     )
 
@@ -130,7 +141,8 @@ def main() -> None:
     print(
         f"  Simulations: {train_config.mcts_simulations} "
         f"(k={train_config.max_num_considered}, "
-        f"wave_parallel={train_config.wave_parallel})"
+        f"wave_parallel={train_config.wave_parallel}, "
+        f"compile_forward={train_config.compile_forward})"
     )
     print(f"  Checkpoint dir: {train_config.checkpoint_dir}")
     print()

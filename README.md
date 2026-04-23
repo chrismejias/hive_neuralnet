@@ -172,6 +172,8 @@ Legacy PRS v1 modules are archived under `archive/legacy_prs_v1`.
 - **Default:** Gumbel-root MCTS tree search (`PRSMCTSOrchestratorV2`)
 - Sequential-halving rounds use final Gumbel sigma scoring (`gumbel + logits + sigma * Q`) for the played move, rather than visit-count argmax.
 - Wave-parallel MCTS is enabled by default with a hard-coded per-round schedule: `1, 2, 4, 8`. Use `--no-wave-parallel` for pure serial waves.
+- PRS enables TF32 matmul precision for the transformer trunk on supported GPUs.
+- `--compile-forward` can opt in to `torch.compile` for the tensor-only trunk/head path; it is off by default because Inductor can be unstable on some hosts.
 - Current `train_prs` path is v2-only; legacy PRS-v1 search paths are archived.
 - Move-cap draws are excluded from value loss, while their policy targets are still retained.
 
@@ -209,12 +211,14 @@ python -m hive_prs.train_prs \
 | `--simulations` | 512 | Gumbel simulation budget per move |
 | `--max-considered` | 16 | Root actions considered (k); rounds = ceil(log2(k)) |
 | `--wave-parallel` / `--no-wave-parallel` | on | Enable/disable PRS v2 per-round MCTS wave schedule (`1,2,4,8`) |
+| `--compile-forward` / `--no-compile-forward` | off | Opt in to `torch.compile` for tensor-only trunk/head forward |
 | `--d-model` | 128 | Transformer hidden dimension |
 | `--num-heads` | 8 | Attention heads |
 | `--num-layers` | 6 | Transformer layers |
 | `--dim-ff` | 512 | Feed-forward hidden dimension |
 | `--expansion-mask` | 7 | Expansion piece mask: 0=base, 1=+Mosquito, 2=+Ladybug, 4=+Pillbug, 7=all |
 | `--augment-prob` | 0.5 | Probability of C6 rotational augmentation per training batch |
+| `--buffer-size` | 150000 | Replay buffer capacity |
 | `--checkpoint-dir` | checkpoints\_prs\_v2 | Checkpoint output directory |
 | `--resume` | — | Path to checkpoint to resume from |
 

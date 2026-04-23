@@ -5,10 +5,9 @@ Differences vs v1 trainer:
   * Loss is masked cross-entropy over 813 slots (legal mask stored with each
     example) + value MSE. No surprise-weighted sampling, no policy softening
     (the slot space is small and already legal-masked).
-  * The trunk runs on GPU; `build_head_inputs_from_states` runs CPU-side to
-    produce piece/cell indices, then the head runs on GPU. `torch.compile`
-    is therefore disabled on the training net (CPU-side bridge would force
-    recompilation per batch).
+  * The trunk and head run on GPU; the CUDA bridge produces dynamic head
+    inputs from state/legal tensors. The tensor-only trunk/head can be
+    torch-compiled while the extension bridge remains outside Dynamo.
 """
 from __future__ import annotations
 
@@ -32,10 +31,6 @@ from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
 from hive_prs.prs_replay_buffer_v2 import PRSReplayBufferV2, PRSTrainingBatchV2
 from hive_prs.prs_mcts_orchestrator_v2 import (
     PRSMCTSConfigV2, PRSMCTSOrchestratorV2,
-)
-from hive_prs.prs_v2_bridge import (
-    build_head_inputs_from_states,
-    build_head_inputs_from_kernel,
 )
 import hive_gpu
 from hive_prs.slot_map import N_SLOTS
@@ -67,7 +62,7 @@ class PRSTrainConfigV2:
     lr_min:                    float = 1e-5
 
     # Replay buffer
-    buffer_max_size:           int   = 100_000
+    buffer_max_size:           int   = 150_000
 
     # Checkpointing
     checkpoint_dir:            str   = "checkpoints_prs_v2"
@@ -82,6 +77,7 @@ class PRSTrainConfigV2:
     expansion_mask:             int   = 7
     nn_max_batch:              int   = 0
     wave_parallel:             bool  = True
+    compile_forward:           bool  = False
 
     # C6 (6-fold) rotational augmentation for training batches.
     # With this probability, a random rotation k∈{1..5} is applied to every
@@ -151,9 +147,10 @@ class PRSTrainerV2:
         self.use_amp = cfg.use_amp if cfg.use_amp is not None else (self.device.type == "cuda")
         self._scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
 
-        # Single net: v2 head uses CPU-side bridge, so torch.compile would
-        # recompile every batch and hurt throughput. Keep uncompiled.
+        # Compile only tensor-heavy trunk/head paths; the CUDA bridge stays
+        # outside Dynamo because its output structure depends on game state.
         self.best_net: HivePRSTransformerV2 = HivePRSTransformerV2(self.net_config).to(self.device)
+        self.best_net.enable_compiled_forward(cfg.compile_forward and self.device.type == "cuda")
         self._train_net = self.best_net   # same instance; no compile gap
 
         self.buffer      = PRSReplayBufferV2(cfg.buffer_max_size)
@@ -194,6 +191,7 @@ class PRSTrainerV2:
             expansion_mask             = cfg.expansion_mask,
             nn_max_batch               = cfg.nn_max_batch,
             wave_parallel              = cfg.wave_parallel,
+            compile_forward            = cfg.compile_forward,
         )
         orchestrator = PRSMCTSOrchestratorV2(self.best_net, mcts_cfg)
         raw_examples = orchestrator.self_play_batch()
@@ -235,10 +233,7 @@ class PRSTrainerV2:
             states_gpu, legal_t, nlegal_t, B, int(legal_t.shape[1]),
         )
 
-        board_h, cls_h, full_h, value = self._train_net.forward_trunk(batch.prs_batch)
-        inp, _ = build_head_inputs_from_kernel(board_h, cls_h, full_h, kernel_out)
-        logits = self._train_net.head(inp)
-        return logits, value
+        return self._train_net.forward_from_kernel(batch.prs_batch, kernel_out)
 
     def _train(self, iteration: int) -> tuple[float, dict]:
         cfg = self.config

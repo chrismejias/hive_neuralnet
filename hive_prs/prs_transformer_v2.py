@@ -15,13 +15,18 @@ call when the caller already has state bytes on hand.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
 from hive_prs.prs_encoder import PRSTokenBatch
 from hive_prs.prs_transformer import PRSConfig, PRSValueHead
 from hive_prs.prs_v2_head import PRSv2PolicyHead, MB
-from hive_prs.prs_v2_bridge import build_head_inputs_from_states
+from hive_prs.prs_v2_bridge import (
+    build_head_inputs_from_kernel,
+    build_head_inputs_from_states,
+)
 
 
 class HivePRSTransformerV2(nn.Module):
@@ -32,6 +37,10 @@ class HivePRSTransformerV2(nn.Module):
 
     def __init__(self, config: PRSConfig | None = None) -> None:
         super().__init__()
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
         if config is None:
             config = PRSConfig()
         self.config = config
@@ -57,6 +66,76 @@ class HivePRSTransformerV2(nn.Module):
         # ── Heads ─────────────────────────────────────────────────────
         self.head = PRSv2PolicyHead(d)
         self.value_head = PRSValueHead(d, config.global_feat_dim)
+        self._compiled_trunk = None
+        self._compiled_head = None
+        self._compile_warned = False
+
+    def enable_compiled_forward(self, enabled: bool = True) -> None:
+        """Compile tensor-only trunk/head paths when available.
+
+        The CUDA bridge that builds `PRSv2HeadInputs` stays outside Dynamo; it
+        is an extension call with dynamic state-derived outputs. If compile
+        fails at runtime, `forward_trunk`/`forward_head` fall back once to eager.
+        """
+        if not enabled or not hasattr(torch, "compile"):
+            object.__setattr__(self, "_compiled_trunk", None)
+            object.__setattr__(self, "_compiled_head", None)
+            return
+        os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+        try:
+            import torch._inductor.config as inductor_config
+            inductor_config.compile_threads = 1
+        except Exception:
+            pass
+        object.__setattr__(
+            self,
+            "_compiled_trunk",
+            torch.compile(
+                self._forward_trunk_tensors,
+                mode="reduce-overhead",
+                fullgraph=False,
+                dynamic=False,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "_compiled_head",
+            torch.compile(
+                self.head,
+                mode="reduce-overhead",
+                fullgraph=False,
+                dynamic=False,
+            ),
+        )
+
+    def _forward_trunk_tensors(
+        self,
+        token_features: torch.Tensor,
+        token_positions: torch.Tensor,
+        token_types: torch.Tensor,
+        attention_mask: torch.Tensor,
+        global_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        padding_mask = ~attention_mask
+        h = self.token_proj(token_features)
+        h = h + self.position_embedding(token_positions)
+        h = h + self.type_embedding(token_types)
+        h = self.transformer_encoder(h, src_key_padding_mask=padding_mask)
+
+        cls_h = h[:, 0, :]                            # (B, d)
+
+        B = h.size(0)
+        device = h.device
+        raw_board = h[:, 1:1 + MB, :]
+        if raw_board.size(1) < MB:
+            pad = torch.zeros(B, MB - raw_board.size(1), raw_board.size(2),
+                              dtype=raw_board.dtype, device=device)
+            board_h = torch.cat([raw_board, pad], dim=1)
+        else:
+            board_h = raw_board
+
+        value = self.value_head(cls_h, global_features)
+        return board_h, cls_h, h, value
 
     # ── Trunk only (for orchestrator / evaluator) ────────────────────
 
@@ -72,26 +151,52 @@ class HivePRSTransformerV2(nn.Module):
         gather per-(color, type) hand tokens via `hand_token_idx` from the
         CUDA bridge.
         """
-        padding_mask = ~batch.attention_mask
-        h = self.token_proj(batch.token_features)
-        h = h + self.position_embedding(batch.token_positions)
-        h = h + self.type_embedding(batch.token_types)
-        h = self.transformer_encoder(h, src_key_padding_mask=padding_mask)
+        fn = self._compiled_trunk or self._forward_trunk_tensors
+        try:
+            return fn(
+                batch.token_features,
+                batch.token_positions,
+                batch.token_types,
+                batch.attention_mask,
+                batch.global_features,
+            )
+        except Exception as exc:
+            if self._compiled_trunk is None:
+                raise
+            if not self._compile_warned:
+                print(f"[PRS_V2_COMPILE_FALLBACK] trunk: {type(exc).__name__}: {exc}")
+                self._compile_warned = True
+            object.__setattr__(self, "_compiled_trunk", None)
+            return self._forward_trunk_tensors(
+                batch.token_features,
+                batch.token_positions,
+                batch.token_types,
+                batch.attention_mask,
+                batch.global_features,
+            )
 
-        cls_h = h[:, 0, :]                            # (B, d)
+    def forward_head(self, inp) -> torch.Tensor:
+        fn = self._compiled_head or self.head
+        try:
+            return fn(inp)
+        except Exception as exc:
+            if self._compiled_head is None:
+                raise
+            if not self._compile_warned:
+                print(f"[PRS_V2_COMPILE_FALLBACK] head: {type(exc).__name__}: {exc}")
+                self._compile_warned = True
+            object.__setattr__(self, "_compiled_head", None)
+            return self.head(inp)
 
-        B = h.size(0)
-        device = h.device
-        raw_board = h[:, 1:1 + MB, :]
-        if raw_board.size(1) < MB:
-            pad = torch.zeros(B, MB - raw_board.size(1), raw_board.size(2),
-                              dtype=raw_board.dtype, device=device)
-            board_h = torch.cat([raw_board, pad], dim=1)
-        else:
-            board_h = raw_board
-
-        value = self.value_head(cls_h, batch.global_features)
-        return board_h, cls_h, h, value
+    def forward_from_kernel(
+        self,
+        batch: PRSTokenBatch,
+        kernel_out: tuple,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (policy_logits [B, 813], value [B, 1]) using CUDA bridge output."""
+        board_h, cls_h, full_h, value = self.forward_trunk(batch)
+        inp, _ = build_head_inputs_from_kernel(board_h, cls_h, full_h, kernel_out)
+        return self.forward_head(inp), value
 
     # ── Full forward, given state bytes ──────────────────────────────
 
@@ -105,7 +210,7 @@ class HivePRSTransformerV2(nn.Module):
         inp, _ = build_head_inputs_from_states(
             state_bytes_cpu, board_h, cls_h, full_h,
         )
-        policy_logits = self.head(inp)
+        policy_logits = self.forward_head(inp)
         return policy_logits, value
 
     def count_parameters(self) -> int:

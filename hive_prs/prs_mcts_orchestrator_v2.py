@@ -22,10 +22,6 @@ import torch
 import hive_gpu
 from hive_prs.prs_encoder import PRSEncoder
 from hive_prs.prs_replay_buffer_v2 import PRSTrainingExampleV2
-from hive_prs.prs_v2_bridge import (
-    build_head_inputs_from_states,
-    build_head_inputs_from_kernel,
-)
 from hive_prs.slot_map import N_SLOTS, PASS_SLOT, map_legal_moves
 
 _OFF_TURN = 3412  # byte offset of turn counter in HiveState
@@ -46,6 +42,7 @@ class PRSMCTSConfigV2:
     expansion_mask:              int   = 7
     nn_max_batch:                int   = 0
     wave_parallel:               bool  = True
+    compile_forward:             bool  = False
     wave_size:                   int   = 16
     dirichlet_alpha:             float = 0.3
     dirichlet_epsilon:           float = 0.25
@@ -77,6 +74,7 @@ class PRSMCTSOrchestratorV2:
         self.ext        = hive_gpu.load_extension()
         self.config     = config or PRSMCTSConfigV2()
         self.net        = net
+        self.net.enable_compiled_forward(self.config.compile_forward)
         self.encoder    = PRSEncoder()
         self._move_size = self.ext.SIZEOF_GPU_MOVE
         self._max_nodes = int(self.config.max_tree_nodes)
@@ -208,11 +206,7 @@ class PRSMCTSOrchestratorV2:
         mb = self.config.nn_max_batch
         if mb <= 0 or B <= mb:
             with torch.no_grad():
-                board_h, cls_h, full_h, value = self.net.forward_trunk(prs_batch)
-                inp, _ = build_head_inputs_from_kernel(
-                    board_h, cls_h, full_h, kernel_out,
-                )
-                logits = self.net.head(inp)
+                logits, value = self.net.forward_from_kernel(prs_batch, kernel_out)
             return logits, value
         # Sub-batching: slice each kernel-output tensor along dim 0.
         all_l, all_v = [], []
@@ -221,11 +215,7 @@ class PRSMCTSOrchestratorV2:
             sub_kernel = tuple(t[s:e] for t in kernel_out)
             with torch.no_grad():
                 sub = prs_batch.slice_batch(s, e)
-                board_h, cls_h, full_h, value = self.net.forward_trunk(sub)
-                inp, _ = build_head_inputs_from_kernel(
-                    board_h, cls_h, full_h, sub_kernel,
-                )
-                lo = self.net.head(inp)
+                lo, value = self.net.forward_from_kernel(sub, sub_kernel)
             all_l.append(lo); all_v.append(value)
         return torch.cat(all_l, 0), torch.cat(all_v, 0)
 
