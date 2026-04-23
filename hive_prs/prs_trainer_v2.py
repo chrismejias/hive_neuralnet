@@ -81,6 +81,7 @@ class PRSTrainConfigV2:
     draw_keep_rate:            float = 1.0
     expansion_mask:             int   = 7
     nn_max_batch:              int   = 0
+    wave_parallel:             bool  = True
 
     # C6 (6-fold) rotational augmentation for training batches.
     # With this probability, a random rotation k∈{1..5} is applied to every
@@ -192,6 +193,7 @@ class PRSTrainerV2:
             max_game_length            = cfg.max_game_length,
             expansion_mask             = cfg.expansion_mask,
             nn_max_batch               = cfg.nn_max_batch,
+            wave_parallel              = cfg.wave_parallel,
         )
         orchestrator = PRSMCTSOrchestratorV2(self.best_net, mcts_cfg)
         raw_examples = orchestrator.self_play_batch()

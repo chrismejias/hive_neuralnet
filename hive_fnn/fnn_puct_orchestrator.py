@@ -261,6 +261,7 @@ class FNNPUCTOrchestrator:
         examples: list[list[FNNTrainingExample]] = [[] for _ in range(B)]
         for i in range(B):
             winner = final_results[i]
+            use_for_value = (winner != 0)
             for state_bytes, target_pi in histories[i]:
                 turn = int(state_bytes[_OFF_TURN]) | (int(state_bytes[_OFF_TURN + 1]) << 8)
                 value = self._result_to_value(winner, turn)
@@ -268,6 +269,7 @@ class FNNPUCTOrchestrator:
                     state_bytes=state_bytes,
                     policy_target=target_pi.astype(np.float32),
                     value_target=float(value),
+                    use_for_value=use_for_value,
                 ))
         return examples
 

@@ -6,8 +6,8 @@ Differences vs. `PRSMCTSOrchestrator` (v1):
     where `count_shared` is the number of legal moves sharing that slot.
     This keeps Σ priors = 1 and treats engine-emitted byte-duplicate throws
     (e.g. P + M-as-P) as sharing probability mass.
-  * Root action selection aggregates visits per slot BEFORE argmax, so
-    duplicate representations cannot split the winner.
+  * Root action selection uses the final Gumbel sigma score among surviving
+    candidates; training targets still aggregate visits in slot space.
   * Training examples record slot-space visit targets + the legal mask,
     and keep raw HiveState bytes so the trainer can rebuild head inputs.
 """
@@ -29,6 +29,7 @@ from hive_prs.prs_v2_bridge import (
 from hive_prs.slot_map import N_SLOTS, PASS_SLOT, map_legal_moves
 
 _OFF_TURN = 3412  # byte offset of turn counter in HiveState
+_GUMBEL_WAVE_SCHEDULE = (1, 2, 4, 8)
 
 
 @dataclass
@@ -44,6 +45,7 @@ class PRSMCTSConfigV2:
     max_game_length:             int   = 300
     expansion_mask:              int   = 7
     nn_max_batch:                int   = 0
+    wave_parallel:               bool  = True
     wave_size:                   int   = 16
     dirichlet_alpha:             float = 0.3
     dirichlet_epsilon:           float = 0.25
@@ -317,9 +319,14 @@ class PRSMCTSOrchestratorV2:
             n_rounds = max(1, math.ceil(math.log2(max(max_k, 2))))
             sims_per_round = max(1, cfg.num_simulations // n_rounds)
 
-            for _ in range(n_rounds):
+            for round_i in range(n_rounds):
+                round_wave_size = (
+                    _GUMBEL_WAVE_SCHEDULE[min(round_i, len(_GUMBEL_WAVE_SCHEDULE) - 1)]
+                    if cfg.wave_parallel else 1
+                )
                 self._run_simulations(
                     tree, states, active_t, alive_mask, B, sims_per_round,
+                    wave_size=round_wave_size,
                 )
                 alive_counts = alive_mask.sum(dim=1)
                 cur_alive_max = int(alive_counts.max().item())
@@ -342,8 +349,8 @@ class PRSMCTSOrchestratorV2:
                 new_alive = new_alive * valid_slot.to(torch.int8)
                 alive_mask = new_alive
 
-            # ── Final action selection (aggregate visits PER SLOT) ───
-            leg_visits, _ = self._gather_root_child_stats(tree, B)
+            # ── Final action selection (Gumbel sigma score) ──────────
+            leg_visits, leg_q = self._gather_root_child_stats(tree, B)
             # leg_visits: (B, MAX_L) int32 — visits per legal-move index.
             if cfg.debug_zero_visit_logging and zero_visit_logs_emitted < cfg.debug_zero_visit_limit:
                 leg_visit_sums = leg_visits.sum(dim=1).cpu().numpy()
@@ -374,21 +381,16 @@ class PRSMCTSOrchestratorV2:
 
             slot_t = slot_of_legal_t.to(dtype=torch.long)                 # (B, MAX_L)
             valid_legal = slot_t >= 0
-            slot_safe = slot_t.clamp(min=0)
 
-            # Sum visits into slot space, then broadcast back so shared slots
-            # cannot split the winner. Dead slots still have valid[k]=True.
-            slot_sum = torch.zeros(B, N_SLOTS, dtype=torch.float32, device="cuda")
-            slot_sum.scatter_add_(
-                1, slot_safe, leg_visits.float() * valid_legal.float(),
+            max_n = int(leg_visits.max().item())
+            sigma_norm = (cfg.c_visit + max_n) * cfg.c_scale
+            final_sigma = (gumbel + root_logit_per_legal + sigma_norm * leg_q).float()
+            final_sigma = torch.where(
+                alive_mask.bool() & valid_legal,
+                final_sigma,
+                torch.full_like(final_sigma, -1e30),
             )
-            agg_per_legal = slot_sum.gather(1, slot_safe)
-            agg_per_legal = torch.where(
-                valid_legal, agg_per_legal, torch.zeros_like(agg_per_legal),
-            )
-            # Restrict to alive survivors
-            agg_per_legal = agg_per_legal * alive_mask.float()
-            chosen_slot_idx = torch.argmax(agg_per_legal, dim=1)          # (B,)
+            chosen_slot_idx = torch.argmax(final_sigma, dim=1)            # (B,)
 
             # ── Record history (single big CPU transfer batch) ──────
             slot_of_legal_np = slot_of_legal_t.cpu().numpy().astype(np.int64)
@@ -606,10 +608,11 @@ class PRSMCTSOrchestratorV2:
         )
 
     def _run_simulations(
-        self, tree, root_states, game_active, alive_mask, B: int, num_sims: int,
+        self, tree, root_states, game_active, alive_mask, B: int,
+        num_sims: int, wave_size: int | None = None,
     ) -> None:
         cfg = self.config
-        W = cfg.wave_size
+        W = max(1, int(cfg.wave_size if wave_size is None else wave_size))
         num_waves = math.ceil(num_sims / W)
 
         state_size = root_states.shape[1]

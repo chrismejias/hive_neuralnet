@@ -64,7 +64,7 @@ Or if a prebuilt `.pyd`/`.so` is already present in `hive_gpu/`, it loads automa
 
 ### Gumbel AlphaZero (default)
 
-Based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). Uses Sequential Halving with Gumbel noise to select and evaluate a fixed budget of candidate actions. All NN evaluations within a round are fully independent and batched — no serial tree traversal bottleneck.
+Based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). Uses Sequential Halving with Gumbel noise to select and evaluate a fixed budget of candidate actions. The original transformer path batches independent root evaluations; the PRS, FNN, and MC paths use Gumbel-root MCTS tree search.
 
 - **On by default** — no flag needed
 - Use `--gumbel-considered` to set the number of actions considered at the root (k, default 16)
@@ -170,7 +170,10 @@ Legacy PRS v1 modules are archived under `archive/legacy_prs_v1`.
 ### Search Pattern
 
 - **Default:** Gumbel-root MCTS tree search (`PRSMCTSOrchestratorV2`)
+- Sequential-halving rounds use final Gumbel sigma scoring (`gumbel + logits + sigma * Q`) for the played move, rather than visit-count argmax.
+- Wave-parallel MCTS is enabled by default with a hard-coded per-round schedule: `1, 2, 4, 8`. Use `--no-wave-parallel` for pure serial waves.
 - Current `train_prs` path is v2-only; legacy PRS-v1 search paths are archived.
+- Move-cap draws are excluded from value loss, while their policy targets are still retained.
 
 ### Training
 
@@ -205,6 +208,7 @@ python -m hive_prs.train_prs \
 | `--games` | 128 | Parallel self-play games per iteration |
 | `--simulations` | 512 | Gumbel simulation budget per move |
 | `--max-considered` | 16 | Root actions considered (k); rounds = ceil(log2(k)) |
+| `--wave-parallel` / `--no-wave-parallel` | on | Enable/disable PRS v2 per-round MCTS wave schedule (`1,2,4,8`) |
 | `--d-model` | 128 | Transformer hidden dimension |
 | `--num-heads` | 8 | Attention heads |
 | `--num-layers` | 6 | Transformer layers |
@@ -250,7 +254,10 @@ The entire Gumbel AlphaZero game loop — move generation, feature extraction, F
 ### Search Patterns
 
 - **Default:** Gumbel-root MCTS tree search (`FNNMCTSOrchestrator`)
+- Gumbel MCTS uses a hard-coded per-round wave schedule `2, 4, 8, 16` by default; use `--no-gumbel-wave-parallel` for pure serial waves.
 - **Alternative:** plain PUCT MCTS (`FNNPUCTOrchestrator`) via `--puct`
+- PUCT MCTS uses wave-parallel virtual-loss search with `--puct-wave-size` (default 16).
+- Move-cap draws are excluded from value loss, while their policy targets are still retained.
 
 ### Training
 
@@ -287,6 +294,8 @@ python -m hive_fnn.train_fnn \
 | `--games` | 128 | Parallel self-play games per iteration |
 | `--simulations` | 128 | Gumbel simulation budget per move |
 | `--gumbel-considered` | 16 | Root actions considered (k) |
+| `--gumbel-wave-parallel` / `--no-gumbel-wave-parallel` | on | Enable/disable FNN Gumbel per-round MCTS wave schedule (`2,4,8,16`) |
+| `--puct-wave-size` | 16 | Parallel MCTS simulations per wave for plain PUCT |
 | `--puct` | off | Use plain PUCT MCTS root policy instead of Gumbel root halving |
 | `--checkpoint-dir` | checkpoints\_fnn | Checkpoint output directory |
 

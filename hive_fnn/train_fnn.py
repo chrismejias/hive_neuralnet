@@ -29,6 +29,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--simulations", type=int, default=128)
     p.add_argument("--gumbel-considered", type=int, default=16)
     p.add_argument("--max-game-length", type=int, default=300)
+    p.add_argument(
+        "--gumbel-wave-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the hard-coded Gumbel per-round wave schedule "
+            "(FNN: 2,4,8,16). Use --no-gumbel-wave-parallel for pure serial waves."
+        ),
+    )
+    p.add_argument("--gumbel-wave-size", type=int, default=4)
+    p.add_argument("--puct-wave-size", type=int, default=16)
 
     # Training
     p.add_argument("--batch-size", type=int, default=128)
@@ -74,6 +85,9 @@ def main() -> None:
         expansion_mask=args.expansion_mask,
         draw_keep_rate=args.draw_keep_rate,
         use_puct=args.puct,
+        gumbel_wave_parallel=args.gumbel_wave_parallel,
+        gumbel_wave_size=args.gumbel_wave_size,
+        puct_wave_size=args.puct_wave_size,
     )
 
     net = HiveFNN(net_config)
@@ -83,9 +97,12 @@ def main() -> None:
     print(f"  Action tower: {net_config.embed_dim * 2} -> {net_config.action_hidden} -> 1")
     print(f"  Value head: {net_config.embed_dim} -> 1 -> tanh")
     if args.puct:
-        print("  Search: plain PUCT MCTS")
+        print(f"  Search: plain PUCT MCTS (wave_size={train_config.puct_wave_size})")
     else:
-        print("  Search: Gumbel-root MCTS")
+        print(
+            "  Search: Gumbel-root MCTS "
+            f"(wave_parallel={train_config.gumbel_wave_parallel})"
+        )
     del net
 
     trainer = FNNTrainer(train_config, net_config)

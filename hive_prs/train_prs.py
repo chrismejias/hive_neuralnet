@@ -59,6 +59,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--draw-keep-rate", type=float, default=1.0)
     p.add_argument("--nn-max-batch", type=int, default=0)
     p.add_argument(
+        "--wave-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use the hard-coded Gumbel per-round wave schedule "
+            "(PRS v2: 1,2,4,8). Use --no-wave-parallel for pure serial waves."
+        ),
+    )
+    p.add_argument(
         "--augment-prob",
         type=float,
         default=0.5,
@@ -96,6 +105,7 @@ def main() -> None:
         expansion_mask=args.expansion_mask,
         draw_keep_rate=args.draw_keep_rate,
         nn_max_batch=args.nn_max_batch,
+        wave_parallel=args.wave_parallel,
         augment_prob=args.augment_prob,
     )
 
@@ -119,7 +129,8 @@ def main() -> None:
     print(f"  Games/iter: {train_config.games_per_batch}")
     print(
         f"  Simulations: {train_config.mcts_simulations} "
-        f"(k={train_config.max_num_considered})"
+        f"(k={train_config.max_num_considered}, "
+        f"wave_parallel={train_config.wave_parallel})"
     )
     print(f"  Checkpoint dir: {train_config.checkpoint_dir}")
     print()
@@ -129,4 +140,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

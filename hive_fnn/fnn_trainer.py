@@ -53,6 +53,9 @@ class FNNTrainConfig:
     use_amp: bool | None = None
 
     use_puct: bool = False
+    gumbel_wave_parallel: bool = True
+    gumbel_wave_size: int = 4
+    puct_wave_size: int = 16
 
 
 def _flat_to_padded(
@@ -100,10 +103,16 @@ def compute_fnn_loss(
     policy_targets: torch.Tensor,
     value_targets: torch.Tensor,
     num_actions: torch.Tensor,
+    value_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Combined loss: policy cross-entropy + value MSE."""
     policy_loss = _policy_cross_entropy(action_logits, policy_targets, num_actions)
-    value_loss = F.mse_loss(root_values.squeeze(-1), value_targets.squeeze(-1))
+    value_diff = (root_values.squeeze(-1) - value_targets.squeeze(-1)) ** 2
+    mask_1d = value_mask.squeeze(-1)
+    if mask_1d.sum() > 0:
+        value_loss = (value_diff * mask_1d).sum() / mask_1d.sum()
+    else:
+        value_loss = torch.tensor(0.0, device=root_values.device)
 
     total = policy_loss + value_loss
     return total, {
@@ -192,6 +201,7 @@ class FNNTrainer:
                     batch_size=cfg.games_per_batch,
                     max_game_length=cfg.max_game_length,
                     expansion_mask=cfg.expansion_mask,
+                    wave_size=cfg.puct_wave_size,
                 ),
             )
         else:
@@ -205,6 +215,8 @@ class FNNTrainer:
                     batch_size=cfg.games_per_batch,
                     max_game_length=cfg.max_game_length,
                     expansion_mask=cfg.expansion_mask,
+                    wave_parallel=cfg.gumbel_wave_parallel,
+                    wave_size=cfg.gumbel_wave_size,
                 ),
             )
         raw = orch.self_play_batch()
@@ -315,6 +327,7 @@ class FNNTrainer:
                             batch.policy_targets,
                             batch.value_targets,
                             batch.num_actions,
+                            batch.value_mask,
                         )
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(opt)
@@ -333,6 +346,7 @@ class FNNTrainer:
                         batch.policy_targets,
                         batch.value_targets,
                         batch.num_actions,
+                        batch.value_mask,
                     )
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(

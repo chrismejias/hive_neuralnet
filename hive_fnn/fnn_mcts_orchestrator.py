@@ -28,6 +28,7 @@ from hive_fnn.fnn_network import HiveFNN
 from hive_fnn.fnn_replay_buffer import FNNTrainingExample
 
 _OFF_TURN = 3412
+_GUMBEL_WAVE_SCHEDULE = (2, 4, 8, 16)
 
 
 @dataclass
@@ -42,7 +43,8 @@ class FNNMCTSConfig:
     batch_size:                  int   = 128
     max_game_length:             int   = 300
     expansion_mask:              int   = 0
-    wave_size:                   int   = 16
+    wave_parallel:               bool  = True
+    wave_size:                   int   = 4
     dirichlet_alpha:             float = 0.3
     dirichlet_epsilon:           float = 0.25
     max_tree_nodes:              int   = 65536
@@ -327,8 +329,13 @@ class FNNMCTSOrchestrator:
                 sims_per_round = max(1, cfg.num_simulations // n_rounds)
 
                 for round_i in range(n_rounds):
+                    round_wave_size = (
+                        _GUMBEL_WAVE_SCHEDULE[min(round_i, len(_GUMBEL_WAVE_SCHEDULE) - 1)]
+                        if cfg.wave_parallel else 1
+                    )
                     self._run_simulations(
                         tree, states, game_active_t, alive_mask, B, sims_per_round,
+                        wave_size=round_wave_size,
                     )
 
                     alive_counts = alive_mask.sum(dim=1)
@@ -426,6 +433,7 @@ class FNNMCTSOrchestrator:
         examples: list[list[FNNTrainingExample]] = [[] for _ in range(B)]
         for i in range(B):
             winner = final_results[i]
+            use_for_value = (winner != 0)
             for state_bytes, target_pi in histories[i]:
                 turn = int(state_bytes[_OFF_TURN]) | (
                     int(state_bytes[_OFF_TURN + 1]) << 8
@@ -435,6 +443,7 @@ class FNNMCTSOrchestrator:
                     state_bytes=state_bytes,
                     policy_target=target_pi.astype(np.float32),
                     value_target=float(value),
+                    use_for_value=use_for_value,
                 ))
         return examples
 
@@ -489,9 +498,10 @@ class FNNMCTSOrchestrator:
 
     def _run_simulations(
         self, tree, root_states, game_active_t, alive_mask, B, num_sims,
+        wave_size=None,
     ):
         cfg = self.config
-        W = cfg.wave_size
+        W = max(1, int(cfg.wave_size if wave_size is None else wave_size))
         num_waves = math.ceil(num_sims / W)
         state_size = root_states.shape[1]
         leaf_states = torch.zeros(W * B, state_size, dtype=torch.uint8, device="cuda")

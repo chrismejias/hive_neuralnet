@@ -16,6 +16,7 @@ class FNNTrainingExample(NamedTuple):
     state_bytes: np.ndarray      # (SIZEOF_HIVE_STATE,) uint8
     policy_target: np.ndarray    # (n_legal,) float32
     value_target: float
+    use_for_value: bool = True
     surprise_weight: float = 1.0
 
 
@@ -25,6 +26,7 @@ class FNNTrainingBatch:
     policy_targets: torch.Tensor    # (B, max_actions) float32
     num_actions: torch.Tensor       # (B,) int64
     value_targets: torch.Tensor     # (B, 1) float32
+    value_mask: torch.Tensor        # (B, 1) float32
 
     def to(self, device: torch.device, non_blocking: bool = False) -> FNNTrainingBatch:
         return FNNTrainingBatch(
@@ -32,6 +34,7 @@ class FNNTrainingBatch:
             policy_targets=self.policy_targets.to(device, non_blocking=non_blocking),
             num_actions=self.num_actions.to(device, non_blocking=non_blocking),
             value_targets=self.value_targets.to(device, non_blocking=non_blocking),
+            value_mask=self.value_mask.to(device, non_blocking=non_blocking),
         )
 
 
@@ -76,6 +79,7 @@ def _collate(samples: list[FNNTrainingExample]) -> FNNTrainingBatch:
     policy = np.zeros((B, max_actions), dtype=np.float32)
     num_actions = np.zeros((B,), dtype=np.int64)
     values = np.zeros((B, 1), dtype=np.float32)
+    value_mask = np.zeros((B, 1), dtype=np.float32)
 
     for i, s in enumerate(samples):
         states[i, : s.state_bytes.shape[0]] = s.state_bytes
@@ -83,10 +87,12 @@ def _collate(samples: list[FNNTrainingExample]) -> FNNTrainingBatch:
         policy[i, :n] = s.policy_target
         num_actions[i] = n
         values[i, 0] = s.value_target
+        value_mask[i, 0] = float(s.use_for_value)
 
     return FNNTrainingBatch(
         state_bytes=torch.from_numpy(states).pin_memory(),
         policy_targets=torch.from_numpy(policy).pin_memory(),
         num_actions=torch.from_numpy(num_actions).pin_memory(),
         value_targets=torch.from_numpy(values).pin_memory(),
+        value_mask=torch.from_numpy(value_mask).pin_memory(),
     )
