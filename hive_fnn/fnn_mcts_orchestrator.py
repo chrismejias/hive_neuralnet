@@ -68,6 +68,17 @@ class FNNMCTSOrchestrator:
         self._move_size = self.ext.SIZEOF_GPU_MOVE
         self._max_nodes = int(self.config.max_tree_nodes)
         self._max_legal = int(self.ext.MAX_LEGAL_MOVES)
+        self._slot_idx = torch.arange(
+            self._max_legal, device="cuda", dtype=torch.int64,
+        ).unsqueeze(0)
+        self._row_idx_cache: dict[int, torch.Tensor] = {}
+
+    def _row_indices(self, n: int) -> torch.Tensor:
+        cached = self._row_idx_cache.get(n)
+        if cached is None:
+            cached = torch.arange(n, device="cuda", dtype=torch.int64).unsqueeze(1)
+            self._row_idx_cache[n] = cached
+        return cached
 
     # ── Tree tensor management ────────────────────────────────────────
 
@@ -119,6 +130,7 @@ class FNNMCTSOrchestrator:
         legal_moves: torch.Tensor,
         num_legal: torch.Tensor,
         total: int,
+        root_features: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode states + score every legal successor.
 
@@ -130,43 +142,36 @@ class FNNMCTSOrchestrator:
         dev = "cuda"
         MAX_L = self._max_legal
         n64 = num_legal.to(torch.int64)
-        max_n = int(n64.max().item()) if total > 0 else 0
 
-        # Root features
-        root_features = self.ext.extract_fnn_features_batch(
-            states, legal_moves, num_legal, total,
-        )   # (total, feat_dim)
+        if root_features is None:
+            root_features = self.ext.extract_fnn_features_batch(
+                states, legal_moves, num_legal, total,
+            )   # (total, feat_dim)
 
-        priors_per_legal = torch.zeros(total, MAX_L, dtype=torch.float32, device=dev)
-        if total == 0 or max_n == 0:
-            with torch.no_grad():
-                root_emb = self.net.encode(root_features)
-                root_values = self.net.value_head(root_emb).squeeze(-1).float()
-            return priors_per_legal, root_values
+        if total == 0:
+            empty = torch.zeros(0, MAX_L, dtype=torch.float32, device=dev)
+            return empty, empty.new_zeros((0,))
 
-        # Build flat successor-state array
-        slot_idx = torch.arange(MAX_L, device=dev, dtype=torch.int64).unsqueeze(0)
+        slot_idx = self._slot_idx
         valid = slot_idx < n64.unsqueeze(1)          # (total, MAX_L)
-        action_to_root = torch.arange(
-            total, device=dev, dtype=torch.int64,
-        ).unsqueeze(1).expand_as(valid)[valid]        # (N_total,)
+        action_to_root = self._row_indices(total).expand_as(valid)[valid]
         move_indices = slot_idx.expand_as(valid)[valid]
         N_total = int(action_to_root.shape[0])
 
-        # Construct child states
-        child_states = states[action_to_root].clone()
-        child_moves = legal_moves[action_to_root, move_indices]
-        self.ext.apply_moves_batch(child_states, child_moves, N_total)
+        if N_total == 0:
+            with torch.inference_mode():
+                root_emb = self.net.encode(root_features)
+                root_values = self.net.value_head(root_emb).squeeze(-1).float()
+            priors_per_legal = torch.zeros(
+                total, MAX_L, dtype=torch.float32, device=dev,
+            )
+            return priors_per_legal, root_values
 
-        # Child features need child legal moves (for density feature)
-        child_legal, child_nlegal = self.ext.generate_legal_moves_batch(
-            child_states, N_total,
-        )
-        succ_features = self.ext.extract_fnn_features_batch(
-            child_states, child_legal, child_nlegal, N_total,
+        succ_features = self.ext.fnn_successor_features_batch(
+            states, legal_moves, action_to_root, move_indices, N_total,
         )
 
-        with torch.no_grad():
+        with torch.inference_mode():
             combined = torch.cat([root_features, succ_features], dim=0)
             all_emb = self.net.encode(combined)
             root_emb = all_emb[:total]
@@ -177,24 +182,17 @@ class FNNMCTSOrchestrator:
                 gathered_root, succ_emb,
             ).float()                                  # (N_total,)
 
-        # Scatter logits back into (total, max_n) padded tensor
+        # Scatter logits back into the fixed-width legal tensor. Keeping
+        # MAX_L avoids a per-eval CPU sync on num_legal.max().item().
         legal_logits = torch.full(
-            (total, max_n), -1e30, dtype=torch.float32, device=dev,
+            (total, MAX_L), -1e30, dtype=torch.float32, device=dev,
         )
-        legal_logits[valid[:, :max_n]] = action_logits
+        legal_logits[valid] = action_logits
 
-        # Softmax over valid slots (padded slots stay -inf)
-        max_logit = legal_logits.max(dim=1, keepdim=True).values
-        exp_shift = (legal_logits - max_logit).exp()
-        sum_e = exp_shift.sum(dim=1, keepdim=True).clamp(min=1e-20)
-        prior_pad = exp_shift / sum_e
-        prior_pad = torch.where(
-            valid[:, :max_n], prior_pad, torch.zeros_like(prior_pad),
-        )
-
-        eff_n = min(max_n, MAX_L)
-        priors_per_legal[:, :eff_n] = prior_pad[:, :eff_n]
-        return priors_per_legal, root_values
+        # Softmax over valid slots (padded slots stay effectively -inf).
+        prior_pad = torch.softmax(legal_logits, dim=1)
+        prior_pad = prior_pad.masked_fill(~valid, 0.0)
+        return prior_pad, root_values
 
     def _find_immediate_wins(
         self,
@@ -262,7 +260,9 @@ class FNNMCTSOrchestrator:
         histories: list[list[tuple[np.ndarray, np.ndarray]]] = [[] for _ in range(B)]
 
         while bool(active_mask.any().item()):
-            legal_moves, num_legal = self.ext.generate_legal_moves_batch(states, B)
+            legal_moves, num_legal, root_features = (
+                self.ext.generate_legal_moves_and_fnn_features_batch(states, B)
+            )
             n_per_game = num_legal.to(torch.int64)
             nlegal_np = num_legal.cpu().numpy()
 
@@ -279,7 +279,9 @@ class FNNMCTSOrchestrator:
             if max_k == 0:
                 break
 
-            priors_per_legal, _root_vals = self._eval_states(states, legal_moves, num_legal, B)
+            priors_per_legal, _root_vals = self._eval_states(
+                states, legal_moves, num_legal, B, root_features,
+            )
             if bool(has_immediate_win.any().item()):
                 priors_per_legal.zero_()
                 priors_per_legal[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
@@ -526,12 +528,14 @@ class FNNMCTSOrchestrator:
             )
 
             results = self.ext.check_results_batch(leaf_states[:total], total)
-            legal_moves, num_legal = self.ext.generate_legal_moves_batch(
-                leaf_states[:total], total,
+            legal_moves, num_legal, leaf_features = (
+                self.ext.generate_legal_moves_and_fnn_features_batch(
+                    leaf_states[:total], total,
+                )
             )
 
             priors_leaf, leaf_vals = self._eval_states(
-                leaf_states[:total], legal_moves, num_legal, total,
+                leaf_states[:total], legal_moves, num_legal, total, leaf_features,
             )
 
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
@@ -545,26 +549,24 @@ class FNNMCTSOrchestrator:
     def _gather_root_child_stats(
         self, tree, B,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        row = torch.arange(B, device="cuda")
+        row = torch.arange(B, device="cuda", dtype=torch.long)
         root = tree["root_node"]
-        fc = tree["first_child"][row, root].cpu().numpy()
-        nc = tree["num_children"][row, root].cpu().numpy()
+        fc = tree["first_child"][row, root].to(torch.long)
+        nc = tree["num_children"][row, root].to(torch.long)
 
-        visits = torch.zeros(B, self._max_legal, dtype=torch.int32,  device="cuda")
-        q      = torch.zeros(B, self._max_legal, dtype=torch.float32, device="cuda")
+        slots = self._slot_idx.expand(B, -1)
+        valid = (fc.unsqueeze(1) >= 0) & (slots < nc.unsqueeze(1))
+        child_idx = (fc.unsqueeze(1) + slots).clamp(min=0, max=self._max_nodes - 1)
+        row2 = row.unsqueeze(1).expand_as(child_idx)
 
-        for i in range(B):
-            fci = int(fc[i]); nci = int(nc[i])
-            if fci < 0 or nci == 0:
-                continue
-            lim = min(nci, self._max_legal)
-            vc = tree["visit_count"][i, fci:fci + lim]
-            tv = tree["total_value"][i, fci:fci + lim]
-            visits[i, :lim] = vc
-            q[i, :lim] = torch.where(
-                vc > 0, -tv / vc.clamp(min=1).float(),
-                torch.zeros_like(tv),
-            )
+        visits_raw = tree["visit_count"][row2, child_idx]
+        total_raw = tree["total_value"][row2, child_idx]
+        visits = torch.where(valid, visits_raw, torch.zeros_like(visits_raw))
+        q = torch.where(
+            valid & (visits_raw > 0),
+            -total_raw / visits_raw.clamp(min=1).float(),
+            torch.zeros_like(total_raw),
+        )
         return visits, q
 
     def _reroot_tree(self, tree, B, active_cpu, chosen_child_nodes):

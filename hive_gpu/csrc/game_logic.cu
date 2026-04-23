@@ -27,6 +27,28 @@
 
 namespace hive_gpu {
 
+void reset_movegen_profile() {
+#ifdef __CUDACC__
+    cudaMemset(MOVEGEN_PROFILE, 0, sizeof(unsigned long long) * MGP_MAX);
+    cudaDeviceSynchronize();
+    MOVEGEN_PROFILE_ENABLED = true;
+#endif
+}
+
+at::Tensor get_movegen_profile() {
+    auto opts = at::TensorOptions().dtype(c10::kLong).device(c10::kCPU);
+    auto out = at::empty({MGP_MAX}, opts);
+#ifdef __CUDACC__
+    cudaDeviceSynchronize();
+    auto* dst = static_cast<int64_t*>(out.data_ptr());
+    for (int i = 0; i < MGP_MAX; ++i) {
+        dst[i] = static_cast<int64_t>(MOVEGEN_PROFILE[i]);
+    }
+    MOVEGEN_PROFILE_ENABLED = false;
+#endif
+    return out;
+}
+
 // ── Kernel: initialize batch of states ─────────────────────────────
 
 __global__ void init_states_kernel(HiveState* states, int batch_size, uint8_t expansion_mask) {
@@ -48,6 +70,48 @@ __global__ void generate_legal_moves_kernel(
     if (idx < batch_size) {
         GPUMove* my_moves = moves_out + idx * MAX_LEGAL_MOVES;
         num_legal_out[idx] = generate_legal_moves(states[idx], my_moves);
+    }
+}
+
+__global__ void generate_legal_moves_and_fnn_features_kernel(
+    const HiveState* states,
+    GPUMove* moves_out,       // [MAX_LEGAL_MOVES * batch_size]
+    int* num_legal_out,       // [batch_size]
+    float* features_out,      // [FNN_FEAT_DIM * batch_size]
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        GPUMove* my_moves = moves_out + idx * MAX_LEGAL_MOVES;
+        int n = generate_legal_moves(states[idx], my_moves);
+        num_legal_out[idx] = n;
+        extract_fnn_features_device(
+            states[idx], my_moves, n, features_out + idx * FNN_FEAT_DIM);
+    }
+}
+
+__global__ void fnn_successor_features_kernel(
+    const HiveState* states,
+    const GPUMove* legal_moves,       // [B, MAX_LEGAL_MOVES]
+    const int64_t* action_to_root,    // [N]
+    const int64_t* move_indices,      // [N]
+    float* features_out,              // [N, FNN_FEAT_DIM]
+    int num_actions
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_actions) {
+        int root = (int)action_to_root[idx];
+        int move_i = (int)move_indices[idx];
+
+        HiveState child = states[root];
+        const GPUMove& mv = legal_moves[(int64_t)root * MAX_LEGAL_MOVES + move_i];
+        apply_move(child, mv);
+
+        GPUMove child_moves[MAX_LEGAL_MOVES];
+        int child_nlegal = generate_legal_moves(child, child_moves);
+        extract_fnn_features_device(
+            child, child_moves, child_nlegal,
+            features_out + (int64_t)idx * FNN_FEAT_DIM);
     }
 }
 
@@ -784,6 +848,70 @@ at::Tensor extract_fnn_features_batch(
         static_cast<float*>(features.data_ptr()),
         batch_size);
     // No sync: null-stream ordering sufficient for GPU-to-GPU.
+
+    return features;
+}
+
+/**
+ * Generate legal moves and FNN features in one per-state kernel.
+ *
+ * This avoids launching a separate feature-extraction kernel that rereads the
+ * just-generated legal move list from global memory.
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+generate_legal_moves_and_fnn_features_batch(
+    at::Tensor states_tensor,
+    int batch_size
+) {
+    auto opts_u8 = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+    auto opts_i = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+
+    auto moves_tensor = at::zeros(
+        {batch_size, (int64_t)MAX_LEGAL_MOVES, (int64_t)sizeof(GPUMove)}, opts_u8);
+    auto num_legal = at::zeros({batch_size}, opts_i);
+    auto features = at::zeros({batch_size, (int64_t)FNN_FEAT_DIM}, opts_f);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(states_tensor.data_ptr());
+    GPUMove* moves_ptr = reinterpret_cast<GPUMove*>(moves_tensor.data_ptr());
+    int* num_legal_ptr = static_cast<int*>(num_legal.data_ptr());
+    float* features_ptr = static_cast<float*>(features.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    generate_legal_moves_and_fnn_features_kernel<<<blocks, threads>>>(
+        states_ptr, moves_ptr, num_legal_ptr, features_ptr, batch_size);
+
+    return std::make_tuple(moves_tensor, num_legal, features);
+}
+
+/**
+ * Build each legal successor locally and return only its FNN features.
+ *
+ * Used by FNN action scoring: successor features are needed, but successor
+ * states and successor legal move lists are not otherwise consumed.
+ */
+at::Tensor fnn_successor_features_batch(
+    at::Tensor states_tensor,
+    at::Tensor legal_moves_tensor,
+    at::Tensor action_to_root_tensor,
+    at::Tensor move_indices_tensor,
+    int num_actions
+) {
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto features = at::zeros({num_actions, (int64_t)FNN_FEAT_DIM}, opts_f);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(states_tensor.data_ptr());
+    const GPUMove* moves_ptr = reinterpret_cast<const GPUMove*>(legal_moves_tensor.data_ptr());
+    const int64_t* action_to_root = static_cast<const int64_t*>(action_to_root_tensor.data_ptr());
+    const int64_t* move_indices = static_cast<const int64_t*>(move_indices_tensor.data_ptr());
+    float* features_ptr = static_cast<float*>(features.data_ptr());
+
+    int threads = 256;
+    int blocks = (num_actions + threads - 1) / threads;
+    fnn_successor_features_kernel<<<blocks, threads>>>(
+        states_ptr, moves_ptr, action_to_root, move_indices,
+        features_ptr, num_actions);
 
     return features;
 }

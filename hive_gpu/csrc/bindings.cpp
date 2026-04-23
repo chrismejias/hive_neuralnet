@@ -20,6 +20,8 @@ namespace hive_gpu {
 
 // Forward declarations (defined in game_logic.cu)
 void initialize_tables();
+void reset_movegen_profile();
+torch::Tensor get_movegen_profile();
 torch::Tensor create_initial_states(int batch_size, int expansion_mask);
 std::tuple<torch::Tensor, torch::Tensor> generate_legal_moves_batch(
     torch::Tensor states_tensor, int batch_size);
@@ -47,6 +49,16 @@ torch::Tensor extract_fnn_features_batch(
     torch::Tensor legal_moves_tensor,
     torch::Tensor num_legal_tensor,
     int batch_size);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+generate_legal_moves_and_fnn_features_batch(
+    torch::Tensor states_tensor,
+    int batch_size);
+torch::Tensor fnn_successor_features_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor action_to_root_tensor,
+    torch::Tensor move_indices_tensor,
+    int num_actions);
 
 // GPU-native FNN self-play
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -163,6 +175,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("initialize_tables", &hive_gpu::initialize_tables,
           "Initialize hex grid lookup tables in CUDA constant memory");
+    m.def("reset_movegen_profile", &hive_gpu::reset_movegen_profile,
+          "Reset CUDA move generation profile counters");
+    m.def("get_movegen_profile", &hive_gpu::get_movegen_profile,
+          "Read CUDA move generation profile counters");
 
     m.def("create_initial_states", &hive_gpu::create_initial_states,
           "Allocate and initialize a batch of game states on GPU",
@@ -209,6 +225,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Extract FNN board features directly from HiveState + legal moves",
           py::arg("states"), py::arg("legal_moves"), py::arg("num_legal"),
           py::arg("batch_size"));
+
+    m.def("generate_legal_moves_and_fnn_features_batch",
+          &hive_gpu::generate_legal_moves_and_fnn_features_batch,
+          "Generate legal moves and extract FNN features in one kernel",
+          py::arg("states"), py::arg("batch_size"));
+
+    m.def("fnn_successor_features_batch",
+          &hive_gpu::fnn_successor_features_batch,
+          "Apply legal moves locally and extract only FNN successor features",
+          py::arg("states"), py::arg("legal_moves"),
+          py::arg("action_to_root"), py::arg("move_indices"),
+          py::arg("num_actions"));
 
     // ── GPU-native FNN self-play ────────────────────────────────────
     m.def("fnn_selfplay_batch", &hive_gpu::fnn_selfplay_batch,

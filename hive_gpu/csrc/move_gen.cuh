@@ -28,6 +28,41 @@ namespace hive_gpu {
 // Max inline buffer size for ant destinations
 constexpr int MAX_ANT_DESTS = 128;
 
+enum MovegenProfileIdx {
+    MGP_CALLS = 0,
+    MGP_PLACEMENT_CALLS = 1,
+    MGP_PLACEMENT_MOVES = 2,
+    MGP_QUEEN_CALLS = 3,
+    MGP_QUEEN_MOVES = 4,
+    MGP_ANT_CALLS = 5,
+    MGP_ANT_MOVES = 6,
+    MGP_SPIDER_CALLS = 7,
+    MGP_SPIDER_MOVES = 8,
+    MGP_GRASSHOPPER_CALLS = 9,
+    MGP_GRASSHOPPER_MOVES = 10,
+    MGP_BEETLE_CALLS = 11,
+    MGP_BEETLE_MOVES = 12,
+    MGP_MOSQUITO_CALLS = 13,
+    MGP_MOSQUITO_MOVES = 14,
+    MGP_LADYBUG_CALLS = 15,
+    MGP_LADYBUG_MOVES = 16,
+    MGP_PILLBUG_CALLS = 17,
+    MGP_PILLBUG_MOVES = 18,
+    MGP_THROW_CALLS = 19,
+    MGP_THROW_MOVES = 20,
+    MGP_PASS_MOVES = 21,
+    MGP_MAX = 22,
+};
+
+__device__ __managed__ unsigned long long MOVEGEN_PROFILE[MGP_MAX];
+__device__ __managed__ bool MOVEGEN_PROFILE_ENABLED = false;
+
+__device__ __forceinline__ void mgp_add(int idx, unsigned long long value) {
+    if (MOVEGEN_PROFILE_ENABLED) {
+        atomicAdd(&MOVEGEN_PROFILE[idx], value);
+    }
+}
+
 // ── Slide check ─────────────────────────────────────────────────────
 
 /**
@@ -61,6 +96,20 @@ __device__ __forceinline__ bool can_slide(const HiveState& s,
     if (!cw_occ && !ccw_occ) return false;
 
     return true;
+}
+
+__device__ __forceinline__ bool can_slide_occ(const Bitboard& occ,
+                                               int from_cell, int dir) {
+    int16_t dest = SLIDE_FLANKS[from_cell][dir][0];
+    int16_t cw   = SLIDE_FLANKS[from_cell][dir][1];
+    int16_t ccw  = SLIDE_FLANKS[from_cell][dir][2];
+
+    if (dest < 0) return false;
+    if (occ.get(dest)) return false;
+
+    bool cw_occ  = (cw  >= 0) && occ.get(cw);
+    bool ccw_occ = (ccw >= 0) && occ.get(ccw);
+    return (cw_occ || ccw_occ) && !(cw_occ && ccw_occ);
 }
 
 // ── Queen moves ─────────────────────────────────────────────────────
@@ -118,6 +167,9 @@ __device__ inline int gen_grasshopper_moves(const HiveState& s, int cell,
  */
 __device__ inline int gen_ant_moves(const HiveState& s, int cell,
                                      uint16_t* out) {
+    Bitboard occ = s.occupied;
+    occ.clr(cell);  // the moving ant's source is empty during the search
+
     // BFS visited set (289 bits)
     Bitboard visited;
     visited.clear();
@@ -129,7 +181,7 @@ __device__ inline int gen_ant_moves(const HiveState& s, int cell,
 
     // Seed frontier with initial slide destinations
     for (int d = 0; d < NUM_DIRS; d++) {
-        if (can_slide(s, cell, d, cell)) {
+        if (can_slide_occ(occ, cell, d)) {
             int16_t dest = SLIDE_FLANKS[cell][d][0];
             if (!visited.get(dest)) {
                 visited.set(dest);
@@ -149,7 +201,7 @@ __device__ inline int gen_ant_moves(const HiveState& s, int cell,
     while (front_read < front_write && count < MAX_ANT_DESTS) {
         int cur = frontier[front_read++];
         for (int d = 0; d < NUM_DIRS; d++) {
-            if (can_slide(s, cur, d, cell)) {  // exclude_cell = ant's start
+            if (can_slide_occ(occ, cur, d)) {
                 int16_t dest = SLIDE_FLANKS[cur][d][0];
                 if (dest >= 0 && !visited.get(dest)) {
                     visited.set(dest);
@@ -627,6 +679,7 @@ __device__ inline int find_placement_positions(const HiveState& s, Color color,
  */
 __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
     if (s.result != IN_PROGRESS) return 0;
+    mgp_add(MGP_CALLS, 1);
 
     Color color = current_player(s);
     int ptn = player_turn_number(s);
@@ -652,32 +705,33 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
     if (has_any_hand) {
         Bitboard placements;
         int npos = find_placement_positions(s, color, placements);
+        mgp_add(MGP_PLACEMENT_CALLS, 1);
 
         if (npos > 0) {
             // Queen can't be placed on player's first turn
             bool first_turn = (ptn == 0);
 
-            for (int p = 0; p < NUM_PIECE_TYPES; p++) {
-                if (!can_place_type[p]) continue;
-                if (first_turn && p == 0) continue;  // No queen on first turn
+            // Scan placement cells once, then emit every placeable type for
+            // that destination. Previously this rescanned the same bitboard
+            // once per piece type.
+            for (int wi = 0; wi < BB_WORDS; wi++) {
+                uint64_t bits = placements.w[wi];
+                while (bits) {
+                    int bit = __ffsll(bits) - 1;
+                    int cell = wi * 64 + bit;
+                    bits &= bits - 1;
+                    if (cell >= NUM_CELLS) continue;
 
-                PieceType pt = (PieceType)(p + 1);  // PT_QUEEN=1, etc.
-
-                // Scan placement bitboard
-                for (int wi = 0; wi < BB_WORDS; wi++) {
-                    uint64_t bits = placements.w[wi];
-                    while (bits) {
-                        int bit = __ffsll(bits) - 1;
-                        int cell = wi * 64 + bit;
-                        bits &= bits - 1;
-                        if (cell >= NUM_CELLS) continue;
-
+                    for (int p = 0; p < NUM_PIECE_TYPES; p++) {
+                        if (!can_place_type[p]) continue;
+                        if (first_turn && p == 0) continue;  // No queen on first turn
                         if (count < MAX_LEGAL_MOVES) {
                             out[count].type = MOVE_PLACE;
-                            out[count].piece_type = pt;
+                            out[count].piece_type = (PieceType)(p + 1);
                             out[count].from_cell = 0;  // unused
                             out[count].to_cell = (uint16_t)cell;
                             count++;
+                            mgp_add(MGP_PLACEMENT_MOVES, 1);
                         }
                     }
                 }
@@ -713,28 +767,44 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
 
                 switch (pt) {
                     case PT_QUEEN:
+                        mgp_add(MGP_QUEEN_CALLS, 1);
                         ndests = gen_queen_moves(s, cell, dests);
+                        mgp_add(MGP_QUEEN_MOVES, ndests);
                         break;
                     case PT_ANT:
+                        mgp_add(MGP_ANT_CALLS, 1);
                         ndests = gen_ant_moves(s, cell, dests);
+                        mgp_add(MGP_ANT_MOVES, ndests);
                         break;
                     case PT_GRASSHOPPER:
+                        mgp_add(MGP_GRASSHOPPER_CALLS, 1);
                         ndests = gen_grasshopper_moves(s, cell, dests);
+                        mgp_add(MGP_GRASSHOPPER_MOVES, ndests);
                         break;
                     case PT_SPIDER:
+                        mgp_add(MGP_SPIDER_CALLS, 1);
                         ndests = gen_spider_moves(s, cell, dests);
+                        mgp_add(MGP_SPIDER_MOVES, ndests);
                         break;
                     case PT_BEETLE:
+                        mgp_add(MGP_BEETLE_CALLS, 1);
                         ndests = gen_beetle_moves(s, cell, dests);
+                        mgp_add(MGP_BEETLE_MOVES, ndests);
                         break;
                     case PT_MOSQUITO:
+                        mgp_add(MGP_MOSQUITO_CALLS, 1);
                         ndests = gen_mosquito_moves(s, cell, dests);
+                        mgp_add(MGP_MOSQUITO_MOVES, ndests);
                         break;
                     case PT_LADYBUG:
+                        mgp_add(MGP_LADYBUG_CALLS, 1);
                         ndests = gen_ladybug_moves(s, cell, dests);
+                        mgp_add(MGP_LADYBUG_MOVES, ndests);
                         break;
                     case PT_PILLBUG:
+                        mgp_add(MGP_PILLBUG_CALLS, 1);
                         ndests = gen_pillbug_moves(s, cell, dests);
+                        mgp_add(MGP_PILLBUG_MOVES, ndests);
                         break;
                     default:
                         break;
@@ -766,7 +836,10 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
 
                 // Pillbug on top → generate throws
                 if (pt == PT_PILLBUG) {
+                    int before = count;
                     count = gen_pillbug_throws(s, cell, ap_mask, out, count);
+                    mgp_add(MGP_THROW_CALLS, 1);
+                    mgp_add(MGP_THROW_MOVES, count - before);
                 }
 
                 // Mosquito on ground adjacent to any pillbug → generate throws
@@ -781,7 +854,10 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
                         }
                     }
                     if (adj_pillbug) {
+                        int before = count;
                         count = gen_pillbug_throws(s, cell, ap_mask, out, count);
+                        mgp_add(MGP_THROW_CALLS, 1);
+                        mgp_add(MGP_THROW_MOVES, count - before);
                     }
                 }
             }
@@ -796,6 +872,7 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
         out[0].from_cell = 0;
         out[0].to_cell = 0;
         count = 1;
+        mgp_add(MGP_PASS_MOVES, 1);
     }
 
     return count;

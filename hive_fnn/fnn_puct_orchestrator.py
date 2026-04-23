@@ -149,7 +149,9 @@ class FNNPUCTOrchestrator:
         histories: list[list[tuple[np.ndarray, np.ndarray]]] = [[] for _ in range(B)]
 
         while bool(active_mask.any().item()):
-            legal_moves, num_legal = self.ext.generate_legal_moves_batch(states, B)
+            legal_moves, num_legal, root_features = (
+                self.ext.generate_legal_moves_and_fnn_features_batch(states, B)
+            )
             n_per_game = num_legal.to(torch.int64)
             nlegal_np = num_legal.cpu().numpy()
 
@@ -165,7 +167,9 @@ class FNNPUCTOrchestrator:
             if max_n == 0:
                 break
 
-            priors_per_legal, _root_vals = self._eval_states(states, legal_moves, num_legal, B)
+            priors_per_legal, _root_vals = self._eval_states(
+                states, legal_moves, num_legal, B, root_features,
+            )
             if bool(has_immediate_win.any().item()):
                 priors_per_legal.zero_()
                 priors_per_legal[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
@@ -340,8 +344,14 @@ class FNNPUCTOrchestrator:
             )
 
             results = self.ext.check_results_batch(leaf_states[:total], total)
-            legal_moves, num_legal = self.ext.generate_legal_moves_batch(leaf_states[:total], total)
-            priors_leaf, leaf_vals = self._eval_states(leaf_states[:total], legal_moves, num_legal, total)
+            legal_moves, num_legal, leaf_features = (
+                self.ext.generate_legal_moves_and_fnn_features_batch(
+                    leaf_states[:total], total,
+                )
+            )
+            priors_leaf, leaf_vals = self._eval_states(
+                leaf_states[:total], legal_moves, num_legal, total, leaf_features,
+            )
 
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
                 *self._tree_args(tree),

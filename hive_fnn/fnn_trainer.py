@@ -251,8 +251,10 @@ class FNNTrainer:
             action_to_root: (N_total,) int64
             num_actions: (B,) int64
         """
-        legal_moves, num_legal = self.ext.generate_legal_moves_batch(
-            state_bytes, batch_size,
+        legal_moves, num_legal, root_features = (
+            self.ext.generate_legal_moves_and_fnn_features_batch(
+                state_bytes, batch_size,
+            )
         )
         num_actions = num_legal.to(torch.int64)
 
@@ -267,24 +269,12 @@ class FNNTrainer:
 
         total_actions = action_to_root.shape[0]
 
-        # Root features via CUDA kernel
-        root_features = self.ext.extract_fnn_features_batch(
-            state_bytes, legal_moves, num_legal, batch_size,
-        )
-
         if total_actions == 0:
             return root_features, root_features[:0], action_to_root, num_actions
 
-        # Build child states and extract features
-        child_states = state_bytes[action_to_root].clone()
-        moves = legal_moves[action_to_root, move_indices]
-        self.ext.apply_moves_batch(child_states, moves, total_actions)
-
-        child_legal, child_nlegal = self.ext.generate_legal_moves_batch(
-            child_states, total_actions,
-        )
-        succ_features = self.ext.extract_fnn_features_batch(
-            child_states, child_legal, child_nlegal, total_actions,
+        succ_features = self.ext.fnn_successor_features_batch(
+            state_bytes, legal_moves, action_to_root, move_indices,
+            total_actions,
         )
 
         return root_features, succ_features, action_to_root, num_actions
