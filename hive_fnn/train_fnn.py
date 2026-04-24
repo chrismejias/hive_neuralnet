@@ -43,8 +43,13 @@ def parse_args() -> argparse.Namespace:
                 (64/64/64) unless --preset is supplied.
               - python -u keeps startup and per-iteration output unbuffered.
               - < /dev/null prevents the process from inheriting a terminal stdin.
-              - If launched through a tool that kills detached children, use a
-                persistent shell/tmux/session and run the same command in it.
+              - In this environment, a plain background job may be reaped when
+                the shell exits. Use a persistent shell/tmux/session or an
+                equivalent long-lived launcher, then run the same nohup command
+                inside that session.
+              - A good manual launch pattern is:
+                  nohup python3.11 -u -m hive_fnn.train_fnn ... > checkpoints_fnn/training.log 2>&1 < /dev/null &
+                  disown
         """),
     )
     # Network architecture
