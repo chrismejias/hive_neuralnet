@@ -115,8 +115,11 @@ class FNNPUCTOrchestrator:
         legal_moves: torch.Tensor,
         num_legal: torch.Tensor,
         total: int,
+        root_features: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._eval_helper._eval_states(states, legal_moves, num_legal, total)
+        return self._eval_helper._eval_states(
+            states, legal_moves, num_legal, total, root_features,
+        )
 
     def _find_immediate_wins(
         self,

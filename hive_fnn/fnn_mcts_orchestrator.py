@@ -28,6 +28,8 @@ from hive_fnn.fnn_network import HiveFNN
 from hive_fnn.fnn_replay_buffer import FNNTrainingExample
 
 _OFF_TURN = 3412
+_GUMBEL_K = 16
+_GUMBEL_ROUNDS = 4
 _GUMBEL_WAVE_SCHEDULE = (2, 4, 8, 16)
 
 
@@ -72,12 +74,20 @@ class FNNMCTSOrchestrator:
             self._max_legal, device="cuda", dtype=torch.int64,
         ).unsqueeze(0)
         self._row_idx_cache: dict[int, torch.Tensor] = {}
+        self._keep_rank_cache: dict[int, torch.Tensor] = {}
 
     def _row_indices(self, n: int) -> torch.Tensor:
         cached = self._row_idx_cache.get(n)
         if cached is None:
             cached = torch.arange(n, device="cuda", dtype=torch.int64).unsqueeze(1)
             self._row_idx_cache[n] = cached
+        return cached
+
+    def _keep_rank(self, n: int) -> torch.Tensor:
+        cached = self._keep_rank_cache.get(n)
+        if cached is None:
+            cached = torch.arange(n, device="cuda").unsqueeze(0)
+            self._keep_rank_cache[n] = cached
         return cached
 
     # ── Tree tensor management ────────────────────────────────────────
@@ -275,9 +285,10 @@ class FNNMCTSOrchestrator:
             has_immediate_win = immediate_wins >= 0
 
             max_n = int(n_per_game.max().item()) if B > 0 else 0
-            max_k = min(cfg.max_num_considered_actions, max_n) if max_n > 0 else 0
-            if max_k == 0:
+            if max_n == 0:
                 break
+            if cfg.max_num_considered_actions != _GUMBEL_K:
+                cfg.max_num_considered_actions = _GUMBEL_K
 
             priors_per_legal, _root_vals = self._eval_states(
                 states, legal_moves, num_legal, B, root_features,
@@ -301,7 +312,7 @@ class FNNMCTSOrchestrator:
             gumbel = -torch.log(-torch.log(u))
             gumbel = torch.where(valid_slot, gumbel, torch.full_like(gumbel, -1e30))
             perturbed = gumbel + legal_logits
-            _, topk_slots = torch.topk(perturbed, max_k, dim=1)
+            _, topk_slots = torch.topk(perturbed, _GUMBEL_K, dim=1)
 
             # ── Expand root if needed ────────────────────────────────
             game_active_t = has_actions.to(torch.int8)
@@ -322,57 +333,84 @@ class FNNMCTSOrchestrator:
                     torch.zeros_like(immediate_wins),
                 )
             else:
-                alive_mask = torch.zeros(B, MAX_L, dtype=torch.int8, device=dev)
-                alive_mask.scatter_(1, topk_slots, 1)
-                alive_mask = alive_mask * valid_slot.to(torch.int8)
+                candidate_slots = topk_slots.to(torch.int32)
+                candidate_valid = torch.gather(
+                    valid_slot, 1, candidate_slots.long(),
+                )
+                candidate_slots = torch.where(
+                    candidate_valid,
+                    candidate_slots,
+                    torch.full_like(candidate_slots, -1),
+                )
 
                 # ── Sequential Halving ────────────────────────────────────
-                n_rounds = max(1, math.ceil(math.log2(max(max_k, 2))))
-                sims_per_round = max(1, cfg.num_simulations // n_rounds)
+                sims_per_round = max(1, cfg.num_simulations // _GUMBEL_ROUNDS)
 
-                for round_i in range(n_rounds):
+                for round_i in range(_GUMBEL_ROUNDS):
+                    root_slots = candidate_slots
+                    candidate_valid = root_slots >= 0
+                    num_candidates = int(root_slots.shape[1])
+                    sims_per_candidate = max(1, sims_per_round // num_candidates)
                     round_wave_size = (
                         _GUMBEL_WAVE_SCHEDULE[min(round_i, len(_GUMBEL_WAVE_SCHEDULE) - 1)]
                         if cfg.wave_parallel else 1
                     )
-                    self._run_simulations(
-                        tree, states, game_active_t, alive_mask, B, sims_per_round,
+                    self._run_simulations_for_root_slots(
+                        tree, states, game_active_t, root_slots, B, sims_per_candidate,
                         wave_size=round_wave_size,
                     )
 
-                    alive_counts = alive_mask.sum(dim=1)
-                    cur_alive_max = int(alive_counts.max().item())
-                    if cur_alive_max <= 1:
+                    if num_candidates <= 1:
                         continue
-                    num_keep = max(1, cur_alive_max // 2)
+                    per_game_keep = (candidate_valid.sum(dim=1) // 2).clamp(min=1)
+                    max_keep = num_candidates // 2
 
-                    slot_visits, slot_q = self._gather_root_child_stats(tree, B)
-                    max_nv = int(slot_visits.max().item())
-                    sigma_norm = (cfg.c_visit + max_nv) * cfg.c_scale
-                    sigma_score = (gumbel + legal_logits + sigma_norm * slot_q).float()
-                    sigma_score = torch.where(
-                        alive_mask.bool(), sigma_score,
-                        torch.full_like(sigma_score, -1e30),
+                    cand_visits, cand_q = self._gather_root_candidate_stats(
+                        tree, B, root_slots,
+                    )
+                    sigma_norm = (cfg.c_visit + cand_visits.max()) * cfg.c_scale
+                    cand_idx = root_slots.long().clamp(min=0)
+                    cand_score = (
+                        torch.gather(gumbel + legal_logits, 1, cand_idx)
+                        + sigma_norm * cand_q
+                    ).float()
+                    cand_score = torch.where(
+                        candidate_valid, cand_score,
+                        torch.full_like(cand_score, -1e30),
                     )
 
-                    _, keep_slots = torch.topk(sigma_score, num_keep, dim=1)
-                    new_alive = torch.zeros_like(alive_mask)
-                    new_alive.scatter_(1, keep_slots, 1)
-                    new_alive = new_alive * valid_slot.to(torch.int8)
-                    alive_mask = new_alive
+                    _, keep_pos = torch.topk(cand_score, max_keep, dim=1)
+                    keep_rank = self._keep_rank(max_keep)
+                    keep_valid = keep_rank < per_game_keep.unsqueeze(1)
+                    new_slots = torch.gather(root_slots, 1, keep_pos)
+                    candidate_slots = torch.where(
+                        keep_valid,
+                        new_slots,
+                        torch.full_like(new_slots, -1),
+                    )
 
                 # ── Final action selection ────────────────────────────────
-                slot_visits, slot_q = self._gather_root_child_stats(tree, B)
-                max_nv = int(slot_visits.max().item())
-                sigma_norm = (cfg.c_visit + max_nv) * cfg.c_scale
-                final_sigma = (gumbel + legal_logits + sigma_norm * slot_q).float()
-                final_sigma = torch.where(
-                    alive_mask.bool(), final_sigma,
-                    torch.full_like(final_sigma, -1e30),
+                candidate_valid = candidate_slots >= 0
+                cand_visits, cand_q = self._gather_root_candidate_stats(
+                    tree, B, candidate_slots,
                 )
-                chosen_slot = torch.argmax(final_sigma, dim=1)
+                sigma_norm = (cfg.c_visit + cand_visits.max()) * cfg.c_scale
+                cand_idx = candidate_slots.long().clamp(min=0)
+                final_cand_sigma = (
+                    torch.gather(gumbel + legal_logits, 1, cand_idx)
+                    + sigma_norm * cand_q
+                ).float()
+                final_cand_sigma = torch.where(
+                    candidate_valid, final_cand_sigma,
+                    torch.full_like(final_cand_sigma, -1e30),
+                )
+                chosen_pos = torch.argmax(final_cand_sigma, dim=1)
+                chosen_slot = torch.gather(
+                    candidate_slots, 1, chosen_pos.unsqueeze(1),
+                ).squeeze(1).clamp(min=0).to(torch.long)
 
                 # ── Policy target = visit distribution over legal moves ───
+                slot_visits, _slot_q = self._gather_root_child_stats(tree, B)
                 visits_f = slot_visits.float()
                 vsum = visits_f.sum(dim=1, keepdim=True)
                 probs_pad = torch.where(
@@ -545,6 +583,113 @@ class FNNMCTSOrchestrator:
                 leaf_vals, vl_paths[:total], vl_lens[:total],
                 B, total, self._max_nodes,
             )
+
+    def _run_simulations_for_root_slots(
+        self, tree, root_states, game_active_t, root_slots, B, num_sims_per_slot,
+        wave_size=None,
+    ):
+        cfg = self.config
+        C = int(root_slots.shape[1])
+        W = max(1, int(cfg.wave_size if wave_size is None else wave_size))
+        num_waves = math.ceil(num_sims_per_slot / W)
+        use_fused_prefix = hasattr(
+            self.ext, "mcts_select_replay_legal_fnn_root_slots_batch",
+        )
+        leaf_states = None
+        if not use_fused_prefix:
+            state_size = root_states.shape[1]
+            leaf_states = torch.zeros(W * C * B, state_size, dtype=torch.uint8, device="cuda")
+
+        for wave in range(num_waves):
+            actual_w = min(W, num_sims_per_slot - wave * W)
+            total = actual_w * C * B
+
+            if use_fused_prefix:
+                (
+                    leaf_idx, leaf_states_wave, legal_moves, num_legal,
+                    leaf_features, results, vl_paths, vl_lens,
+                ) = self.ext.mcts_select_replay_legal_fnn_root_slots_batch(
+                    *self._tree_args(tree),
+                    root_states,
+                    game_active_t, tree["root_node"],
+                    root_slots, C, self._max_legal,
+                    cfg.c_puct, B, actual_w, self._max_nodes,
+                )
+            else:
+                leaf_idx, move_paths, path_lens, vl_paths, vl_lens = (
+                    self.ext.mcts_select_with_root_slots_batch(
+                        *self._tree_args(tree),
+                        game_active_t, tree["root_node"],
+                        root_slots, C, self._max_legal,
+                        cfg.c_puct, B, actual_w, self._max_nodes,
+                    )
+                )
+
+                self.ext.mcts_replay_batch(
+                    root_states, leaf_states[:total],
+                    move_paths[:total], path_lens[:total], leaf_idx[:total],
+                    B, total,
+                )
+
+                results = self.ext.check_results_batch(leaf_states[:total], total)
+                legal_moves, num_legal, leaf_features = (
+                    self.ext.generate_legal_moves_and_fnn_features_batch(
+                        leaf_states[:total], total,
+                    )
+                )
+                leaf_states_wave = leaf_states[:total]
+
+            priors_leaf, leaf_vals = self._eval_states(
+                leaf_states_wave, legal_moves, num_legal, total, leaf_features,
+            )
+
+            self.ext.mcts_expand_and_backprop_dense_priors_batch(
+                *self._tree_args(tree),
+                leaf_idx[:total], leaf_states_wave,
+                legal_moves, num_legal, priors_leaf, results,
+                leaf_vals, vl_paths[:total], vl_lens[:total],
+                B, total, self._max_nodes,
+            )
+
+    def _alive_root_slots(self, alive: torch.Tensor) -> torch.Tensor:
+        counts = alive.sum(dim=1)
+        C = max(1, int(counts.max().item()))
+        B, L = alive.shape
+        slot_ids = torch.arange(L, device=alive.device).unsqueeze(0).expand(B, L)
+        scores = torch.where(
+            alive,
+            -slot_ids.float(),
+            torch.full((B, L), -1e30, dtype=torch.float32, device=alive.device),
+        )
+        _, slots = torch.topk(scores, C, dim=1)
+        slots = slots.to(torch.int32)
+        valid = torch.gather(alive, 1, slots.long())
+        return torch.where(slots >= 0, torch.where(valid, slots, torch.full_like(slots, -1)), slots)
+
+    def _gather_root_candidate_stats(
+        self, tree, B: int, candidate_slots: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        row = torch.arange(B, device="cuda", dtype=torch.long)
+        root = tree["root_node"]
+        fc = tree["first_child"][row, root].to(torch.long)
+        nc = tree["num_children"][row, root].to(torch.long)
+
+        slots = candidate_slots.to(torch.long)
+        valid = (slots >= 0) & (fc.unsqueeze(1) >= 0) & (slots < nc.unsqueeze(1))
+        child_idx = (fc.unsqueeze(1) + slots.clamp(min=0)).clamp(
+            min=0, max=self._max_nodes - 1,
+        )
+        row2 = row.unsqueeze(1).expand_as(child_idx)
+
+        visits_raw = tree["visit_count"][row2, child_idx]
+        total_raw = tree["total_value"][row2, child_idx]
+        visits = torch.where(valid, visits_raw, torch.zeros_like(visits_raw))
+        q = torch.where(
+            valid & (visits_raw > 0),
+            -total_raw / visits_raw.clamp(min=1).float(),
+            torch.zeros_like(total_raw),
+        )
+        return visits, q
 
     def _gather_root_child_stats(
         self, tree, B,

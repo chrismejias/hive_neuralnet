@@ -46,9 +46,9 @@ def parse_args() -> argparse.Namespace:
         """),
     )
     # Network architecture
-    p.add_argument("--hidden-dim", type=int, default=32)
-    p.add_argument("--embed-dim", type=int, default=32)
-    p.add_argument("--action-hidden", type=int, default=32)
+    p.add_argument("--hidden-dim", type=int, default=64)
+    p.add_argument("--embed-dim", type=int, default=64)
+    p.add_argument("--action-hidden", type=int, default=64)
     p.add_argument(
         "--preset",
         choices=["small", "medium", "large"],

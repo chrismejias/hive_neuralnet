@@ -24,9 +24,9 @@ from hive_fnn.fnn_features import FEAT_DIM
 @dataclass
 class FNNConfig:
     feat_dim: int = 94  # FNN_FEAT_DIM from CUDA kernel
-    hidden_dim: int = 32
-    embed_dim: int = 32
-    action_hidden: int = 32
+    hidden_dim: int = 64
+    embed_dim: int = 64
+    action_hidden: int = 64
 
     @classmethod
     def small(cls) -> FNNConfig:
@@ -53,7 +53,7 @@ class HiveFNN(nn.Module):
 
     def __init__(self, config: FNNConfig | None = None) -> None:
         super().__init__()
-        self.config = config or FNNConfig.medium()
+        self.config = config or FNNConfig.large()
         c = self.config
 
         # ---- Shared board encoder (root & successor) ----

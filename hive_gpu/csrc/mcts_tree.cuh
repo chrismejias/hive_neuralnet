@@ -698,6 +698,133 @@ __global__ void mcts_select_with_root_mask_kernel(
 }
 
 /**
+ * SELECT WITH ROOT SLOTS kernel — each simulation is assigned to a specific
+ * root child slot. This implements Gumbel Sequential Halving's equal budget
+ * per candidate while still allowing virtual-loss parallelism below the root.
+ *
+ * root_slots[B, num_candidates] contains root child slots, or -1 for padding.
+ * sim_idx layout is [wave, candidate, game], so game remains sim_idx % B for
+ * replay/backprop compatibility.
+ */
+__global__ void mcts_select_with_root_slots_kernel(
+    MCTSTree tree,
+    int*      leaf_indices,    // [total_sims]
+    uint8_t*  move_paths,      // [total_sims, MAX_TREE_DEPTH, sizeof(GPUMove)]
+    int*      path_lengths,    // [total_sims]
+    int*      vl_paths,        // [total_sims, MAX_TREE_DEPTH]
+    int*      vl_lengths,      // [total_sims]
+    const int8_t* game_active, // [B]
+    const int*    root_nodes,  // [B]
+    const int*    root_slots,  // [B, num_candidates]
+    int num_candidates,
+    int max_root_children,
+    float c_puct,
+    int B, int total_sims
+) {
+    int sim_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sim_idx >= total_sims) return;
+
+    int game = sim_idx % B;
+    int candidate = (sim_idx / B) % num_candidates;
+
+    if (!game_active[game]) {
+        leaf_indices[sim_idx] = -1;
+        path_lengths[sim_idx] = 0;
+        vl_lengths[sim_idx]   = 0;
+        return;
+    }
+
+    int slot = root_slots[(int64_t)game * num_candidates + candidate];
+    if (slot < 0 || slot >= max_root_children) {
+        leaf_indices[sim_idx] = -1;
+        path_lengths[sim_idx] = 0;
+        vl_lengths[sim_idx]   = 0;
+        return;
+    }
+
+    constexpr int MOVE_SZ = (int)sizeof(GPUMove);
+    GPUMove* my_moves = reinterpret_cast<GPUMove*>(
+        move_paths + (int64_t)sim_idx * MAX_TREE_DEPTH * MOVE_SZ);
+    int* my_vl = vl_paths + (int64_t)sim_idx * MAX_TREE_DEPTH;
+
+    int root_node = root_nodes[game];
+    int root_i = tree_idx(tree, game, root_node);
+    int fc = tree.first_child[root_i];
+    int nc = tree.num_children[root_i];
+    if (fc < 0 || tree.is_terminal[root_i] || nc <= 0 || slot >= nc) {
+        leaf_indices[sim_idx] = -1;
+        path_lengths[sim_idx] = 0;
+        vl_lengths[sim_idx]   = 0;
+        return;
+    }
+
+    int node = fc + slot;
+    if (node < 0 || node >= tree.max_nodes) {
+        leaf_indices[sim_idx] = -1;
+        path_lengths[sim_idx] = 0;
+        vl_lengths[sim_idx]   = 0;
+        return;
+    }
+
+    int path_len = 0;
+
+    int ni_root_child = tree_idx(tree, game, node);
+    atomicAdd(&tree.visit_count[ni_root_child], 1);
+    atomicAdd(&tree.total_value[ni_root_child], -1.0f);
+
+    if (path_len < MAX_TREE_DEPTH) {
+        my_vl[path_len] = node;
+        int64_t mb_base = ((int64_t)game * tree.max_nodes + node) * MOVE_SZ;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(&my_moves[path_len]);
+        for (int b = 0; b < MOVE_SZ; b++)
+            dst[b] = tree.move_bytes[mb_base + b];
+        path_len++;
+    }
+
+    for (int _loop_iter = 1; _loop_iter < MAX_TREE_DEPTH; _loop_iter++) {
+        int ni = tree_idx(tree, game, node);
+
+        int child_fc = tree.first_child[ni];
+        int child_nc = tree.num_children[ni];
+        if (child_fc < 0 || tree.is_terminal[ni] || child_nc == 0) break;
+        if (child_nc <= 0 || child_nc > 1024) break;
+
+        int best_child = -1;
+        float best_score = -1e30f;
+        for (int c = 0; c < child_nc; c++) {
+            int child_node = child_fc + c;
+            if (child_node < 0 || child_node >= tree.max_nodes) break;
+            float score = puct_score(tree, game, node, child_node, c_puct);
+            if (score > best_score) {
+                best_score = score;
+                best_child = child_node;
+            }
+        }
+
+        if (best_child < 0) break;
+
+        node = best_child;
+
+        int ni2 = tree_idx(tree, game, node);
+        atomicAdd(&tree.visit_count[ni2], 1);
+        atomicAdd(&tree.total_value[ni2], -1.0f);
+
+        if (path_len < MAX_TREE_DEPTH) {
+            my_vl[path_len] = node;
+            int64_t mb_base = ((int64_t)game * tree.max_nodes + node) * MOVE_SZ;
+            uint8_t* dst = reinterpret_cast<uint8_t*>(&my_moves[path_len]);
+            for (int b = 0; b < MOVE_SZ; b++)
+                dst[b] = tree.move_bytes[mb_base + b];
+            path_len++;
+        }
+    }
+
+    leaf_indices[sim_idx] = node;
+    path_lengths[sim_idx] = path_len;
+    vl_lengths[sim_idx]   = path_len;
+}
+
+/**
  * EXPAND with DENSE PRIORS — like mcts_expand_kernel but priors are
  * given per-legal-move (NOT per-action). This avoids needing the 29407-dim
  * engine action-space mapping for networks like PRS (6841-dim), MC

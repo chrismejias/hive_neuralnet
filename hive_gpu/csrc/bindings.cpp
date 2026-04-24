@@ -130,6 +130,26 @@ mcts_select_with_root_mask_batch(
     torch::Tensor alive_mask, int max_root_children,
     float c_puct, int B, int W, int max_nodes);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mcts_select_with_root_slots_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor game_active, torch::Tensor root_nodes,
+    torch::Tensor root_slots, int num_candidates, int max_root_children,
+    float c_puct, int B, int W, int max_nodes);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mcts_select_replay_legal_fnn_root_slots_batch(
+    torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
+    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor root_states,
+    torch::Tensor game_active, torch::Tensor root_nodes,
+    torch::Tensor root_slots, int num_candidates, int max_root_children,
+    float c_puct, int B, int W, int max_nodes);
+
 torch::Tensor mcts_expand_dense_priors_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
     torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
@@ -265,6 +285,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Apply root policy temperature + Dirichlet noise");
     m.def("mcts_select_with_root_mask_batch", &hive_gpu::mcts_select_with_root_mask_batch,
           "MCTS PUCT selection with root alive-mask (Gumbel Sequential Halving)");
+    m.def("mcts_select_with_root_slots_batch", &hive_gpu::mcts_select_with_root_slots_batch,
+          "MCTS PUCT selection with explicit root slots (equal-budget Gumbel halving)");
+    m.def("mcts_select_replay_legal_fnn_root_slots_batch",
+          &hive_gpu::mcts_select_replay_legal_fnn_root_slots_batch,
+          "Fused root-slot select + replay + legal/FNN features for one Gumbel wave");
     m.def("mcts_expand_dense_priors_batch", &hive_gpu::mcts_expand_dense_priors_batch,
           "MCTS expand with per-legal-move priors (no ACTION_SPACE indirection)");
     m.def("mcts_expand_and_backprop_dense_priors_batch",

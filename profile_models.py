@@ -73,6 +73,8 @@ class TimedExt:
         "prs_v2_classify_batch",
         "legal_moves_to_actions_batch",
         "mcts_select_with_root_mask_batch",
+        "mcts_select_with_root_slots_batch",
+        "mcts_select_replay_legal_fnn_root_slots_batch",
         "mcts_expand_and_backprop_dense_priors_batch",
         "mcts_select_batch",
         "mcts_expand_and_backprop_batch",
@@ -150,7 +152,7 @@ def print_report(
 
 # ─── PRS v2 ───────────────────────────────────────────────────────────────────
 
-def run_prs():
+def run_prs(preset: str = "small"):
     import hive_gpu
     from hive_prs.prs_trainer_v2 import PRSTrainerV2, PRSTrainConfigV2
     from hive_prs.prs_transformer import PRSConfig
@@ -161,7 +163,7 @@ def run_prs():
         num_epochs=3, batch_size=256,
         checkpoint_dir="/tmp/prof_prs", checkpoint_keep_every=0,
     )
-    trainer = PRSTrainerV2(cfg, PRSConfig.small())
+    trainer = PRSTrainerV2(cfg, getattr(PRSConfig, preset)())
 
     sp_timer = Timer()
     tr_timer = Timer()
@@ -246,7 +248,7 @@ def run_prs():
     peak_total = mb_peak()
 
     print_report(
-        "PRS v2  (Gumbel MCTS · 813-slot head · ~1.3M params)",
+        f"PRS v2 {preset}  (Gumbel MCTS · 813-slot head)",
         sp_timer, sp_s, tr_timer, tr_s, max(peak_sp, peak_total),
     )
     cleanup()
@@ -279,6 +281,7 @@ def run_mc():
         _orig_init(self_orch, net, config)
         self_orch.ext = timed_ext_sp
         wrap_method(self_orch, "_run_simulations",       sp_timer, "mcts._run_simulations")
+        wrap_method(self_orch, "_run_simulations_for_root_slots", sp_timer, "mcts._run_simulations_for_root_slots")
         wrap_method(self_orch, "_expand_root_if_needed", sp_timer, "mcts._expand_root")
     _mc_mod.MCMCTSOrchestrator.__init__ = _patched_init
 
@@ -380,7 +383,13 @@ def run_mc():
 
 # ─── FNN (Gumbel) ────────────────────────────────────────────────────────────
 
-def _run_fnn(use_puct: bool, skip_training: bool = False):
+def _run_fnn(
+    use_puct: bool,
+    skip_training: bool = False,
+    wave_parallel: bool = True,
+    puct_wave_size: int = 16,
+    temperature_drop_move: int = 20,
+):
     from hive_fnn.fnn_trainer import FNNTrainer, FNNTrainConfig
     from hive_fnn.fnn_network import FNNConfig
     import hive_fnn.fnn_mcts_orchestrator as _fmcts_mod
@@ -392,6 +401,9 @@ def _run_fnn(use_puct: bool, skip_training: bool = False):
         mcts_simulations=SIMS, max_num_considered=GUMBEL_K,
         num_epochs=3, batch_size=128,
         use_puct=use_puct,
+        gumbel_wave_parallel=wave_parallel,
+        puct_wave_size=puct_wave_size,
+        temperature_drop_move=temperature_drop_move,
         checkpoint_dir="/tmp/prof_fnn", checkpoint_keep_every=0,
     )
     trainer = FNNTrainer(cfg, FNNConfig.small())
@@ -405,11 +417,24 @@ def _run_fnn(use_puct: bool, skip_training: bool = False):
     def _patched_fmcts_init(self_orch, net, config=None):
         _orig_fmcts_init(self_orch, net, config)
         self_orch.ext = timed_ext_sp
+        if not use_puct:
+            wrap_method(self_orch, "_eval_states",           sp_timer, "nn._eval_states (FNN encode+score)")
+            wrap_method(self_orch, "_find_immediate_wins",   sp_timer, "check_immediate_wins")
+            wrap_method(self_orch, "_run_simulations",       sp_timer, "mcts._run_simulations")
+            wrap_method(self_orch, "_run_simulations_for_root_slots", sp_timer, "mcts._run_simulations_for_root_slots")
+            wrap_method(self_orch, "_expand_root_if_needed", sp_timer, "mcts._expand_root")
+    _fmcts_mod.FNNMCTSOrchestrator.__init__ = _patched_fmcts_init
+
+    _orig_fpuct_init = _fpuct_mod.FNNPUCTOrchestrator.__init__
+    def _patched_fpuct_init(self_orch, net, config=None):
+        _orig_fpuct_init(self_orch, net, config)
+        self_orch.ext = timed_ext_sp
+        self_orch._eval_helper.ext = timed_ext_sp
         wrap_method(self_orch, "_eval_states",           sp_timer, "nn._eval_states (FNN encode+score)")
         wrap_method(self_orch, "_find_immediate_wins",   sp_timer, "check_immediate_wins")
         wrap_method(self_orch, "_run_simulations",       sp_timer, "mcts._run_simulations")
         wrap_method(self_orch, "_expand_root_if_needed", sp_timer, "mcts._expand_root")
-    _fmcts_mod.FNNMCTSOrchestrator.__init__ = _patched_fmcts_init
+    _fpuct_mod.FNNPUCTOrchestrator.__init__ = _patched_fpuct_init
 
     t0 = synced()
     examples, stats = trainer._self_play()
@@ -417,10 +442,12 @@ def _run_fnn(use_puct: bool, skip_training: bool = False):
     variant = "PUCT MCTS" if use_puct else "Gumbel MCTS"
     print(
         f"  FNN {variant} self-play complete: "
-        f"{sp_s:.2f}s, {len(examples)} games, "
-        f"{sum(len(g) for g in examples)} examples"
+        f"{sp_s:.2f}s, {stats['num_games']} games, "
+        f"{len(examples)} examples "
+        f"(W:{stats['white_wins']} B:{stats['black_wins']} D:{stats['draws']})"
     )
     _fmcts_mod.FNNMCTSOrchestrator.__init__ = _orig_fmcts_init
+    _fpuct_mod.FNNPUCTOrchestrator.__init__ = _orig_fpuct_init
     peak_sp = mb_peak()
     cleanup()
 
@@ -493,13 +520,31 @@ def main() -> None:
     parser.add_argument(
         "--models",
         nargs="+",
-        choices=["prs", "mc", "fnn-gumbel", "fnn-puct"],
-        default=["prs", "mc", "fnn-gumbel", "fnn-puct"],
+        choices=["prs-small", "prs-large", "mc", "fnn-gumbel", "fnn-puct"],
+        default=["prs-small", "prs-large", "mc", "fnn-gumbel", "fnn-puct"],
         help="Which model profiles to run, in order.",
     )
     parser.add_argument("--games", type=int, default=GAMES)
     parser.add_argument("--sims", type=int, default=SIMS)
     parser.add_argument("--gumbel-k", type=int, default=GUMBEL_K)
+    parser.add_argument(
+        "--fnn-gumbel-wave-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable or disable the FNN Gumbel wave schedule.",
+    )
+    parser.add_argument(
+        "--fnn-puct-wave-size",
+        type=int,
+        default=16,
+        help="PUCT FNN virtual-loss wave size.",
+    )
+    parser.add_argument(
+        "--temperature-drop-move",
+        type=int,
+        default=20,
+        help="Move number at which self-play switches from sampling to greedy action selection.",
+    )
     parser.add_argument(
         "--skip-training",
         action="store_true",
@@ -518,10 +563,23 @@ def main() -> None:
     torch.zeros(1, device="cuda"); torch.cuda.synchronize()  # CUDA warmup
 
     runners = {
-        "prs": run_prs,
+        "prs-small": lambda: run_prs("small"),
+        "prs-large": lambda: run_prs("large"),
         "mc": run_mc,
-        "fnn-gumbel": lambda: _run_fnn(use_puct=False, skip_training=args.skip_training),
-        "fnn-puct": lambda: _run_fnn(use_puct=True, skip_training=args.skip_training),
+        "fnn-gumbel": lambda: _run_fnn(
+            use_puct=False,
+            skip_training=args.skip_training,
+            wave_parallel=args.fnn_gumbel_wave_parallel,
+            puct_wave_size=args.fnn_puct_wave_size,
+            temperature_drop_move=args.temperature_drop_move,
+        ),
+        "fnn-puct": lambda: _run_fnn(
+            use_puct=True,
+            skip_training=args.skip_training,
+            wave_parallel=args.fnn_gumbel_wave_parallel,
+            puct_wave_size=args.fnn_puct_wave_size,
+            temperature_drop_move=args.temperature_drop_move,
+        ),
     }
     for model_name in args.models:
         cleanup()

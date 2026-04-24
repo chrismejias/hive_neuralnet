@@ -8,7 +8,7 @@ AlphaZero-style self-play training for the board game [Hive](https://en.wikipedi
 |-------|---------|--------|-----------|
 | Transformer | `hive_gpu` | ~9M | GPU-native batched Gumbel |
 | PRS Transformer | `hive_prs` | 1.3M / 9.7M | Gumbel-root MCTS (v2 default) |
-| FNN (HiveGo-style) | `hive_fnn` | 0.6K – 15K | Gumbel-root MCTS / PUCT MCTS |
+| FNN (HiveGo-style) | `hive_fnn` | 1.0K – 18.8K | Gumbel-root MCTS / PUCT MCTS |
 | Move-Conditioned Transformer | `hive_mc` | ~1.1M / ~5M | Gumbel-root MCTS |
 
 All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels for move generation, state encoding, and legal move lookup.
@@ -87,6 +87,26 @@ nohup python3.11 -u -m hive_prs.train_prs \
 echo $!
 ```
 
+FNN example:
+
+```bash
+cd /workspace/hive_neuralnet
+mkdir -p checkpoints_fnn
+
+nohup python3.11 -u -m hive_fnn.train_fnn \
+  --preset large \
+  --iterations 1000 \
+  --games 256 \
+  --simulations 1024 \
+  --gumbel-considered 16 \
+  --checkpoint-dir checkpoints_fnn \
+  --checkpoint-keep-every 50 \
+  --gumbel-wave-parallel \
+  >> checkpoints_fnn/training.log 2>&1 < /dev/null &
+
+echo $!
+```
+
 Check that exactly one intended trainer is running:
 
 ```bash
@@ -122,8 +142,8 @@ background-launch templates.
 Based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). Uses Sequential Halving with Gumbel noise to select and evaluate a fixed budget of candidate actions. The original transformer path batches independent root evaluations; the PRS, FNN, and MC paths use Gumbel-root MCTS tree search.
 
 - **On by default** — no flag needed
-- Use `--gumbel-considered` to set the number of actions considered at the root (k, default 16)
-- Rounds = ceil(log2(k)) — e.g. k=16 → 4 rounds
+- Current PRS/FNN defaults standardize on `k=16`
+- Rounds = `ceil(log2(k))` — for the current fixed `k=16`, that is 4 rounds
 - Scales well with VRAM: run more games in parallel, not more serial rounds
 
 ### Wave-parallel MCTS (opt-out, Transformer only)
@@ -227,10 +247,12 @@ Legacy PRS v1 modules are archived under `archive/legacy_prs_v1`.
 - **Default:** Gumbel-root MCTS tree search (`PRSMCTSOrchestratorV2`)
 - Sequential-halving rounds use final Gumbel sigma scoring (`gumbel + logits + sigma * Q`) for the played move, rather than visit-count argmax.
 - Wave-parallel MCTS is enabled by default with a hard-coded per-round schedule: `1, 2, 4, 8`. Use `--no-wave-parallel` for pure serial waves.
+- The current training/profile defaults use `k=16`.
 - PRS enables TF32 matmul precision for the transformer trunk on supported GPUs.
 - `--compile-forward` can opt in to `torch.compile` for the tensor-only trunk/head path; it is off by default because Inductor can be unstable on some hosts.
 - Current `train_prs` path is v2-only; legacy PRS-v1 search paths are archived.
 - Move-cap draws are excluded from value loss, while their policy targets are still retained.
+- `profile_models.py` exposes `prs-small` and `prs-large` for direct preset comparison.
 
 ### Training
 
@@ -249,6 +271,9 @@ python -m hive_prs.train_prs \
   --d-model 256 --num-heads 16 --num-layers 8 --dim-ff 1024 \
   --iterations 1500 --games 128 --simulations 512 --max-considered 16 \
   --checkpoint-dir checkpoints_prs_large
+
+# Compare small vs large
+python -m profile_models --models prs-small prs-large --games 256 --sims 256 --gumbel-k 16
 ```
 
 ### Performance (RTX 4090, small model)
@@ -288,9 +313,9 @@ A tiny feedforward network inspired by HiveGo's AlphaZeroFNN. The key idea: enco
 - **Board encoder**: 88-dim features → hidden → embedding (Linear + sigmoid + LayerNorm)
 - **Value head**: embedding → Linear → tanh
 - **Action scoring**: concat [root\_emb, successor\_emb] → tower → logit
-- **Small** (~600 params): hidden=8, embed=8, action\_hidden=8
-- **Medium** (~5K params): hidden=32, embed=32, action\_hidden=32
-- **Large** (~15K params): hidden=64, embed=64, action\_hidden=64
+- **Small** (~1.0K params): hidden=8, embed=8, action\_hidden=8
+- **Medium** (~6.3K params): hidden=32, embed=32, action\_hidden=32
+- **Large** (~18.8K params, current default): hidden=64, embed=64, action\_hidden=64
 
 ### 88-dim Feature Vector (per state, extracted by CUDA kernel)
 
@@ -314,6 +339,7 @@ The entire Gumbel AlphaZero game loop — move generation, feature extraction, F
 
 - **Default:** Gumbel-root MCTS tree search (`FNNMCTSOrchestrator`)
 - Gumbel MCTS uses a hard-coded per-round wave schedule `2, 4, 8, 16` by default; use `--no-gumbel-wave-parallel` for pure serial waves.
+- The current Gumbel implementations standardize on `k=16`.
 - **Alternative:** plain PUCT MCTS (`FNNPUCTOrchestrator`) via `--puct`
 - PUCT MCTS uses wave-parallel virtual-loss search with `--puct-wave-size` (default 16).
 - Move-cap draws are excluded from value loss, while their policy targets are still retained.
@@ -321,14 +347,14 @@ The entire Gumbel AlphaZero game loop — move generation, feature extraction, F
 ### Training
 
 ```bash
-# Quick smoke test (1 iteration, small model)
+# Quick smoke test (1 iteration, large model)
 python -m hive_fnn.train_fnn \
-  --preset small --games 32 --simulations 64 --gumbel-considered 16 \
+  --preset large --games 32 --simulations 64 --gumbel-considered 16 \
   --iterations 1
 
-# Full training run (small model)
+# Full training run (large model)
 python -m hive_fnn.train_fnn \
-  --preset small \
+  --preset large \
   --games 128 --simulations 1024 --gumbel-considered 16 \
   --iterations 1500 \
   --checkpoint-dir checkpoints_fnn
@@ -339,16 +365,25 @@ python -m hive_fnn.train_fnn \
   --games 128 --simulations 512 --gumbel-considered 16 \
   --iterations 1500 \
   --checkpoint-dir checkpoints_fnn_medium
+
+# Large model (current default)
+python -m hive_fnn.train_fnn \
+  --preset large \
+  --games 128 --simulations 1024 --gumbel-considered 16 \
+  --iterations 1500 \
+  --checkpoint-dir checkpoints_fnn_large
 ```
+
+The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 
 ### FNN Key Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--preset` | — | `small` / `medium` / `large` (overrides `--hidden-dim` etc.) |
-| `--hidden-dim` | 32 | Board encoder hidden dimension |
-| `--embed-dim` | 32 | Board embedding dimension |
-| `--action-hidden` | 32 | Action tower hidden dimension |
+| `--hidden-dim` | 64 | Board encoder hidden dimension |
+| `--embed-dim` | 64 | Board embedding dimension |
+| `--action-hidden` | 64 | Action tower hidden dimension |
 | `--iterations` | 1500 | Training iterations |
 | `--games` | 128 | Parallel self-play games per iteration |
 | `--simulations` | 128 | Gumbel simulation budget per move |

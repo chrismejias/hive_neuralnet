@@ -707,6 +707,123 @@ mcts_select_with_root_mask_batch(
 }
 
 /**
+ * MCTS select with explicit root slots (for equal-budget Gumbel halving).
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mcts_select_with_root_slots_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor game_active, at::Tensor root_nodes,
+    at::Tensor root_slots, int num_candidates, int max_root_children,
+    float c_puct, int B, int W, int max_nodes
+) {
+    int total = W * num_candidates * B;
+    auto oi = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto ou = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+
+    auto leaf_idx   = at::zeros({total}, oi);
+    auto move_paths = at::zeros({total, MAX_TREE_DEPTH, (int64_t)sizeof(GPUMove)}, ou);
+    auto path_lens  = at::zeros({total}, oi);
+    auto vl_paths   = at::zeros({total, MAX_TREE_DEPTH}, oi);
+    auto vl_lens    = at::zeros({total}, oi);
+
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    mcts_select_with_root_slots_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<int*>(leaf_idx.data_ptr()),
+        static_cast<uint8_t*>(move_paths.data_ptr()),
+        static_cast<int*>(path_lens.data_ptr()),
+        static_cast<int*>(vl_paths.data_ptr()),
+        static_cast<int*>(vl_lens.data_ptr()),
+        static_cast<const int8_t*>(game_active.data_ptr()),
+        static_cast<const int*>(root_nodes.data_ptr()),
+        static_cast<const int*>(root_slots.data_ptr()),
+        num_candidates, max_root_children,
+        c_puct, B, total);
+
+    return std::make_tuple(leaf_idx, move_paths, path_lens, vl_paths, vl_lens);
+}
+
+/**
+ * Fused root-slot select + replay + terminal check + legal/FNN feature build.
+ *
+ * This is the largest prefix of one Gumbel wave that can stay inside the CUDA
+ * extension before Python must run the FNN forward pass.
+ */
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+mcts_select_replay_legal_fnn_root_slots_batch(
+    at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
+    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor root_states,
+    at::Tensor game_active, at::Tensor root_nodes,
+    at::Tensor root_slots, int num_candidates, int max_root_children,
+    float c_puct, int B, int W, int max_nodes
+) {
+    int total = W * num_candidates * B;
+    auto oi = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto ou = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+    auto of = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+
+    auto leaf_idx   = at::zeros({total}, oi);
+    auto move_paths = at::zeros({total, MAX_TREE_DEPTH, (int64_t)sizeof(GPUMove)}, ou);
+    auto path_lens  = at::zeros({total}, oi);
+    auto vl_paths   = at::zeros({total, MAX_TREE_DEPTH}, oi);
+    auto vl_lens    = at::zeros({total}, oi);
+    auto leaf_states = at::zeros({total, root_states.size(1)}, ou);
+    auto results = at::zeros({total}, oi);
+    auto legal_moves = at::zeros(
+        {total, (int64_t)MAX_LEGAL_MOVES, (int64_t)sizeof(GPUMove)}, ou);
+    auto num_legal = at::zeros({total}, oi);
+    auto features = at::zeros({total, (int64_t)FNN_FEAT_DIM}, of);
+
+    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    mcts_select_with_root_slots_kernel<<<blocks, threads>>>(
+        tree,
+        static_cast<int*>(leaf_idx.data_ptr()),
+        static_cast<uint8_t*>(move_paths.data_ptr()),
+        static_cast<int*>(path_lens.data_ptr()),
+        static_cast<int*>(vl_paths.data_ptr()),
+        static_cast<int*>(vl_lens.data_ptr()),
+        static_cast<const int8_t*>(game_active.data_ptr()),
+        static_cast<const int*>(root_nodes.data_ptr()),
+        static_cast<const int*>(root_slots.data_ptr()),
+        num_candidates, max_root_children,
+        c_puct, B, total);
+
+    mcts_replay_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const HiveState*>(root_states.data_ptr()),
+        reinterpret_cast<HiveState*>(leaf_states.data_ptr()),
+        static_cast<const uint8_t*>(move_paths.data_ptr()),
+        static_cast<const int*>(path_lens.data_ptr()),
+        static_cast<const int*>(leaf_idx.data_ptr()),
+        B, total);
+
+    check_results_kernel<<<blocks, threads>>>(
+        reinterpret_cast<HiveState*>(leaf_states.data_ptr()),
+        static_cast<int*>(results.data_ptr()),
+        total);
+
+    generate_legal_moves_and_fnn_features_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const HiveState*>(leaf_states.data_ptr()),
+        reinterpret_cast<GPUMove*>(legal_moves.data_ptr()),
+        static_cast<int*>(num_legal.data_ptr()),
+        static_cast<float*>(features.data_ptr()),
+        total);
+
+    return std::make_tuple(
+        leaf_idx, leaf_states, legal_moves, num_legal, features,
+        results, vl_paths, vl_lens);
+}
+
+/**
  * MCTS expand with dense per-legal-move priors (no ACTION_SPACE indirection).
  */
 at::Tensor mcts_expand_dense_priors_batch(
