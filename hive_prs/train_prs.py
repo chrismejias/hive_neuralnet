@@ -3,11 +3,16 @@ CLI entry point for PRS v2 training (default PRS path).
 
 Usage:
     python -m hive_prs.train_prs [options]
+
+For long runs, prefer the nohup pattern shown in --help: use python -u,
+redirect stdin from /dev/null, append stdout/stderr to the training log, and
+capture the PID.
 """
 
 from __future__ import annotations
 
 import argparse
+import textwrap
 
 from hive_prs.prs_transformer import PRSConfig
 from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
@@ -15,7 +20,36 @@ from hive_prs.prs_trainer_v2 import PRSTrainConfigV2, PRSTrainerV2
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train the PRS v2 Transformer")
+    p = argparse.ArgumentParser(
+        description="Train the PRS v2 Transformer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Long-running background launch:
+              cd /workspace/hive_neuralnet
+              mkdir -p checkpoints_prs_v2
+              nohup python3.11 -u -m hive_prs.train_prs \\
+                --iterations 1000 \\
+                --games 256 \\
+                --simulations 256 \\
+                --max-considered 16 \\
+                --checkpoint-dir checkpoints_prs_v2 \\
+                --checkpoint-keep-every 50 \\
+                --resume checkpoints_prs_v2/prs_v2_iter_0500.pt \\
+                --wave-parallel \\
+                >> checkpoints_prs_v2/training.log 2>&1 < /dev/null &
+              echo $!
+
+            Checks:
+              pgrep -af 'hive_prs.train_prs|train_prs'
+              tail -f checkpoints_prs_v2/training.log
+
+            Notes:
+              - python -u keeps startup and per-iteration output unbuffered.
+              - < /dev/null prevents the process from inheriting a terminal stdin.
+              - If launched through a tool that kills detached children, use a
+                persistent shell/tmux/session and run the same command in it.
+        """),
+    )
 
     # Model
     p.add_argument("--d-model", type=int, default=128)

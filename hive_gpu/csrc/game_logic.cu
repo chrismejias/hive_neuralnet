@@ -103,15 +103,39 @@ __global__ void fnn_successor_features_kernel(
         int root = (int)action_to_root[idx];
         int move_i = (int)move_indices[idx];
 
+        unsigned long long t0 = 0, t1 = 0;
+        if (MOVEGEN_PROFILE_ENABLED) t0 = clock64();
         HiveState child = states[root];
+        if (MOVEGEN_PROFILE_ENABLED) {
+            t1 = clock64();
+            mgp_add(MGP_FNN_SUCC_CALLS, 1);
+            mgp_add(MGP_FNN_SUCC_COPY_CYCLES, t1 - t0);
+            t0 = t1;
+        }
+
         const GPUMove& mv = legal_moves[(int64_t)root * MAX_LEGAL_MOVES + move_i];
         apply_move(child, mv);
+        if (MOVEGEN_PROFILE_ENABLED) {
+            t1 = clock64();
+            mgp_add(MGP_FNN_SUCC_APPLY_CYCLES, t1 - t0);
+            t0 = t1;
+        }
 
         GPUMove child_moves[MAX_LEGAL_MOVES];
-        int child_nlegal = generate_legal_moves(child, child_moves);
+        int child_nlegal = generate_fnn_feature_moves(child, child_moves);
+        if (MOVEGEN_PROFILE_ENABLED) {
+            t1 = clock64();
+            mgp_add(MGP_FNN_SUCC_LEGAL_CYCLES, t1 - t0);
+            t0 = t1;
+        }
+
         extract_fnn_features_device(
             child, child_moves, child_nlegal,
             features_out + (int64_t)idx * FNN_FEAT_DIM);
+        if (MOVEGEN_PROFILE_ENABLED) {
+            t1 = clock64();
+            mgp_add(MGP_FNN_SUCC_FEATURE_CYCLES, t1 - t0);
+        }
     }
 }
 

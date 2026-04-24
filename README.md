@@ -60,6 +60,61 @@ pip install -e hive_gpu/
 
 Or if a prebuilt `.pyd`/`.so` is already present in `hive_gpu/`, it loads automatically.
 
+## Long-Running Background Training
+
+Use `python -u`, redirect stdin from `/dev/null`, append both stdout and stderr
+to a log, and capture the PID. This is more reliable than a bare `nohup`
+because startup output is unbuffered and the process does not inherit an
+interactive stdin handle.
+
+PRS example:
+
+```bash
+cd /workspace/hive_neuralnet
+mkdir -p checkpoints_prs_v2
+
+nohup python3.11 -u -m hive_prs.train_prs \
+  --iterations 1000 \
+  --games 256 \
+  --simulations 256 \
+  --max-considered 16 \
+  --checkpoint-dir checkpoints_prs_v2 \
+  --checkpoint-keep-every 50 \
+  --resume checkpoints_prs_v2/prs_v2_iter_0500.pt \
+  --wave-parallel \
+  >> checkpoints_prs_v2/training.log 2>&1 < /dev/null &
+
+echo $!
+```
+
+Check that exactly one intended trainer is running:
+
+```bash
+pgrep -af 'hive_prs.train_prs|train_prs|hive_fnn.train_fnn|train_fnn|hive_mc.train_mc|train_mc'
+tail -f checkpoints_prs_v2/training.log
+```
+
+If no process appears and the log does not update, run the same command in the
+foreground first to catch startup errors:
+
+```bash
+python3.11 -u -m hive_prs.train_prs \
+  --iterations 1000 \
+  --games 256 \
+  --simulations 256 \
+  --max-considered 16 \
+  --checkpoint-dir checkpoints_prs_v2 \
+  --checkpoint-keep-every 50 \
+  --resume checkpoints_prs_v2/prs_v2_iter_0500.pt \
+  --wave-parallel
+```
+
+Some managed notebook/agent environments kill detached child processes when the
+launch command exits, even with `nohup`. In that case, start training inside a
+persistent shell, `tmux`, `screen`, or a long-lived PTY session and keep that
+session open. The trainer CLI help for PRS, FNN, and MC includes model-specific
+background-launch templates.
+
 ## Search Algorithms
 
 ### Gumbel AlphaZero (default)

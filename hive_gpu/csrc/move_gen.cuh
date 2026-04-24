@@ -51,7 +51,12 @@ enum MovegenProfileIdx {
     MGP_THROW_CALLS = 19,
     MGP_THROW_MOVES = 20,
     MGP_PASS_MOVES = 21,
-    MGP_MAX = 22,
+    MGP_FNN_SUCC_CALLS = 22,
+    MGP_FNN_SUCC_COPY_CYCLES = 23,
+    MGP_FNN_SUCC_APPLY_CYCLES = 24,
+    MGP_FNN_SUCC_LEGAL_CYCLES = 25,
+    MGP_FNN_SUCC_FEATURE_CYCLES = 26,
+    MGP_MAX = 27,
 };
 
 __device__ __managed__ unsigned long long MOVEGEN_PROFILE[MGP_MAX];
@@ -112,6 +117,81 @@ __device__ __forceinline__ bool can_slide_occ(const Bitboard& occ,
     return (cw_occ || ccw_occ) && !(cw_occ && ccw_occ);
 }
 
+__device__ __forceinline__ bool can_slide_ant_occ(const Bitboard& occ,
+                                                   const Bitboard& perimeter,
+                                                   int from_cell, int dir) {
+    int16_t dest = SLIDE_FLANKS[from_cell][dir][0];
+    if (dest < 0 || !perimeter.get(dest)) return false;
+
+    int16_t cw   = SLIDE_FLANKS[from_cell][dir][1];
+    int16_t ccw  = SLIDE_FLANKS[from_cell][dir][2];
+    bool cw_occ  = (cw  >= 0) && occ.get(cw);
+    bool ccw_occ = (ccw >= 0) && occ.get(ccw);
+    return (cw_occ || ccw_occ) && !(cw_occ && ccw_occ);
+}
+
+__device__ inline void build_empty_perimeter_mask(const Bitboard& occ,
+                                                   Bitboard& perimeter) {
+    perimeter.clear();
+    for (int wi = 0; wi < BB_WORDS; wi++) {
+        uint64_t bits = occ.w[wi];
+        while (bits) {
+            int bit = __ffsll(bits) - 1;
+            int cell = wi * 64 + bit;
+            bits &= bits - 1;
+            if (cell >= NUM_CELLS) continue;
+
+            for (int d = 0; d < NUM_DIRS; d++) {
+                int16_t nb = NEIGHBORS[cell][d];
+                if (nb >= 0 && !occ.get(nb)) {
+                    perimeter.set(nb);
+                }
+            }
+        }
+    }
+}
+
+struct MovegenStateCache {
+    Bitboard ap_mask;
+    Bitboard pinned_mask;
+    Bitboard base_perimeter;
+    bool base_perimeter_ready;
+};
+
+__device__ inline void init_movegen_state_cache(const HiveState& s,
+                                                 MovegenStateCache& cache) {
+    cache.ap_mask = find_articulation_points(s);
+    cache.pinned_mask.clear();
+    cache.base_perimeter_ready = false;
+
+    for (int wi = 0; wi < BB_WORDS; wi++) {
+        uint64_t bits = cache.ap_mask.w[wi];
+        while (bits) {
+            int bit = __ffsll(bits) - 1;
+            int cell = wi * 64 + bit;
+            bits &= bits - 1;
+            if (cell < NUM_CELLS && s.height[cell] == 1) {
+                cache.pinned_mask.set(cell);
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ bool is_pinned(const MovegenStateCache& cache,
+                                           int cell) {
+    return cache.pinned_mask.get(cell);
+}
+
+__device__ __forceinline__ const Bitboard& ensure_base_perimeter(
+    const HiveState& s, MovegenStateCache& cache
+) {
+    if (!cache.base_perimeter_ready) {
+        build_empty_perimeter_mask(s.occupied, cache.base_perimeter);
+        cache.base_perimeter_ready = true;
+    }
+    return cache.base_perimeter;
+}
+
 // ── Queen moves ─────────────────────────────────────────────────────
 
 /**
@@ -129,6 +209,13 @@ __device__ inline int gen_queen_moves(const HiveState& s, int cell,
         }
     }
     return count;
+}
+
+__device__ inline bool has_queen_move(const HiveState& s, int cell) {
+    for (int d = 0; d < NUM_DIRS; d++) {
+        if (can_slide(s, cell, d, cell)) return true;
+    }
+    return false;
 }
 
 // ── Grasshopper moves ───────────────────────────────────────────────
@@ -157,6 +244,18 @@ __device__ inline int gen_grasshopper_moves(const HiveState& s, int cell,
     return count;
 }
 
+__device__ inline bool has_grasshopper_move(const HiveState& s, int cell) {
+    for (int d = 0; d < NUM_DIRS; d++) {
+        int16_t pos = NEIGHBORS[cell][d];
+        if (pos < 0 || !s.occupied.get(pos)) continue;
+        while (pos >= 0 && s.occupied.get(pos)) {
+            pos = NEIGHBORS[pos][d];
+        }
+        if (pos >= 0) return true;
+    }
+    return false;
+}
+
 // ── Ant moves (BFS) ─────────────────────────────────────────────────
 
 /**
@@ -165,8 +264,12 @@ __device__ inline int gen_grasshopper_moves(const HiveState& s, int cell,
  * @param out  Output array for destination cells (max MAX_ANT_DESTS)
  * @return     Number of valid destinations
  */
-__device__ inline int gen_ant_moves(const HiveState& s, int cell,
-                                     uint16_t* out) {
+__device__ inline int gen_ant_moves_with_perimeter(const HiveState& s, int cell,
+                                                    const Bitboard& perimeter,
+                                                    uint16_t* out, int max_out) {
+    if (max_out <= 0) return 0;
+    if (max_out > MAX_ANT_DESTS) max_out = MAX_ANT_DESTS;
+
     Bitboard occ = s.occupied;
     occ.clr(cell);  // the moving ant's source is empty during the search
 
@@ -175,47 +278,113 @@ __device__ inline int gen_ant_moves(const HiveState& s, int cell,
     visited.clear();
     visited.set(cell);
 
-    // BFS frontier in local array
-    uint16_t frontier[MAX_ANT_DESTS];
+    // Use the output buffer as the BFS queue. Ant moves are all reachable
+    // destinations, so every enqueued cell is also an emitted move.
     int front_read = 0, front_write = 0;
 
     // Seed frontier with initial slide destinations
     for (int d = 0; d < NUM_DIRS; d++) {
-        if (can_slide_occ(occ, cell, d)) {
+        if (can_slide_ant_occ(occ, perimeter, cell, d)) {
             int16_t dest = SLIDE_FLANKS[cell][d][0];
             if (!visited.get(dest)) {
                 visited.set(dest);
-                if (front_write < MAX_ANT_DESTS)
-                    frontier[front_write++] = (uint16_t)dest;
+                out[front_write++] = (uint16_t)dest;
+                if (front_write >= max_out) break;
             }
         }
     }
 
-    int count = front_write;  // initial destinations are already results
-    // Copy initial frontier to output
-    for (int i = 0; i < front_write; i++) {
-        out[i] = frontier[i];
-    }
-
     // BFS expansion
-    while (front_read < front_write && count < MAX_ANT_DESTS) {
-        int cur = frontier[front_read++];
+    while (front_read < front_write && front_write < max_out) {
+        int cur = out[front_read++];
         for (int d = 0; d < NUM_DIRS; d++) {
-            if (can_slide_occ(occ, cur, d)) {
+            if (can_slide_ant_occ(occ, perimeter, cur, d)) {
                 int16_t dest = SLIDE_FLANKS[cur][d][0];
-                if (dest >= 0 && !visited.get(dest)) {
+                if (!visited.get(dest)) {
                     visited.set(dest);
-                    out[count++] = (uint16_t)dest;
-                    if (front_write < MAX_ANT_DESTS) {
-                        frontier[front_write++] = (uint16_t)dest;
-                    }
-                    if (count >= MAX_ANT_DESTS) break;
+                    out[front_write++] = (uint16_t)dest;
+                    if (front_write >= max_out) break;
                 }
             }
         }
     }
 
-    return count;
+    return front_write;
+}
+
+__device__ inline int gen_ant_moves_limited(const HiveState& s, int cell,
+                                             uint16_t* out, int max_out) {
+    Bitboard occ = s.occupied;
+    occ.clr(cell);
+
+    Bitboard perimeter;
+    build_empty_perimeter_mask(occ, perimeter);
+    return gen_ant_moves_with_perimeter(s, cell, perimeter, out, max_out);
+}
+
+__device__ inline int gen_ant_moves(const HiveState& s, int cell,
+                                     uint16_t* out) {
+    return gen_ant_moves_limited(s, cell, out, MAX_ANT_DESTS);
+}
+
+__device__ inline bool has_ant_move_with_perimeter(const HiveState& s, int cell,
+                                                    const Bitboard& perimeter) {
+    Bitboard occ = s.occupied;
+    occ.clr(cell);
+    for (int d = 0; d < NUM_DIRS; d++) {
+        if (can_slide_ant_occ(occ, perimeter, cell, d)) return true;
+    }
+    return false;
+}
+
+__device__ __forceinline__ void append_ant_move(GPUMove* out, int idx,
+                                                 int from_cell, int to_cell) {
+    out[idx].type = MOVE_MOVE;
+    out[idx].piece_type = PT_ANT;
+    out[idx].from_cell = (uint16_t)from_cell;
+    out[idx].to_cell = (uint16_t)to_cell;
+}
+
+__device__ inline int emit_ant_moves_with_perimeter(const HiveState& s, int cell,
+                                                     const Bitboard& perimeter,
+                                                     GPUMove* out, int count) {
+    if (count >= MAX_LEGAL_MOVES) return count;
+
+    Bitboard occ = s.occupied;
+    occ.clr(cell);
+
+    Bitboard visited;
+    visited.clear();
+    visited.set(cell);
+
+    int front_read = count;
+    int front_write = count;
+
+    for (int d = 0; d < NUM_DIRS && front_write < MAX_LEGAL_MOVES; d++) {
+        if (can_slide_ant_occ(occ, perimeter, cell, d)) {
+            int16_t dest = SLIDE_FLANKS[cell][d][0];
+            if (!visited.get(dest)) {
+                visited.set(dest);
+                append_ant_move(out, front_write++, cell, dest);
+            }
+        }
+    }
+
+    while (front_read < front_write && front_write < MAX_LEGAL_MOVES) {
+        int cur = out[front_read++].to_cell;
+        for (int d = 0; d < NUM_DIRS; d++) {
+            if (can_slide_ant_occ(occ, perimeter, cur, d)) {
+                int16_t dest = SLIDE_FLANKS[cur][d][0];
+                if (!visited.get(dest)) {
+                    visited.set(dest);
+                    append_ant_move(out, front_write++, cell, dest);
+                    if (front_write >= MAX_LEGAL_MOVES) break;
+                }
+            }
+        }
+    }
+
+    return front_write;
 }
 
 // ── Spider moves (3-step DFS) ───────────────────────────────────────
@@ -259,6 +428,29 @@ __device__ inline int gen_spider_moves(const HiveState& s, int cell,
     }
 
     return count;
+}
+
+__device__ inline bool has_spider_move(const HiveState& s, int cell) {
+    for (int d1 = 0; d1 < NUM_DIRS; d1++) {
+        if (!can_slide(s, cell, d1, cell)) continue;
+        int16_t p1 = SLIDE_FLANKS[cell][d1][0];
+        if (p1 < 0) continue;
+
+        for (int d2 = 0; d2 < NUM_DIRS; d2++) {
+            if (!can_slide(s, p1, d2, cell)) continue;
+            int16_t p2 = SLIDE_FLANKS[p1][d2][0];
+            if (p2 < 0 || p2 == cell || p2 == p1) continue;
+
+            for (int d3 = 0; d3 < NUM_DIRS; d3++) {
+                if (!can_slide(s, p2, d3, cell)) continue;
+                int16_t p3 = SLIDE_FLANKS[p2][d3][0];
+                if (p3 >= 0 && p3 != cell && p3 != p1 && p3 != p2) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 // ── Beetle moves ────────────────────────────────────────────────────
@@ -307,6 +499,28 @@ __device__ inline int gen_beetle_moves(const HiveState& s, int cell,
     }
 
     return count;
+}
+
+__device__ inline bool has_beetle_move(const HiveState& s, int cell) {
+    int src_height_after = s.height[cell] - 1;
+
+    for (int d = 0; d < NUM_DIRS; d++) {
+        int16_t dest = NEIGHBORS[cell][d];
+        if (dest < 0) continue;
+
+        int dest_height = s.height[dest];
+        int move_height = max(dest_height, src_height_after);
+        if (move_height > 0) {
+            int16_t cw  = SLIDE_FLANKS[cell][d][1];
+            int16_t ccw = SLIDE_FLANKS[cell][d][2];
+            int cw_h  = (cw  >= 0) ? s.height[cw]  : 0;
+            int ccw_h = (ccw >= 0) ? s.height[ccw] : 0;
+            if (!(cw_h > move_height && ccw_h > move_height)) return true;
+        } else if (can_slide(s, cell, d, cell)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ── Ladybug moves ───────────────────────────────────────────────────
@@ -381,6 +595,47 @@ __device__ inline int gen_ladybug_moves(const HiveState& s, int cell,
     return count;
 }
 
+__device__ inline bool has_ladybug_move(const HiveState& s, int cell) {
+    for (int d1 = 0; d1 < NUM_DIRS; d1++) {
+        int16_t p1 = NEIGHBORS[cell][d1];
+        if (p1 < 0 || !s.occupied.get(p1)) continue;
+
+        int src_h_after = s.height[cell] - 1;
+        int dst_h = s.height[p1];
+        int move_h = max(src_h_after, dst_h);
+        int16_t cw1  = SLIDE_FLANKS[cell][d1][1];
+        int16_t ccw1 = SLIDE_FLANKS[cell][d1][2];
+        int cw1_h  = (cw1  >= 0) ? s.height[cw1]  : 0;
+        int ccw1_h = (ccw1 >= 0) ? s.height[ccw1] : 0;
+        if (cw1_h > move_h && ccw1_h > move_h) continue;
+
+        for (int d2 = 0; d2 < NUM_DIRS; d2++) {
+            int16_t p2 = NEIGHBORS[p1][d2];
+            if (p2 < 0 || p2 == cell || !s.occupied.get(p2)) continue;
+
+            int trav_h = max(s.height[p1], s.height[p2]);
+            int16_t cw2  = SLIDE_FLANKS[p1][d2][1];
+            int16_t ccw2 = SLIDE_FLANKS[p1][d2][2];
+            int cw2_h  = (cw2  >= 0) ? s.height[cw2]  : 0;
+            int ccw2_h = (ccw2 >= 0) ? s.height[ccw2] : 0;
+            if (cw2_h > trav_h && ccw2_h > trav_h) continue;
+
+            for (int d3 = 0; d3 < NUM_DIRS; d3++) {
+                int16_t p3 = NEIGHBORS[p2][d3];
+                if (p3 < 0 || p3 == cell || p3 == p1 || s.occupied.get(p3)) continue;
+
+                int desc_h = max(s.height[p2], 0);
+                int16_t cw3  = SLIDE_FLANKS[p2][d3][1];
+                int16_t ccw3 = SLIDE_FLANKS[p2][d3][2];
+                int cw3_h  = (cw3  >= 0) ? s.height[cw3]  : 0;
+                int ccw3_h = (ccw3 >= 0) ? s.height[ccw3] : 0;
+                if (!(cw3_h > desc_h && ccw3_h > desc_h)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 // ── Pillbug moves (standard) ────────────────────────────────────────
 
 /**
@@ -389,6 +644,10 @@ __device__ inline int gen_ladybug_moves(const HiveState& s, int cell,
 __device__ inline int gen_pillbug_moves(const HiveState& s, int cell,
                                           uint16_t* out) {
     return gen_queen_moves(s, cell, out);
+}
+
+__device__ inline bool has_pillbug_move(const HiveState& s, int cell) {
+    return has_queen_move(s, cell);
 }
 
 // ── Pillbug special moves (throw) ───────────────────────────────────
@@ -424,13 +683,13 @@ __device__ __forceinline__ int find_direction(int from_cell, int to_cell) {
  *
  * @param s         Game state
  * @param pb_cell   Position of the pillbug (or mosquito acting as pillbug)
- * @param ap_mask   Articulation point mask
+ * @param cache     Per-state articulation/pinned/perimeter cache
  * @param out       Output moves array
  * @param count     Current count (appends to existing moves)
  * @return          Updated count
  */
 __device__ inline int gen_pillbug_throws(const HiveState& s, int pb_cell,
-                                           const Bitboard& ap_mask,
+                                           const MovegenStateCache& cache,
                                            GPUMove* out, int count) {
     int pb_height = s.height[pb_cell];
 
@@ -440,7 +699,7 @@ __device__ inline int gen_pillbug_throws(const HiveState& s, int pb_cell,
         if (target_cell < 0 || !s.occupied.get(target_cell)) continue;
 
         // Target must be on top and not pinned
-        if (is_pinned(s, ap_mask, target_cell)) continue;
+        if (is_pinned(cache, target_cell)) continue;
 
         // Target must have stack height 1 (only ground piece can be thrown)
         // Actually: target top piece is thrown, but only if it's the only piece
@@ -486,7 +745,9 @@ __device__ inline int gen_pillbug_throws(const HiveState& s, int pb_cell,
  * If adjacent only to mosquitos, cannot move.
  */
 __device__ inline int gen_mosquito_moves(const HiveState& s, int cell,
-                                           uint16_t* out) {
+                                           uint16_t* out,
+                                           Bitboard* ant_perimeter = nullptr,
+                                           bool* ant_perimeter_ready = nullptr) {
     // If elevated, act as beetle
     if (s.height[cell] > 1) {
         return gen_beetle_moves(s, cell, out);
@@ -523,7 +784,16 @@ __device__ inline int gen_mosquito_moves(const HiveState& s, int cell,
     }
 
     if (has_type[PT_ANT]) {
-        int n = gen_ant_moves(s, cell, tmp);
+        int n;
+        if (ant_perimeter) {
+            if (ant_perimeter_ready && !*ant_perimeter_ready) {
+                build_empty_perimeter_mask(s.occupied, *ant_perimeter);
+                *ant_perimeter_ready = true;
+            }
+            n = gen_ant_moves_with_perimeter(s, cell, *ant_perimeter, tmp, MAX_ANT_DESTS);
+        } else {
+            n = gen_ant_moves(s, cell, tmp);
+        }
         for (int i = 0; i < n; i++) {
             if (!result_set.get(tmp[i])) {
                 result_set.set(tmp[i]);
@@ -575,6 +845,47 @@ __device__ inline int gen_mosquito_moves(const HiveState& s, int cell,
     // Note: pillbug special throw is handled separately in generate_legal_moves
 
     return count;
+}
+
+__device__ inline bool has_mosquito_move(const HiveState& s, int cell,
+                                           Bitboard* ant_perimeter = nullptr,
+                                           bool* ant_perimeter_ready = nullptr) {
+    if (s.height[cell] > 1) {
+        return has_beetle_move(s, cell);
+    }
+
+    bool has_type[NUM_PIECE_TYPES + 1] = {};
+    for (int d = 0; d < NUM_DIRS; d++) {
+        int16_t nb = NEIGHBORS[cell][d];
+        if (nb < 0 || !s.occupied.get(nb)) continue;
+        PieceType npt = top_piece_type_at(s, nb);
+        if (npt != PT_MOSQUITO) {
+            has_type[npt] = true;
+        }
+    }
+
+    if ((has_type[PT_QUEEN] || has_type[PT_PILLBUG]) &&
+        has_queen_move(s, cell)) return true;
+
+    if (has_type[PT_ANT]) {
+        if (ant_perimeter) {
+            if (ant_perimeter_ready && !*ant_perimeter_ready) {
+                build_empty_perimeter_mask(s.occupied, *ant_perimeter);
+                *ant_perimeter_ready = true;
+            }
+            if (has_ant_move_with_perimeter(s, cell, *ant_perimeter)) return true;
+        } else {
+            uint16_t tmp[1];
+            if (gen_ant_moves_limited(s, cell, tmp, 1) > 0) return true;
+        }
+    }
+
+    if (has_type[PT_GRASSHOPPER] && has_grasshopper_move(s, cell)) return true;
+    if (has_type[PT_SPIDER] && has_spider_move(s, cell)) return true;
+    if (has_type[PT_BEETLE] && has_beetle_move(s, cell)) return true;
+    if (has_type[PT_LADYBUG] && has_ladybug_move(s, cell)) return true;
+
+    return false;
 }
 
 // ── Placement position generation ───────────────────────────────────
@@ -742,7 +1053,8 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
     // ── Movement moves (only if queen is placed) ────────────────
 
     if (is_queen_placed(s, color)) {
-        Bitboard ap_mask = find_articulation_points(s);
+        MovegenStateCache cache;
+        init_movegen_state_cache(s, cache);
 
         const Bitboard& my_pieces = (color == WHITE) ? s.white_top : s.black_top;
 
@@ -758,7 +1070,7 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
                 // (white_top/black_top already tracks top-piece ownership)
 
                 // Check if pinned
-                if (is_pinned(s, ap_mask, cell)) continue;
+                if (is_pinned(cache, cell)) continue;
 
                 // Generate type-specific destinations
                 uint16_t dests[MAX_ANT_DESTS];
@@ -773,9 +1085,15 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
                         break;
                     case PT_ANT:
                         mgp_add(MGP_ANT_CALLS, 1);
-                        ndests = gen_ant_moves(s, cell, dests);
-                        mgp_add(MGP_ANT_MOVES, ndests);
-                        break;
+                        {
+                            const Bitboard& base_perimeter =
+                                ensure_base_perimeter(s, cache);
+                            int before = count;
+                            count = emit_ant_moves_with_perimeter(
+                                s, cell, base_perimeter, out, count);
+                            mgp_add(MGP_ANT_MOVES, count - before);
+                        }
+                        continue;
                     case PT_GRASSHOPPER:
                         mgp_add(MGP_GRASSHOPPER_CALLS, 1);
                         ndests = gen_grasshopper_moves(s, cell, dests);
@@ -793,7 +1111,9 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
                         break;
                     case PT_MOSQUITO:
                         mgp_add(MGP_MOSQUITO_CALLS, 1);
-                        ndests = gen_mosquito_moves(s, cell, dests);
+                        ndests = gen_mosquito_moves(
+                            s, cell, dests, &cache.base_perimeter,
+                            &cache.base_perimeter_ready);
                         mgp_add(MGP_MOSQUITO_MOVES, ndests);
                         break;
                     case PT_LADYBUG:
@@ -837,7 +1157,7 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
                 // Pillbug on top → generate throws
                 if (pt == PT_PILLBUG) {
                     int before = count;
-                    count = gen_pillbug_throws(s, cell, ap_mask, out, count);
+                    count = gen_pillbug_throws(s, cell, cache, out, count);
                     mgp_add(MGP_THROW_CALLS, 1);
                     mgp_add(MGP_THROW_MOVES, count - before);
                 }
@@ -855,7 +1175,7 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
                     }
                     if (adj_pillbug) {
                         int before = count;
-                        count = gen_pillbug_throws(s, cell, ap_mask, out, count);
+                        count = gen_pillbug_throws(s, cell, cache, out, count);
                         mgp_add(MGP_THROW_CALLS, 1);
                         mgp_add(MGP_THROW_MOVES, count - before);
                     }
@@ -875,6 +1195,206 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
         mgp_add(MGP_PASS_MOVES, 1);
     }
 
+    return count;
+}
+
+__device__ __forceinline__ void emit_fnn_move_flag(
+    const HiveState& s, GPUMove* out, int& count,
+    uint32_t& seen_flags, PieceType pt, int from_cell
+) {
+    int src_h = s.height[from_cell];
+    if (src_h <= 0) return;
+    Color owner = cell_color(s.pieces[src_h - 1][from_cell]);
+    int bit = ((int)pt - 1) * 2 + (int)owner;
+    if (seen_flags & (1u << bit)) return;
+    seen_flags |= (1u << bit);
+    out[count].type = MOVE_MOVE;
+    out[count].piece_type = pt;
+    out[count].from_cell = (uint16_t)from_cell;
+    out[count].to_cell = 0;
+    count++;
+}
+
+__device__ inline void summarize_pillbug_throws_for_fnn(
+    const HiveState& s, int pb_cell, const MovegenStateCache& cache,
+    GPUMove* out, int& count, uint32_t& seen_flags
+) {
+    int pb_height = s.height[pb_cell];
+
+    for (int dt = 0; dt < NUM_DIRS; dt++) {
+        int16_t target_cell = NEIGHBORS[pb_cell][dt];
+        if (target_cell < 0 || !s.occupied.get(target_cell)) continue;
+        if (is_pinned(cache, target_cell)) continue;
+
+        int lift_h = max(s.height[target_cell] - 1, pb_height);
+        int opp_dt = find_direction(target_cell, pb_cell);
+        if (opp_dt < 0) continue;
+        if (elevated_gate_blocked(s, target_cell, opp_dt, lift_h)) continue;
+
+        for (int dd = 0; dd < NUM_DIRS; dd++) {
+            int16_t dest_cell = NEIGHBORS[pb_cell][dd];
+            if (dest_cell < 0 || dest_cell == target_cell) continue;
+            if (s.occupied.get(dest_cell)) continue;
+
+            int drop_h = max(pb_height, 0);
+            if (elevated_gate_blocked(s, pb_cell, dd, drop_h)) continue;
+
+            PieceType thrown_pt = top_piece_type_at(s, target_cell);
+            emit_fnn_move_flag(s, out, count, seen_flags, thrown_pt, target_cell);
+            break;
+        }
+    }
+}
+
+/**
+ * Generate a compact move list that preserves the FNN legal-move features:
+ * unique placement destinations and one MOVE per movable piece type/color.
+ */
+__device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* out) {
+    if (s.result != IN_PROGRESS) return 0;
+
+    Color color = current_player(s);
+    int ptn = player_turn_number(s);
+    int count = 0;
+
+    bool must_place_queen = (ptn == 3 && !is_queen_placed(s, color));
+    bool can_place_type[NUM_PIECE_TYPES];
+    bool has_legal_place_type = false;
+    for (int p = 0; p < NUM_PIECE_TYPES; p++) {
+        if (must_place_queen) {
+            can_place_type[p] = (p == 0) && (s.hands[color][0] > 0);
+        } else {
+            can_place_type[p] = (s.hands[color][p] > 0);
+        }
+        if (ptn == 0 && p == 0) can_place_type[p] = false;
+        has_legal_place_type = has_legal_place_type || can_place_type[p];
+    }
+
+    if (has_legal_place_type) {
+        Bitboard placements;
+        int npos = find_placement_positions(s, color, placements);
+        if (npos > 0) {
+            for (int wi = 0; wi < BB_WORDS; wi++) {
+                uint64_t bits = placements.w[wi];
+                while (bits && count < MAX_LEGAL_MOVES) {
+                    int bit = __ffsll(bits) - 1;
+                    int cell = wi * 64 + bit;
+                    bits &= bits - 1;
+                    if (cell >= NUM_CELLS) continue;
+                    out[count].type = MOVE_PLACE;
+                    out[count].piece_type = PT_EMPTY;
+                    out[count].from_cell = 0;
+                    out[count].to_cell = (uint16_t)cell;
+                    count++;
+                }
+            }
+        }
+    }
+
+    if (!is_queen_placed(s, color) || count >= MAX_LEGAL_MOVES) {
+        if (count == 0) {
+            out[0].type = MOVE_PASS;
+            out[0].piece_type = PT_EMPTY;
+            out[0].from_cell = 0;
+            out[0].to_cell = 0;
+            return 1;
+        }
+        return count;
+    }
+
+    MovegenStateCache cache;
+    init_movegen_state_cache(s, cache);
+    uint32_t seen_flags = 0;
+    const Bitboard& my_pieces = (color == WHITE) ? s.white_top : s.black_top;
+
+    for (int wi = 0; wi < BB_WORDS && count < MAX_LEGAL_MOVES; wi++) {
+        uint64_t bits = my_pieces.w[wi];
+        while (bits && count < MAX_LEGAL_MOVES) {
+            int bit = __ffsll(bits) - 1;
+            int cell = wi * 64 + bit;
+            bits &= bits - 1;
+            if (cell >= NUM_CELLS) continue;
+            if (is_pinned(cache, cell)) continue;
+
+            bool has_move = false;
+            PieceType pt = top_piece_type_at(s, cell);
+            int flag_bit = ((int)pt - 1) * 2 + (int)color;
+            if (seen_flags & (1u << flag_bit)) continue;
+
+            switch (pt) {
+                case PT_QUEEN:
+                    has_move = has_queen_move(s, cell);
+                    break;
+                case PT_ANT:
+                    has_move = has_ant_move_with_perimeter(
+                        s, cell, ensure_base_perimeter(s, cache));
+                    break;
+                case PT_GRASSHOPPER:
+                    has_move = has_grasshopper_move(s, cell);
+                    break;
+                case PT_SPIDER:
+                    has_move = has_spider_move(s, cell);
+                    break;
+                case PT_BEETLE:
+                    has_move = has_beetle_move(s, cell);
+                    break;
+                case PT_MOSQUITO:
+                    has_move = has_mosquito_move(
+                        s, cell, &cache.base_perimeter,
+                        &cache.base_perimeter_ready);
+                    break;
+                case PT_LADYBUG:
+                    has_move = has_ladybug_move(s, cell);
+                    break;
+                case PT_PILLBUG:
+                    has_move = has_pillbug_move(s, cell);
+                    break;
+                default:
+                    break;
+            }
+            if (has_move) {
+                emit_fnn_move_flag(s, out, count, seen_flags, pt, cell);
+            }
+        }
+    }
+
+    for (int wi = 0; wi < BB_WORDS && count < MAX_LEGAL_MOVES; wi++) {
+        uint64_t bits = my_pieces.w[wi];
+        while (bits && count < MAX_LEGAL_MOVES) {
+            int bit = __ffsll(bits) - 1;
+            int cell = wi * 64 + bit;
+            bits &= bits - 1;
+            if (cell >= NUM_CELLS) continue;
+
+            PieceType pt = top_piece_type_at(s, cell);
+            if (pt == PT_PILLBUG) {
+                summarize_pillbug_throws_for_fnn(s, cell, cache, out, count, seen_flags);
+            }
+            if (pt == PT_MOSQUITO && s.height[cell] == 1) {
+                bool adj_pillbug = false;
+                for (int d = 0; d < NUM_DIRS; d++) {
+                    int16_t nb = NEIGHBORS[cell][d];
+                    if (nb >= 0 && s.occupied.get(nb) &&
+                        top_piece_type_at(s, nb) == PT_PILLBUG) {
+                        adj_pillbug = true;
+                        break;
+                    }
+                }
+                if (adj_pillbug) {
+                    summarize_pillbug_throws_for_fnn(
+                        s, cell, cache, out, count, seen_flags);
+                }
+            }
+        }
+    }
+
+    if (count == 0) {
+        out[0].type = MOVE_PASS;
+        out[0].piece_type = PT_EMPTY;
+        out[0].from_cell = 0;
+        out[0].to_cell = 0;
+        return 1;
+    }
     return count;
 }
 

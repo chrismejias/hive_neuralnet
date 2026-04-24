@@ -87,6 +87,10 @@ __device__ inline void extract_fnn_features_device(
     opp_queen[0] = s.queen_cell[1];  // white's opponent is black's queen
     opp_queen[1] = s.queen_cell[0];  // black's opponent is white's queen
 
+    constexpr int PB_CELLS_PER_COLOR = 8;   // generous; real games see <= 2
+    uint16_t pb_cells[2][PB_CELLS_PER_COLOR];
+    int      pb_count[2] = {0, 0};
+
     for (int cell = 0; cell < NUM_CELLS; cell++) {
         int h = s.height[cell];
         if (h == 0) continue;
@@ -141,6 +145,25 @@ __device__ inline void extract_fnn_features_device(
                     Color qc = cell_color(below);
                     f[82 + (int)qc] = 1.0f;
                 }
+            }
+        }
+
+        // pillbug_capable [88:90]
+        bool is_capable = (pt == PT_PILLBUG);
+        if (!is_capable && pt == PT_MOSQUITO && h == 1) {
+            for (int d = 0; d < NUM_DIRS; d++) {
+                int16_t nb = NEIGHBORS[cell][d];
+                if (nb < 0 || s.height[nb] == 0) continue;
+                if (top_piece_type_at(s, nb) == PT_PILLBUG) {
+                    is_capable = true;
+                    break;
+                }
+            }
+        }
+        if (is_capable) {
+            f[88 + (int)pc] = 1.0f;
+            if (pb_count[(int)pc] < PB_CELLS_PER_COLOR) {
+                pb_cells[(int)pc][pb_count[(int)pc]++] = (uint16_t)cell;
             }
         }
     }
@@ -248,38 +271,6 @@ __device__ inline void extract_fnn_features_device(
     //
     // Pieces adjacent to both sides' pillbugs get counted in both buckets,
     // which is the intended signal (double pressure).
-    constexpr int PB_CELLS_PER_COLOR = 8;   // generous; real games see ≤ 2
-    uint16_t pb_cells[2][PB_CELLS_PER_COLOR];
-    int      pb_count[2] = {0, 0};
-
-    for (int cell = 0; cell < NUM_CELLS; cell++) {
-        int h = s.height[cell];
-        if (h == 0) continue;
-        uint8_t top = s.pieces[h - 1][cell];
-        PieceType pt = cell_piece_type(top);
-        Color pc     = cell_color(top);
-
-        bool is_capable = (pt == PT_PILLBUG);
-
-        if (!is_capable && pt == PT_MOSQUITO && h == 1) {
-            for (int d = 0; d < NUM_DIRS; d++) {
-                int16_t nb = NEIGHBORS[cell][d];
-                if (nb < 0 || s.height[nb] == 0) continue;
-                if (top_piece_type_at(s, nb) == PT_PILLBUG) {
-                    is_capable = true;
-                    break;
-                }
-            }
-        }
-
-        if (is_capable) {
-            f[88 + (int)pc] = 1.0f;
-            if (pb_count[(int)pc] < PB_CELLS_PER_COLOR) {
-                pb_cells[(int)pc][pb_count[(int)pc]++] = (uint16_t)cell;
-            }
-        }
-    }
-
     for (int c = 0; c < 2; c++) {
         for (int pi = 0; pi < pb_count[c]; pi++) {
             int pbc = (int)pb_cells[c][pi];

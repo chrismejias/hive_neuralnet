@@ -1,13 +1,41 @@
 from __future__ import annotations
 
 import argparse
+import textwrap
 
 from hive_mc.mc_trainer import MCTrainConfig, MCTrainer
 from hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train the move-conditioned Hive transformer")
+    p = argparse.ArgumentParser(
+        description="Train the move-conditioned Hive transformer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Long-running background launch:
+              cd /workspace/hive_neuralnet
+              mkdir -p checkpoints_mc
+              nohup python3.11 -u -m hive_mc.train_mc \\
+                --iterations 1500 \\
+                --games 128 \\
+                --simulations 256 \\
+                --gumbel-considered 16 \\
+                --checkpoint-dir checkpoints_mc \\
+                --checkpoint-keep-every 50 \\
+                >> checkpoints_mc/training.log 2>&1 < /dev/null &
+              echo $!
+
+            Checks:
+              pgrep -af 'hive_mc.train_mc|train_mc'
+              tail -f checkpoints_mc/training.log
+
+            Notes:
+              - python -u keeps startup and per-iteration output unbuffered.
+              - < /dev/null prevents the process from inheriting a terminal stdin.
+              - If launched through a tool that kills detached children, use a
+                persistent shell/tmux/session and run the same command in it.
+        """),
+    )
     p.add_argument("--d-model", type=int, default=128)
     p.add_argument("--num-heads", type=int, default=8)
     p.add_argument("--num-layers", type=int, default=3)

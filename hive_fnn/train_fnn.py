@@ -1,8 +1,14 @@
-"""CLI entry point for FNN training."""
+"""CLI entry point for FNN training.
+
+For long runs, prefer the nohup pattern shown in --help: use python -u,
+redirect stdin from /dev/null, append stdout/stderr to the training log, and
+capture the PID.
+"""
 
 from __future__ import annotations
 
 import argparse
+import textwrap
 
 from hive_fnn.fnn_network import FNNConfig, HiveFNN
 from hive_fnn.fnn_trainer import FNNTrainConfig, FNNTrainer
@@ -11,6 +17,33 @@ from hive_fnn.fnn_trainer import FNNTrainConfig, FNNTrainer
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Train the HiveGo-style feedforward network",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Long-running background launch:
+              cd /workspace/hive_neuralnet
+              mkdir -p checkpoints_fnn
+              nohup python3.11 -u -m hive_fnn.train_fnn \\
+                --preset small \\
+                --iterations 1500 \\
+                --games 128 \\
+                --simulations 1024 \\
+                --gumbel-considered 16 \\
+                --checkpoint-dir checkpoints_fnn \\
+                --checkpoint-keep-every 50 \\
+                --gumbel-wave-parallel \\
+                >> checkpoints_fnn/training.log 2>&1 < /dev/null &
+              echo $!
+
+            Checks:
+              pgrep -af 'hive_fnn.train_fnn|train_fnn'
+              tail -f checkpoints_fnn/training.log
+
+            Notes:
+              - python -u keeps startup and per-iteration output unbuffered.
+              - < /dev/null prevents the process from inheriting a terminal stdin.
+              - If launched through a tool that kills detached children, use a
+                persistent shell/tmux/session and run the same command in it.
+        """),
     )
     # Network architecture
     p.add_argument("--hidden-dim", type=int, default=32)
