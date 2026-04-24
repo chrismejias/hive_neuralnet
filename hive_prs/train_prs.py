@@ -44,6 +44,8 @@ def parse_args() -> argparse.Namespace:
               tail -f checkpoints_prs_v2/training.log
 
             Notes:
+              - The current Gumbel defaults standardize on k=16, so the
+                training and profiling scripts now pass max-considered 16.
               - python -u keeps startup and per-iteration output unbuffered.
               - < /dev/null prevents the process from inheriting a terminal stdin.
               - If launched through a tool that kills detached children, use a
@@ -60,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     # Self-play
     p.add_argument("--iterations", type=int, default=1500)
     p.add_argument("--games", type=int, default=128)
-    p.add_argument("--simulations", type=int, default=512)
+    p.add_argument("--simulations", type=int, default=256)
     p.add_argument("--max-considered", type=int, default=16)
     p.add_argument("--max-game-len", type=int, default=300)
 

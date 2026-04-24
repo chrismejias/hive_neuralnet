@@ -23,9 +23,9 @@ def parse_args() -> argparse.Namespace:
               cd /workspace/hive_neuralnet
               mkdir -p checkpoints_fnn
               nohup python3.11 -u -m hive_fnn.train_fnn \\
-                --preset small \\
+                --preset large \\
                 --iterations 1500 \\
-                --games 128 \\
+                --games 256 \\
                 --simulations 1024 \\
                 --gumbel-considered 16 \\
                 --checkpoint-dir checkpoints_fnn \\
@@ -39,6 +39,8 @@ def parse_args() -> argparse.Namespace:
               tail -f checkpoints_fnn/training.log
 
             Notes:
+              - The bare train_fnn defaults map to the large FNN config
+                (64/64/64) unless --preset is supplied.
               - python -u keeps startup and per-iteration output unbuffered.
               - < /dev/null prevents the process from inheriting a terminal stdin.
               - If launched through a tool that kills detached children, use a
