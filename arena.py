@@ -1,9 +1,42 @@
+"""General arena script for comparing FNN and PRS checkpoints.
+
+Examples:
+
+  Compare a PRS checkpoint against an FNN checkpoint:
+    python3.11 arena.py \
+      --white-model prs \
+      --black-model fnn \
+      --white-checkpoint checkpoints_prs_v2/prs_v2_iter_0600.pt \
+      --black-checkpoint checkpoints_fnn_large/hive_fnn_checkpoint_0100.pt \
+      --white-sims 256 \
+      --black-sims 1024
+
+  Compare two FNN checkpoints:
+    python3.11 arena.py \
+      --white-model fnn \
+      --black-model fnn \
+      --white-checkpoint checkpoints_fnn_small/hive_fnn_checkpoint_0100.pt \
+      --black-checkpoint checkpoints_fnn_large/hive_fnn_checkpoint_0100.pt
+
+  Compare two PRS checkpoints:
+    python3.11 arena.py \
+      --white-model prs \
+      --black-model prs \
+      --white-checkpoint checkpoints_prs_v2/prs_v2_iter_0550.pt \
+      --black-checkpoint checkpoints_prs_v2/prs_v2_iter_0600.pt
+
+Defaults mirror the most common training-time search settings:
+  - PRS: 256 sims, k=16, wave parallel on
+  - FNN: 1024 sims, k=16, wave parallel on
+"""
+
 from __future__ import annotations
 
 import argparse
 import glob
 import os
 import sys
+from typing import Literal
 
 import numpy as np
 import torch
@@ -17,15 +50,98 @@ from hive_prs.prs_mcts_orchestrator_v2 import PRSMCTSConfigV2, PRSMCTSOrchestrat
 from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
 from hive_prs.slot_map import N_SLOTS
 
+ModelType = Literal["fnn", "prs"]
 
-def latest_prs_checkpoint() -> str | None:
-    paths = sorted(glob.glob("checkpoints_prs_v2/prs_v2_iter_*.pt"))
-    return paths[-1] if paths else None
+FNN_DEFAULT_PATTERNS = (
+    "checkpoints_fnn_small/hive_fnn_checkpoint_*.pt",
+    "checkpoints_fnn_medium/hive_fnn_checkpoint_*.pt",
+    "checkpoints_fnn_large/hive_fnn_checkpoint_*.pt",
+    "checkpoints_fnn/hive_fnn_checkpoint_*.pt",
+)
+PRS_DEFAULT_PATTERNS = (
+    "checkpoints_prs_v2/prs_v2_iter_*.pt",
+)
 
 
-def latest_fnn_checkpoint() -> str | None:
-    paths = sorted(glob.glob("checkpoints_fnn/hive_fnn_checkpoint_*.pt"))
-    return paths[-1] if paths else None
+def _latest_by_mtime(paths: list[str]) -> str | None:
+    if not paths:
+        return None
+    return max(paths, key=lambda p: (os.path.getmtime(p), p))
+
+
+def latest_checkpoint(model_type: ModelType) -> str | None:
+    patterns = FNN_DEFAULT_PATTERNS if model_type == "fnn" else PRS_DEFAULT_PATTERNS
+    paths: list[str] = []
+    for pattern in patterns:
+        paths.extend(glob.glob(pattern))
+    return _latest_by_mtime(paths)
+
+
+def default_sims(model_type: ModelType) -> int:
+    return 1024 if model_type == "fnn" else 256
+
+
+def default_k(_: ModelType) -> int:
+    return 16
+
+
+def default_wave_size(model_type: ModelType) -> int:
+    return 4 if model_type == "fnn" else 16
+
+
+def load_checkpoint(model_type: ModelType, path: str) -> torch.nn.Module:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if model_type == "fnn":
+        net = HiveFNN(ckpt["net_config"]).cuda().eval()
+        net.load_state_dict(ckpt["model_state_dict"])
+    else:
+        net = HivePRSTransformerV2(ckpt["net_config"]).cuda().eval()
+        net.load_state_dict(ckpt["model_state"])
+    return net
+
+
+def build_orchestrator(
+    model_type: ModelType,
+    net: torch.nn.Module,
+    games: int,
+    sims: int,
+    k: int,
+    wave_parallel: bool,
+    wave_size: int,
+    expansion_mask: int,
+    max_game_length: int,
+    temperature: float,
+    temperature_drop_move: int,
+    compile_forward: bool,
+) -> tuple[object, object]:
+    if model_type == "fnn":
+        cfg = FNNMCTSConfig(
+            num_simulations=sims,
+            max_num_considered_actions=k,
+            temperature=temperature,
+            temperature_drop_move=temperature_drop_move,
+            batch_size=games,
+            max_game_length=max_game_length,
+            expansion_mask=expansion_mask,
+            wave_parallel=wave_parallel,
+            wave_size=wave_size,
+        )
+        orch = FNNMCTSOrchestrator(net, cfg)
+    else:
+        cfg = PRSMCTSConfigV2(
+            num_simulations=sims,
+            max_num_considered_actions=k,
+            temperature=temperature,
+            temperature_drop_move=temperature_drop_move,
+            batch_size=games,
+            max_game_length=max_game_length,
+            expansion_mask=expansion_mask,
+            nn_max_batch=0,
+            wave_parallel=wave_parallel,
+            compile_forward=compile_forward,
+        )
+        orch = PRSMCTSOrchestratorV2(net, cfg)
+    return orch, cfg
 
 
 def choose_prs_moves(
@@ -198,10 +314,8 @@ def choose_fnn_moves(
         n_rounds = max(1, int(np.ceil(np.log2(max(max_k, 2)))))
         sims_per_round = max(1, cfg.num_simulations // n_rounds)
 
-        for round_i in range(n_rounds):
-            round_wave_size = (
-                orch.config.wave_size if cfg.wave_parallel else 1
-            )
+        for _ in range(n_rounds):
+            round_wave_size = orch.config.wave_size if cfg.wave_parallel else 1
             orch._run_simulations(
                 tree, states, active_t, alive_mask, B, sims_per_round,
                 wave_size=round_wave_size,
@@ -272,86 +386,126 @@ def choose_fnn_moves(
     return out
 
 
+def choose_moves(
+    model_type: ModelType,
+    orch: object,
+    states: torch.Tensor,
+    move_numbers: np.ndarray | None = None,
+    stochastic: bool = False,
+) -> np.ndarray:
+    if model_type == "fnn":
+        return choose_fnn_moves(orch, states, move_numbers=move_numbers, stochastic=stochastic)
+    return choose_prs_moves(orch, states, move_numbers=move_numbers, stochastic=stochastic)
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Arena: latest PRS v2 checkpoint vs latest FNN checkpoint.")
-    ap.add_argument("--prs-checkpoint", type=str, default=None)
-    ap.add_argument("--fnn-checkpoint", type=str, default=None)
+    ap = argparse.ArgumentParser(
+        description="General arena: compare FNN and PRS checkpoints in any pairing.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  Compare PRS vs FNN:\n"
+            "    python3.11 arena.py --white-model prs --black-model fnn \\\n"
+            "      --white-checkpoint checkpoints_prs_v2/prs_v2_iter_0600.pt \\\n"
+            "      --black-checkpoint checkpoints_fnn_large/hive_fnn_checkpoint_0100.pt\n\n"
+            "  Compare small vs large FNN:\n"
+            "    python3.11 arena.py --white-model fnn --black-model fnn \\\n"
+            "      --white-checkpoint checkpoints_fnn_small/hive_fnn_checkpoint_0100.pt \\\n"
+            "      --black-checkpoint checkpoints_fnn_large/hive_fnn_checkpoint_0100.pt\n\n"
+            "  Compare two PRS checkpoints:\n"
+            "    python3.11 arena.py --white-model prs --black-model prs \\\n"
+            "      --white-checkpoint checkpoints_prs_v2/prs_v2_iter_0550.pt \\\n"
+            "      --black-checkpoint checkpoints_prs_v2/prs_v2_iter_0600.pt\n"
+        ),
+    )
+    ap.add_argument("--white-model", choices=["fnn", "prs"], default="prs")
+    ap.add_argument("--black-model", choices=["fnn", "prs"], default="fnn")
+    ap.add_argument("--white-checkpoint", type=str, default=None)
+    ap.add_argument("--black-checkpoint", type=str, default=None)
     ap.add_argument("--games", type=int, default=50)
-    ap.add_argument("--prs-sims", type=int, default=256)
-    ap.add_argument("--prs-k", type=int, default=16)
-    ap.add_argument("--fnn-sims", type=int, default=1024)
-    ap.add_argument("--fnn-k", type=int, default=16)
+    ap.add_argument("--white-sims", type=int, default=None)
+    ap.add_argument("--black-sims", type=int, default=None)
+    ap.add_argument("--white-k", type=int, default=None)
+    ap.add_argument("--black-k", type=int, default=None)
+    ap.add_argument("--white-wave-size", type=int, default=None)
+    ap.add_argument("--black-wave-size", type=int, default=None)
+    ap.add_argument("--wave-parallel", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--temperature-drop-move", type=int, default=20)
     ap.add_argument("--expansion-mask", type=int, default=7)
     ap.add_argument("--max-game-length", type=int, default=300)
-    ap.add_argument("--temperature-drop-move", type=int, default=20)
     ap.add_argument("--stochastic", action="store_true")
+    ap.add_argument("--compile-forward", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    prs_ckpt_path = args.prs_checkpoint or latest_prs_checkpoint()
-    fnn_ckpt_path = args.fnn_checkpoint or latest_fnn_checkpoint()
-    if not prs_ckpt_path:
-        raise SystemExit("No PRS checkpoint found")
-    if not fnn_ckpt_path:
-        raise SystemExit("No FNN checkpoint found")
+    white_ckpt_path = args.white_checkpoint or latest_checkpoint(args.white_model)
+    black_ckpt_path = args.black_checkpoint or latest_checkpoint(args.black_model)
+    if not white_ckpt_path:
+        raise SystemExit(f"No checkpoint found for white model type {args.white_model!r}")
+    if not black_ckpt_path:
+        raise SystemExit(f"No checkpoint found for black model type {args.black_model!r}")
 
-    prs_ckpt = torch.load(prs_ckpt_path, map_location="cpu", weights_only=False)
-    fnn_ckpt = torch.load(fnn_ckpt_path, map_location="cpu", weights_only=False)
+    white_net = load_checkpoint(args.white_model, white_ckpt_path)
+    black_net = load_checkpoint(args.black_model, black_ckpt_path)
 
-    prs_net = HivePRSTransformerV2(prs_ckpt["net_config"]).cuda().eval()
-    prs_net.load_state_dict(prs_ckpt["model_state"])
-    fnn_net = HiveFNN(fnn_ckpt["net_config"]).cuda().eval()
-    fnn_net.load_state_dict(fnn_ckpt["model_state_dict"])
-
-    prs_cfg = PRSMCTSConfigV2(
-        num_simulations=args.prs_sims,
-        max_num_considered_actions=args.prs_k,
-        batch_size=args.games,
-        max_game_length=args.max_game_length,
-        temperature_drop_move=args.temperature_drop_move,
-        expansion_mask=args.expansion_mask,
+    white_sims = args.white_sims if args.white_sims is not None else default_sims(args.white_model)
+    black_sims = args.black_sims if args.black_sims is not None else default_sims(args.black_model)
+    white_k = args.white_k if args.white_k is not None else default_k(args.white_model)
+    black_k = args.black_k if args.black_k is not None else default_k(args.black_model)
+    white_wave_size = (
+        args.white_wave_size if args.white_wave_size is not None else default_wave_size(args.white_model)
     )
-    fnn_cfg = FNNMCTSConfig(
-        num_simulations=args.fnn_sims,
-        max_num_considered_actions=args.fnn_k,
-        batch_size=args.games,
-        max_game_length=args.max_game_length,
-        temperature_drop_move=args.temperature_drop_move,
-        expansion_mask=args.expansion_mask,
+    black_wave_size = (
+        args.black_wave_size if args.black_wave_size is not None else default_wave_size(args.black_model)
     )
 
-    prs_orch = PRSMCTSOrchestratorV2(prs_net, prs_cfg)
-    fnn_orch = FNNMCTSOrchestrator(fnn_net, fnn_cfg)
+    white_orch, white_cfg = build_orchestrator(
+        args.white_model, white_net, args.games, white_sims, white_k, args.wave_parallel,
+        white_wave_size, args.expansion_mask, args.max_game_length, args.temperature,
+        args.temperature_drop_move, args.compile_forward,
+    )
+    black_orch, black_cfg = build_orchestrator(
+        args.black_model, black_net, args.games, black_sims, black_k, args.wave_parallel,
+        black_wave_size, args.expansion_mask, args.max_game_length, args.temperature,
+        args.temperature_drop_move, args.compile_forward,
+    )
     ext = hive_gpu.load_extension()
 
     B = args.games
     states = ext.create_initial_states(B, args.expansion_mask)
     active = np.ones(B, dtype=bool)
     move_numbers = np.zeros(B, dtype=np.int32)
-    prs_is_white = np.zeros(B, dtype=bool)
-    prs_is_white[: B // 2] = True
-    final_results = np.zeros(B, dtype=np.int32)
+    white_is_model_a = np.zeros(B, dtype=bool)
+    white_is_model_a[: B // 2] = True
 
     while bool(active.any()):
-        turns = prs_orch._get_turns(states, B)
+        if args.white_model == "prs":
+            turns = white_orch._get_turns(states, B)
+        else:
+            turn_off = 3412
+            turns = (
+                states[:, turn_off].cpu().numpy().astype(np.int32)
+                | (states[:, turn_off + 1].cpu().numpy().astype(np.int32) << 8)
+            )
         white_to_move = (turns % 2 == 0)
-        prs_turn = active & (white_to_move == prs_is_white)
-        fnn_turn = active & ~prs_turn
+        white_turn = active & (white_to_move == white_is_model_a)
+        black_turn = active & ~white_turn
 
         move_bytes = np.zeros((B, ext.SIZEOF_GPU_MOVE), dtype=np.uint8)
-
-        for mask, orch, chooser in (
-            (prs_turn, prs_orch, choose_prs_moves),
-            (fnn_turn, fnn_orch, choose_fnn_moves),
+        for mask, model_type, orch in (
+            (white_turn, args.white_model, white_orch),
+            (black_turn, args.black_model, black_orch),
         ):
             idx = np.flatnonzero(mask)
             if idx.size == 0:
                 continue
             sub_states = states[idx].clone()
-            chosen = chooser(
+            chosen = choose_moves(
+                model_type,
                 orch,
                 sub_states,
                 move_numbers=move_numbers[idx],
@@ -381,39 +535,43 @@ def main() -> None:
         final_results = ext.check_results_batch(states, B).cpu().numpy()
         active = active & (final_results == 0) & (move_numbers < args.max_game_length)
 
-    prs_wins = 0
-    fnn_wins = 0
+    white_wins = 0
+    black_wins = 0
     draws = 0
     capped = 0
-    prs_score = 0.0
+    white_score = 0.0
     final_results = ext.check_results_batch(states, B).cpu().numpy()
     for i in range(B):
         r = int(final_results[i])
         if r == 0:
             capped += 1
             draws += 1
-            prs_score += 0.5
+            white_score += 0.5
         elif r == 3:
             draws += 1
-            prs_score += 0.5
-        elif (r == 1 and prs_is_white[i]) or (r == 2 and not prs_is_white[i]):
-            prs_wins += 1
-            prs_score += 1.0
+            white_score += 0.5
+        elif (r == 1 and white_is_model_a[i]) or (r == 2 and not white_is_model_a[i]):
+            white_wins += 1
+            white_score += 1.0
         else:
-            fnn_wins += 1
+            black_wins += 1
 
-    print(f"PRS checkpoint: {prs_ckpt_path}")
-    print(f"FNN checkpoint: {fnn_ckpt_path}")
+    print(f"White model:      {args.white_model}")
+    print(f"White checkpoint: {white_ckpt_path}")
+    print(f"Black model:      {args.black_model}")
+    print(f"Black checkpoint: {black_ckpt_path}")
     print(
-        f"Arena config: games={B}, prs_sims={args.prs_sims}, prs_k={args.prs_k}, "
-        f"fnn_sims={args.fnn_sims}, fnn_k={args.fnn_k}, "
-        f"expansions={args.expansion_mask}, max_game_length={args.max_game_length}, "
-        f"stochastic={args.stochastic}"
+        f"Arena config: games={B}, white_sims={white_sims}, black_sims={black_sims}, "
+        f"white_k={white_k}, black_k={black_k}, "
+        f"white_wave_size={white_cfg.wave_size if hasattr(white_cfg, 'wave_size') else 'n/a'}, "
+        f"black_wave_size={black_cfg.wave_size if hasattr(black_cfg, 'wave_size') else 'n/a'}, "
+        f"expansion_mask={args.expansion_mask}, max_game_length={args.max_game_length}, "
+        f"stochastic={args.stochastic}, wave_parallel={args.wave_parallel}"
     )
-    print(f"PRS wins:       {prs_wins}")
-    print(f"FNN wins:       {fnn_wins}")
-    print(f"Draws:          {draws}  (capped={capped})")
-    print(f"PRS score:      {prs_score:.1f}/{B} = {prs_score / B:.3f}")
+    print(f"White wins:      {white_wins}")
+    print(f"Black wins:      {black_wins}")
+    print(f"Draws:           {draws}  (capped={capped})")
+    print(f"White score:     {white_score:.1f}/{B} = {white_score / B:.3f}")
 
 
 if __name__ == "__main__":
