@@ -67,6 +67,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iterations", type=int, default=1500)
     p.add_argument("--games", type=int, default=128)
     p.add_argument("--simulations", type=int, default=128)
+    p.add_argument(
+        "--simulation-schedule",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated per-iteration simulation schedule, "
+            "for example '1024,2048,4096'. Overrides fixed --simulations."
+        ),
+    )
     p.add_argument("--gumbel-considered", type=int, default=16)
     p.add_argument("--max-game-length", type=int, default=300)
     p.add_argument(
@@ -89,6 +98,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--buffer-size", type=int, default=100_000)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints_fnn")
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from",
+    )
     p.add_argument("--expansion-mask", type=int, default=0)
     p.add_argument("--draw-keep-rate", type=float, default=1.0)
     p.add_argument("--puct", action="store_true",
@@ -99,6 +114,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    sim_schedule = ()
+    if args.simulation_schedule:
+        sim_schedule = tuple(
+            int(part.strip())
+            for part in args.simulation_schedule.split(",")
+            if part.strip()
+        )
 
     if args.preset:
         net_config = getattr(FNNConfig, args.preset)()
@@ -113,6 +135,7 @@ def main() -> None:
         num_iterations=args.iterations,
         games_per_batch=args.games,
         mcts_simulations=args.simulations,
+        simulation_schedule=sim_schedule,
         max_num_considered=args.gumbel_considered,
         max_game_length=args.max_game_length,
         batch_size=args.batch_size,
@@ -143,9 +166,13 @@ def main() -> None:
             "  Search: Gumbel-root MCTS "
             f"(wave_parallel={train_config.gumbel_wave_parallel})"
         )
+    if train_config.simulation_schedule:
+        print(f"  Simulation schedule: {list(train_config.simulation_schedule)}")
     del net
 
     trainer = FNNTrainer(train_config, net_config)
+    if args.resume:
+        trainer.load_checkpoint(args.resume)
     trainer.run()
 
 
