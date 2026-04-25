@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import struct
 import sys
 import threading
 from enum import Enum, auto
@@ -35,8 +36,6 @@ from hive_engine.game_state import GameState, GameResult, Move, MoveType
 from hive_engine.mcts import MCTS, MCTSConfig
 from hive_engine.pieces import Color, PieceType, ExpansionConfig
 from hive_engine.hex_coord import HexCoord
-
-import struct
 
 try:
     from hive_gnn.gnn_encoder import GNNEncoder
@@ -52,6 +51,23 @@ except ImportError:
 
 from hive_transformer.transformer_encoder import TransformerEncoder
 from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
+
+try:
+    from hive_prs.prs_transformer import PRSConfig
+    from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
+    from hive_prs.prs_mcts_orchestrator_v2 import PRSMCTSConfigV2, PRSMCTSOrchestratorV2
+    _HAS_PRS = True
+except ImportError:
+    PRSConfig = HivePRSTransformerV2 = PRSMCTSConfigV2 = PRSMCTSOrchestratorV2 = None  # type: ignore
+    _HAS_PRS = False
+
+try:
+    from hive_fnn.fnn_network import FNNConfig, HiveFNN
+    from hive_fnn.fnn_mcts_orchestrator import FNNMCTSConfig, FNNMCTSOrchestrator
+    _HAS_FNN = True
+except ImportError:
+    FNNConfig = HiveFNN = FNNMCTSConfig = FNNMCTSOrchestrator = None  # type: ignore
+    _HAS_FNN = False
 
 
 # ── Layout constants ────────────────────────────────────────────────
@@ -257,6 +273,125 @@ def find_immediate_win(game: GameState) -> Move | None:
     return None
 
 
+# ── GPU AI move conversion ──────────────────────────────────────────
+
+# GPU board uses 23×23 cells: cell = (r+11)*23 + (q+11)
+_GPU_BOARD_SIZE = 23
+_GPU_HALF       = 11
+
+# CPU PieceType → GPU PieceType (GPU PT_EMPTY=0, so CPU+1)
+_CPU_TO_GPU_PT: dict[PieceType, int] = {
+    PieceType.QUEEN:       1,
+    PieceType.ANT:         2,
+    PieceType.GRASSHOPPER: 3,
+    PieceType.SPIDER:      4,
+    PieceType.BEETLE:      5,
+    PieceType.MOSQUITO:    6,
+    PieceType.LADYBUG:     7,
+    PieceType.PILLBUG:     8,
+}
+_GPU_TO_CPU_PT: dict[int, PieceType] = {v: k for k, v in _CPU_TO_GPU_PT.items()}
+
+
+def _cpu_move_to_gpu_bytes(move: Move) -> bytes:
+    """Convert a CPU Move to the 6-byte GPU move format."""
+    if move.move_type == MoveType.PASS:
+        return struct.pack("<BBHH", 2, 0, 0, 0)
+    gpu_pt = _CPU_TO_GPU_PT[move.piece.piece_type]
+    to_cell = (move.to.r + _GPU_HALF) * _GPU_BOARD_SIZE + (move.to.q + _GPU_HALF)
+    if move.move_type == MoveType.PLACE:
+        return struct.pack("<BBHH", 0, gpu_pt, 0, to_cell)
+    from_cell = (move.from_pos.r + _GPU_HALF) * _GPU_BOARD_SIZE + (move.from_pos.q + _GPU_HALF)
+    return struct.pack("<BBHH", 1, gpu_pt, from_cell, to_cell)
+
+
+def _gpu_bytes_to_cpu_move(move_bytes: bytes | np.ndarray, game: GameState) -> Move | None:
+    """Convert 6-byte GPU move to a CPU Move by matching legal moves.
+
+    Returns None if no matching legal move is found.
+    """
+    if isinstance(move_bytes, np.ndarray):
+        m = move_bytes
+        m_type   = int(m[0])
+        gpu_pt   = int(m[1])
+        m_from   = int(m[2]) | (int(m[3]) << 8)
+        m_to     = int(m[4]) | (int(m[5]) << 8)
+    else:
+        m_type, gpu_pt = struct.unpack_from("BB", move_bytes, 0)
+        m_from, m_to   = struct.unpack_from("<HH", move_bytes, 2)
+
+    if m_type == 2:  # PASS
+        for mv in game.legal_moves():
+            if mv.move_type == MoveType.PASS:
+                return mv
+        return None
+
+    to_q = m_to % _GPU_BOARD_SIZE - _GPU_HALF
+    to_r = m_to // _GPU_BOARD_SIZE - _GPU_HALF
+    to_pos = HexCoord(to_q, to_r)
+
+    cpu_pt = _GPU_TO_CPU_PT.get(gpu_pt)
+
+    if m_type == 0:  # PLACE
+        # Match by destination and piece type
+        for mv in game.legal_moves():
+            if (mv.move_type == MoveType.PLACE
+                    and mv.to == to_pos
+                    and mv.piece is not None
+                    and mv.piece.piece_type == cpu_pt):
+                return mv
+    else:  # MOVE
+        from_q = m_from % _GPU_BOARD_SIZE - _GPU_HALF
+        from_r = m_from // _GPU_BOARD_SIZE - _GPU_HALF
+        from_pos = HexCoord(from_q, from_r)
+        for mv in game.legal_moves():
+            if (mv.move_type == MoveType.MOVE
+                    and mv.from_pos == from_pos
+                    and mv.to == to_pos):
+                return mv
+
+    # Fallback: any legal move (should not happen in practice)
+    legal = game.legal_moves()
+    if legal:
+        return legal[0]
+    return None
+
+
+# ── GPU AI wrapper ──────────────────────────────────────────────────
+
+class GpuAI:
+    """Wraps a GPU MCTS orchestrator (FNN or PRS v2) for single-move selection.
+
+    Maintains a persistent GPU HiveState that mirrors the CPU GameState.
+    """
+
+    def __init__(self, orchestrator, expansion_mask: int = 0) -> None:
+        import hive_gpu
+        self.orch           = orchestrator
+        self.ext            = hive_gpu.load_extension()
+        self.expansion_mask = expansion_mask
+        self.gpu_state      = self.ext.create_initial_states(1, expansion_mask)
+
+    def apply_cpu_move(self, move: Move) -> None:
+        """Mirror a CPU move onto the GPU state."""
+        mb = _cpu_move_to_gpu_bytes(move)
+        t  = torch.tensor(list(mb), dtype=torch.uint8, device="cuda").unsqueeze(0)
+        self.ext.apply_moves_batch(self.gpu_state, t, 1)
+
+    def select_move(self, game: GameState) -> Move:
+        """Run GPU Gumbel MCTS and return the chosen CPU Move."""
+        move_bytes = self.orch.select_move_gpu(self.gpu_state)   # (6,) uint8 CPU
+        move = _gpu_bytes_to_cpu_move(move_bytes.numpy(), game)
+        if move is None:
+            legal = game.legal_moves()
+            move  = legal[0] if legal else Move(MoveType.PASS, None, HexCoord(0, 0))
+        return move
+
+    def reset(self) -> None:
+        """Reinitialize the GPU state to the starting position."""
+        self.gpu_state = self.ext.create_initial_states(1, self.expansion_mask)
+
+
 # ── Selection state ─────────────────────────────────────────────────
 
 class SelectMode(Enum):
@@ -270,18 +405,6 @@ class SelectMode(Enum):
 class GPUValidator:
     """Keeps a GPU HiveState in sync with the CPU GameState and compares legal moves."""
 
-    BOARD_SIZE = 17
-    HALF = 8
-
-    # CPU PieceType → GPU PieceType (GPU adds PT_EMPTY=0, so offset by 1)
-    _PT_MAP = {
-        PieceType.QUEEN: 1,
-        PieceType.ANT: 2,
-        PieceType.GRASSHOPPER: 3,
-        PieceType.SPIDER: 4,
-        PieceType.BEETLE: 5,
-    }
-
     def __init__(self):
         import hive_gpu
         self.ext = hive_gpu.load_extension()
@@ -291,22 +414,9 @@ class GPUValidator:
         self.mismatch = False
         self.error: str | None = None
 
-    def _hex_to_cell(self, q: int, r: int) -> int:
-        col = q + self.HALF
-        row = r + self.HALF
-        return row * self.BOARD_SIZE + col
-
     def _cpu_move_to_gpu_bytes(self, move: Move) -> bytes:
         """Convert a CPU Move to the 6-byte GPUMove struct."""
-        if move.move_type == MoveType.PASS:
-            return struct.pack("<BBhh", 2, 0, 0, 0)  # type=PASS
-        gpu_pt = self._PT_MAP[move.piece.piece_type]
-        to_cell = self._hex_to_cell(move.to.q, move.to.r)
-        if move.move_type == MoveType.PLACE:
-            return struct.pack("<BBHH", 0, gpu_pt, 0, to_cell)
-        else:  # MOVE
-            from_cell = self._hex_to_cell(move.from_pos.q, move.from_pos.r)
-            return struct.pack("<BBHH", 1, gpu_pt, from_cell, to_cell)
+        return _cpu_move_to_gpu_bytes(move)
 
     def apply_move(self, move: Move) -> None:
         """Apply a move to the GPU state and update validation status."""
@@ -357,7 +467,7 @@ class GPUValidator:
 # ── GUI class ───────────────────────────────────────────────────────
 
 class HiveGUI:
-    """pygame-based Hive board for human vs GNN AI."""
+    """pygame-based Hive board for human vs AI (GNN/NNUE/Transformer/FNN/PRS v2)."""
 
     # ── Init ───────────────────────────────────────────────────────
 
@@ -370,7 +480,10 @@ class HiveGUI:
         self_play: bool = False,
         gpu_validate: bool = False,
         expansions: ExpansionConfig | None = None,
+        gpu_ai: GpuAI | None = None,
     ) -> None:
+        # GPU AI path (FNN / PRS v2): net/encoder/mcts_config unused
+        self.gpu_ai = gpu_ai
         self.net = net
         self.encoder = encoder
         self.mcts_config = mcts_config
@@ -425,30 +538,51 @@ class HiveGUI:
         self.ai_thinking = True
         gen = self._game_gen
 
-        def worker() -> None:
-            # Check for immediate win before running MCTS
-            immediate = find_immediate_win(self.game)
-            if immediate is not None:
+        if self.gpu_ai is not None:
+            # ── GPU Gumbel MCTS path (FNN / PRS v2) ──────────────────
+            game_snapshot = self.game   # safe to read from thread (no mutation)
+            gpu_ai        = self.gpu_ai
+
+            def gpu_worker() -> None:
+                # CPU immediate-win check (fast) before paying full MCTS cost
+                immediate = find_immediate_win(game_snapshot)
+                if immediate is not None:
+                    with self._ai_lock:
+                        self._ai_result = (immediate, gen)
+                    self.ai_thinking = False
+                    return
+
+                move = gpu_ai.select_move(game_snapshot)
                 with self._ai_lock:
-                    self._ai_result = (immediate, gen)
+                    self._ai_result = (move, gen)
                 self.ai_thinking = False
-                return
 
-            mcts = MCTS(self.net, self.encoder, self.mcts_config)
-            policy = mcts.search(self.game, move_number=self.move_number)
-            action = int(np.argmax(policy))
-            mask = self.encoder.get_legal_action_mask(self.game)
-            if mask[action] > 0:
-                move = self.encoder.decode_action(action, self.game)
-            else:
-                legal = np.where(mask > 0)[0]
-                best = legal[np.argmax(policy[legal])]
-                move = self.encoder.decode_action(int(best), self.game)
-            with self._ai_lock:
-                self._ai_result = (move, gen)
-            self.ai_thinking = False
+            threading.Thread(target=gpu_worker, daemon=True).start()
+        else:
+            # ── CPU MCTS path (GNN / NNUE / Transformer) ──────────────
+            def worker() -> None:
+                immediate = find_immediate_win(self.game)
+                if immediate is not None:
+                    with self._ai_lock:
+                        self._ai_result = (immediate, gen)
+                    self.ai_thinking = False
+                    return
 
-        threading.Thread(target=worker, daemon=True).start()
+                mcts = MCTS(self.net, self.encoder, self.mcts_config)
+                policy = mcts.search(self.game, move_number=self.move_number)
+                action = int(np.argmax(policy))
+                mask = self.encoder.get_legal_action_mask(self.game)
+                if mask[action] > 0:
+                    move = self.encoder.decode_action(action, self.game)
+                else:
+                    legal = np.where(mask > 0)[0]
+                    best = legal[np.argmax(policy[legal])]
+                    move = self.encoder.decode_action(int(best), self.game)
+                with self._ai_lock:
+                    self._ai_result = (move, gen)
+                self.ai_thinking = False
+
+            threading.Thread(target=worker, daemon=True).start()
 
     # ── Legal move helpers ─────────────────────────────────────────
 
@@ -825,6 +959,8 @@ class HiveGUI:
     def _apply_human(self, move: Move) -> None:
         if self.gpu_validator:
             self.gpu_validator.apply_move(move)
+        if self.gpu_ai:
+            self.gpu_ai.apply_cpu_move(move)
         self.game.apply_move(move)
         self.last_move = move
         self.move_number += 1
@@ -835,6 +971,10 @@ class HiveGUI:
     def _apply_ai(self, move: Move) -> None:
         if self.gpu_validator:
             self.gpu_validator.apply_move(move)
+        # For GPU AI path the move was already chosen from the GPU state;
+        # we still apply to GPU so it stays in sync for the next turn.
+        if self.gpu_ai:
+            self.gpu_ai.apply_cpu_move(move)
         self.game.apply_move(move)
         self.last_move = move
         self.move_number += 1
@@ -894,6 +1034,8 @@ class HiveGUI:
         if self.gpu_validator:
             self.gpu_validator.reset()
             self.gpu_validator.validate(self.game)
+        if self.gpu_ai:
+            self.gpu_ai.reset()
         # ai_thinking may remain True briefly; the thread will finish and its
         # result will be discarded because game_gen won't match.
 
@@ -979,8 +1121,12 @@ class HiveGUI:
 def load_checkpoint(
     path: str, device: torch.device
 ) -> tuple[object, object, str]:
-    """
-    Auto-detect GNN vs NNUE checkpoint and return (net, encoder, model_name).
+    """Auto-detect checkpoint type and return (net_or_gpu_ai, encoder, model_name).
+
+    For FNN / PRS v2 checkpoints the first element is a GpuAI instance and
+    encoder is None — the GUI will use the GPU Gumbel MCTS path.
+    For GNN / NNUE / Transformer the first element is the network and encoder
+    is an encoder object — the GUI uses the CPU MCTS path.
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     net_config = ckpt["net_config"]
@@ -988,6 +1134,56 @@ def load_checkpoint(
     # GPU trainer saves as "model_state_dict"; CPU trainers use "net_state_dict"
     state_dict_key = "model_state_dict" if "model_state_dict" in ckpt else "net_state_dict"
 
+    # ── PRS v2 ────────────────────────────────────────────────────────
+    if _HAS_PRS and isinstance(net_config, PRSConfig):
+        net = HivePRSTransformerV2(net_config).cuda().eval()
+        net.load_state_dict(ckpt["model_state"])
+        prs_cfg = PRSMCTSConfigV2(
+            num_simulations=256,
+            batch_size=1,
+            wave_parallel=True,
+            expansion_mask=7,
+        )
+        orch = PRSMCTSOrchestratorV2(net, prs_cfg)
+        gpu_ai = GpuAI(orch, expansion_mask=7)
+        model_name = (
+            f"PRS v2 (d={net_config.d_model}, "
+            f"h={net_config.num_heads}, L={net_config.num_layers})"
+        )
+        print(f"Loaded PRS v2: {path}")
+        print(
+            f"  Architecture: d_model={net_config.d_model}, "
+            f"num_heads={net_config.num_heads}, num_layers={net_config.num_layers}"
+        )
+        print(f"  MCTS: {prs_cfg.num_simulations} sims, Gumbel, wave_parallel=True, exp_mask=7")
+        return gpu_ai, None, model_name
+
+    # ── FNN ───────────────────────────────────────────────────────────
+    if _HAS_FNN and isinstance(net_config, FNNConfig):
+        net = HiveFNN(net_config).cuda().eval()
+        net.load_state_dict(ckpt["model_state_dict"])
+        train_cfg = ckpt.get("train_config", None)
+        exp_mask = int(train_cfg.expansion_mask) if train_cfg is not None else 0
+        fnn_cfg = FNNMCTSConfig(
+            num_simulations=1024,
+            batch_size=1,
+            wave_parallel=True,
+            expansion_mask=exp_mask,
+        )
+        orch = FNNMCTSOrchestrator(net, fnn_cfg)
+        gpu_ai = GpuAI(orch, expansion_mask=exp_mask)
+        dim = net_config.hidden_dim
+        size_tag = "large" if dim >= 64 else ("medium" if dim >= 32 else "small")
+        model_name = f"FNN {size_tag} (dim={dim})"
+        print(f"Loaded FNN: {path}")
+        print(f"  Architecture: hidden_dim={dim}")
+        print(
+            f"  MCTS: {fnn_cfg.num_simulations} sims, Gumbel, "
+            f"wave_parallel=True, exp_mask={exp_mask}"
+        )
+        return gpu_ai, None, model_name
+
+    # ── NNUE ──────────────────────────────────────────────────────────
     if NNUEConfig is not None and isinstance(net_config, NNUEConfig):
         net = HiveNNUE(net_config)
         net.load_state_dict(ckpt[state_dict_key])
@@ -997,6 +1193,8 @@ def load_checkpoint(
         model_name = f"NNUE ({net_config.hidden_dims})"
         print(f"Loaded NNUE: {path}")
         print(f"  Architecture: hidden_dims={net_config.hidden_dims}")
+
+    # ── Transformer ───────────────────────────────────────────────────
     elif isinstance(net_config, TransformerConfig):
         net = HiveTransformer(net_config)
         net.load_state_dict(ckpt[state_dict_key], strict=False)
@@ -1012,6 +1210,8 @@ def load_checkpoint(
             f"  Architecture: d_model={net_config.d_model}, "
             f"num_heads={net_config.num_heads}, num_layers={net_config.num_layers}"
         )
+
+    # ── GNN ───────────────────────────────────────────────────────────
     elif HiveGNN is not None:
         net = HiveGNN(net_config)
         net.load_state_dict(ckpt[state_dict_key])
@@ -1026,6 +1226,7 @@ def load_checkpoint(
             f"  Architecture: hidden_dim={net_config.hidden_dim}, "
             f"mp_layers={net_config.num_mp_layers}"
         )
+
     else:
         raise ValueError(f"Unsupported checkpoint type: {type(net_config)}")
 
@@ -1036,17 +1237,38 @@ def load_checkpoint(
 # ── Entry point ─────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Play Hive against a trained AI (GNN or NNUE)")
+    parser = argparse.ArgumentParser(
+        description="Play Hive against a trained AI (GNN / NNUE / FNN / PRS v2)"
+    )
     parser.add_argument(
         "--checkpoint",
         default=None,
-        help="Path to checkpoint — GNN or NNUE auto-detected (default: GNN iter 20)",
+        help=(
+            "Path to checkpoint file.  Auto-detected by net_config type. "
+            "Defaults: prs_v2 -> checkpoints_prs_v2/prs_v2_iter_0600.pt, "
+            "fnn_large -> checkpoints_fnn_large/hive_fnn_checkpoint_0100.pt, "
+            "fnn_medium -> checkpoints_fnn_medium/hive_fnn_checkpoint_0100.pt, "
+            "fnn_small -> checkpoints_fnn_small/hive_fnn_checkpoint_0100.pt, "
+            "gnn -> checkpoints_gnn/hive_gnn_checkpoint_0020.pt"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        choices=["auto", "prs_v2", "fnn_large", "fnn_medium", "fnn_small", "gnn"],
+        default="auto",
+        help=(
+            "Which model to use (default: auto = infer from checkpoint). "
+            "Specify to use a default checkpoint path without --checkpoint."
+        ),
     )
     parser.add_argument(
         "--simulations",
         type=int,
-        default=200,
-        help="MCTS simulations per AI move (default: 200)",
+        default=None,
+        help=(
+            "Override MCTS simulations per move. "
+            "Defaults: FNN=1024, PRS v2=256, GNN/NNUE/Transformer=200."
+        ),
     )
     parser.add_argument(
         "--color",
@@ -1074,18 +1296,37 @@ def main() -> None:
         default="",
         help="Expansion pieces to enable: M=Mosquito, L=Ladybug, P=Pillbug (e.g., MLP for all)",
     )
+    parser.add_argument(
+        "--base-game",
+        action="store_true",
+        help="Force base game only (no expansion pieces), overriding model defaults",
+    )
     args = parser.parse_args()
 
-    mcts_config = MCTSConfig(num_simulations=args.simulations, temperature=0.0)
     human_color = Color.WHITE if args.color == "white" else Color.BLACK
 
+    # Default checkpoint paths per model
+    _DEFAULT_CHECKPOINTS = {
+        "prs_v2":     "checkpoints_prs_v2/prs_v2_iter_0600.pt",
+        "fnn_large":  "checkpoints_fnn_large/hive_fnn_checkpoint_0100.pt",
+        "fnn_medium": "checkpoints_fnn_medium/hive_fnn_checkpoint_0100.pt",
+        "fnn_small":  "checkpoints_fnn_small/hive_fnn_checkpoint_0100.pt",
+        "gnn":        "checkpoints_gnn/hive_gnn_checkpoint_0020.pt",
+    }
+
     if args.self_play:
-        # No AI needed — pass dummy values
-        net, encoder, title = None, None, "Hive — Self-Play"
+        net, encoder, gpu_ai, title = None, None, None, "Hive — Self-Play"
+        mcts_config = MCTSConfig(num_simulations=200, temperature=0.0)
         print("Self-play mode: you control both WHITE and BLACK.")
         print("Controls: click to play · R = restart · Escape = quit\n")
     else:
-        checkpoint = args.checkpoint or "checkpoints_gnn/hive_gnn_checkpoint_0020.pt"
+        # Resolve checkpoint path
+        if args.checkpoint:
+            checkpoint = args.checkpoint
+        elif args.model != "auto":
+            checkpoint = _DEFAULT_CHECKPOINTS[args.model]
+        else:
+            checkpoint = _DEFAULT_CHECKPOINTS["prs_v2"]
 
         # Device selection
         if args.device and args.device not in ("auto", ""):
@@ -1096,11 +1337,28 @@ def main() -> None:
             device = torch.device("cpu")
         print(f"Device: {device}")
 
-        net, encoder, model_name = load_checkpoint(checkpoint, device)
+        loaded, encoder, model_name = load_checkpoint(checkpoint, device)
+
+        if isinstance(loaded, GpuAI):
+            # GPU AI path (FNN / PRS v2)
+            gpu_ai = loaded
+            net    = None
+            # Override simulations if requested
+            if args.simulations is not None:
+                gpu_ai.orch.config.num_simulations = args.simulations
+            n_sims = gpu_ai.orch.config.num_simulations
+            mcts_config = MCTSConfig(num_simulations=n_sims, temperature=0.0)
+        else:
+            # CPU MCTS path (GNN / NNUE / Transformer)
+            gpu_ai = None
+            net    = loaded
+            n_sims = args.simulations if args.simulations is not None else 200
+            mcts_config = MCTSConfig(num_simulations=n_sims, temperature=0.0)
+
         title = f"Hive — vs {model_name}"
         print(f"\nYou are playing as {human_color.name}.")
         print(f"AI model: {model_name}")
-        print(f"AI uses {args.simulations} MCTS simulations per move.")
+        print(f"AI uses {n_sims} MCTS simulations per move.")
         print("Controls: click to play · R = restart · Escape = quit\n")
 
     # Parse expansion config from CLI flag
@@ -1111,8 +1369,23 @@ def main() -> None:
         pillbug="P" in exp_str,
     ) if exp_str else None
 
-    gui = HiveGUI(net, encoder, mcts_config, human_color, self_play=args.self_play,
-                   gpu_validate=args.gpu_validate, expansions=expansion_config)
+    # For PRS v2 (exp_mask=7), default expansions to MLP unless --base-game or explicit --expansion
+    if gpu_ai is not None and not exp_str and not args.base_game:
+        exp_mask = gpu_ai.expansion_mask
+        if exp_mask & 1:  # mosquito bit set → model trained with expansions
+            expansion_config = ExpansionConfig(
+                mosquito=bool(exp_mask & 1),
+                ladybug=bool(exp_mask & 2),
+                pillbug=bool(exp_mask & 4),
+            )
+
+    gui = HiveGUI(
+        net, encoder, mcts_config, human_color,
+        self_play=args.self_play,
+        gpu_validate=args.gpu_validate,
+        expansions=expansion_config,
+        gpu_ai=gpu_ai,
+    )
     gui.run(title=title)
 
 

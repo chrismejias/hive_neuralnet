@@ -28,6 +28,7 @@ class FNNTrainConfig:
     num_iterations: int = 1500
     games_per_batch: int = 128
     mcts_simulations: int = 128
+    simulation_schedule: tuple[int, ...] = ()
     max_num_considered: int = 16
     temperature: float = 1.0
     temperature_drop_move: int = 20
@@ -56,6 +57,16 @@ class FNNTrainConfig:
     gumbel_wave_parallel: bool = True
     gumbel_wave_size: int = 4
     puct_wave_size: int = 16
+
+
+def _simulations_for_iteration(
+    base_simulations: int,
+    schedule: tuple[int, ...],
+    iteration: int,
+) -> int:
+    if not schedule:
+        return base_simulations
+    return int(schedule[(iteration - 1) % len(schedule)])
 
 
 def _flat_to_padded(
@@ -134,6 +145,7 @@ class FNNTrainer:
         self.best_net = HiveFNN(self.net_config).to(self.device)
         self.buffer = FNNReplayBuffer(self.config.buffer_max_size)
         self.elo_tracker = EloTracker()
+        self._start_iter = 1
         self.use_amp = (
             self.config.use_amp
             if self.config.use_amp is not None
@@ -161,14 +173,20 @@ class FNNTrainer:
 
     def run(self) -> None:
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
-        for iteration in range(1, self.config.num_iterations + 1):
+        for iteration in range(self._start_iter, self.config.num_iterations + 1):
             self._cleanup()
+            sims_this_iter = _simulations_for_iteration(
+                self.config.mcts_simulations,
+                self.config.simulation_schedule,
+                iteration,
+            )
             print(f"\n{'=' * 60}")
             print(f"FNN Iteration {iteration}/{self.config.num_iterations}")
+            print(f"  Simulations: {sims_this_iter}")
             print(f"{'=' * 60}")
 
             t0 = time.time()
-            new_examples, stats = self._self_play()
+            new_examples, stats = self._self_play(iteration)
             self.buffer.add_examples(new_examples)
             print(
                 f"  Self-play: {len(new_examples)} examples, "
@@ -187,14 +205,17 @@ class FNNTrainer:
             self._save_checkpoint(iteration)
             print(f"  ELO: {elo:.0f}  Buffer: {len(self.buffer)}")
 
-    def _self_play(self) -> tuple[list, dict]:
+    def _self_play(self, iteration: int) -> tuple[list, dict]:
         cfg = self.config
+        sims_this_iter = _simulations_for_iteration(
+            cfg.mcts_simulations, cfg.simulation_schedule, iteration,
+        )
         self.best_net.eval()
         if cfg.use_puct:
             orch = FNNPUCTOrchestrator(
                 self.best_net,
                 FNNPUCTConfig(
-                    num_simulations=cfg.mcts_simulations,
+                    num_simulations=sims_this_iter,
                     c_puct=1.25,
                     temperature=cfg.temperature,
                     temperature_drop_move=cfg.temperature_drop_move,
@@ -208,7 +229,7 @@ class FNNTrainer:
             orch = FNNMCTSOrchestrator(
                 self.best_net,
                 FNNMCTSConfig(
-                    num_simulations=cfg.mcts_simulations,
+                    num_simulations=sims_this_iter,
                     max_num_considered_actions=cfg.max_num_considered,
                     temperature=cfg.temperature,
                     temperature_drop_move=cfg.temperature_drop_move,
@@ -370,3 +391,9 @@ class FNNTrainer:
             },
             path,
         )
+
+    def load_checkpoint(self, path: str) -> None:
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.best_net.load_state_dict(ckpt["model_state_dict"])
+        self._start_iter = int(ckpt["iteration"]) + 1
+        print(f"Resumed from {path} (iter {ckpt['iteration']})")

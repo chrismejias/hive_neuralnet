@@ -231,6 +231,141 @@ class PRSMCTSOrchestratorV2:
 
     # ── Public API ───────────────────────────────────────────────────
 
+    def select_move_gpu(self, state: torch.Tensor) -> torch.Tensor:
+        """Single-ply Gumbel MCTS on one state (PRS v2).
+
+        Args:
+            state: (1, STATE_SIZE) uint8 on CPU or CUDA.
+        Returns:
+            (6,) uint8 on CPU — the chosen move bytes.
+        """
+        dev = "cuda"
+        B = 1
+        cfg = self.config
+
+        state = state.to(dev)
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+
+        tree = self._alloc_tree(B)
+
+        prs_batch = self.encoder.encode_batch(state, B)
+        legal_t, nlegal_t = self.ext.generate_legal_moves_batch(state, B)
+        nlegal_np = nlegal_t.cpu().numpy()
+        max_n = int(nlegal_np[0])
+
+        if max_n == 0:
+            pass_bytes = torch.zeros(6, dtype=torch.uint8)
+            pass_bytes[0] = 2  # MOVE_TYPE_PASS
+            return pass_bytes
+
+        # Immediate-win check (fully batched)
+        turns_np = self._get_turns(state, B)
+        win_overrides = self._check_immediate_wins_v2(
+            state, legal_t, nlegal_np, [True], turns_np, B,
+        )
+
+        # CUDA classify kernel for head inputs + slot mapping
+        kernel_out = self._classify_kernel(state, legal_t, nlegal_t, B)
+        slot_of_legal_t = kernel_out[8]
+
+        policy_logits_813, _ = self._net_forward(prs_batch, kernel_out, B)
+        policy_logits_813 = policy_logits_813.float()
+
+        priors_per_legal, root_logit_per_legal = self._build_legal_priors_v2(
+            policy_logits_813, slot_of_legal_t, B,
+        )
+
+        MAX_L = self._max_legal
+        nlegal_t_gpu = nlegal_t.to(torch.int64)
+        slot_idx_t = torch.arange(MAX_L, device=dev).unsqueeze(0)
+        valid_slot = slot_idx_t < nlegal_t_gpu.unsqueeze(1)
+
+        active_t = torch.ones(B, dtype=torch.int8, device=dev)
+        self._expand_root_if_needed(
+            tree, state, legal_t, nlegal_t,
+            priors_per_legal, active_t, B,
+        )
+        self._apply_root_dirichlet(tree, B, [True])
+
+        if win_overrides:
+            chosen = win_overrides[0]
+        else:
+            u = torch.rand(B, MAX_L, device=dev).clamp(1e-4, 1 - 1e-4)
+            gumbel = -torch.log(-torch.log(u))
+            gumbel = torch.where(valid_slot, gumbel, torch.full_like(gumbel, -1e30))
+            perturbed = gumbel + root_logit_per_legal
+            k = min(_GUMBEL_K, max_n)
+            _, topk_slots = torch.topk(perturbed, k, dim=1)
+
+            candidate_slots = topk_slots.to(torch.int32)
+            candidate_valid = torch.gather(valid_slot, 1, candidate_slots.long())
+            candidate_slots = torch.where(
+                candidate_valid, candidate_slots,
+                torch.full_like(candidate_slots, -1),
+            )
+
+            sims_per_round = max(1, cfg.num_simulations // _GUMBEL_ROUNDS)
+            for round_i in range(_GUMBEL_ROUNDS):
+                root_slots = candidate_slots
+                candidate_valid = root_slots >= 0
+                num_candidates = int(root_slots.shape[1])
+                sims_per_candidate = max(1, sims_per_round // num_candidates)
+                round_wave_size = (
+                    _GUMBEL_WAVE_SCHEDULE[min(round_i, len(_GUMBEL_WAVE_SCHEDULE) - 1)]
+                    if cfg.wave_parallel else 1
+                )
+                self._run_simulations_for_root_slots(
+                    tree, state, active_t, root_slots, B, sims_per_candidate,
+                    wave_size=round_wave_size,
+                )
+                if num_candidates <= 1:
+                    continue
+                per_game_keep = (candidate_valid.sum(dim=1) // 2).clamp(min=1)
+                max_keep = num_candidates // 2
+
+                cand_visits, cand_q = self._gather_root_candidate_stats(
+                    tree, B, root_slots,
+                )
+                sigma_norm = (cfg.c_visit + cand_visits.max()) * cfg.c_scale
+                cand_idx = root_slots.long().clamp(min=0)
+                cand_score = (
+                    torch.gather(gumbel + root_logit_per_legal, 1, cand_idx)
+                    + sigma_norm * cand_q
+                ).float()
+                cand_score = torch.where(
+                    candidate_valid, cand_score,
+                    torch.full_like(cand_score, -1e30),
+                )
+                _, keep_pos = torch.topk(cand_score, max_keep, dim=1)
+                keep_rank = self._keep_rank(max_keep)
+                keep_valid = keep_rank < per_game_keep.unsqueeze(1)
+                new_slots = torch.gather(root_slots, 1, keep_pos)
+                candidate_slots = torch.where(
+                    keep_valid, new_slots, torch.full_like(new_slots, -1),
+                )
+
+            # Final Gumbel sigma selection
+            candidate_valid = candidate_slots >= 0
+            cand_visits, cand_q = self._gather_root_candidate_stats(
+                tree, B, candidate_slots,
+            )
+            sigma_norm = (cfg.c_visit + cand_visits.max()) * cfg.c_scale
+            cand_idx = candidate_slots.long().clamp(min=0)
+            final_cand_sigma = (
+                torch.gather(gumbel + root_logit_per_legal, 1, cand_idx)
+                + sigma_norm * cand_q
+            ).float()
+            final_cand_sigma = torch.where(
+                candidate_valid, final_cand_sigma,
+                torch.full_like(final_cand_sigma, -1e30),
+            )
+            chosen_pos = int(torch.argmax(final_cand_sigma[0]).item())
+            chosen = int(candidate_slots[0, chosen_pos].item())
+            chosen = max(0, min(chosen, max_n - 1))
+
+        return legal_t[0, chosen].cpu()
+
     def self_play_batch(
         self,
         start_states: torch.Tensor | None = None,
