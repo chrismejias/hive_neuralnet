@@ -44,6 +44,7 @@ class PRSTrainConfigV2:
     num_iterations:            int   = 1500
     games_per_batch:           int   = 128
     mcts_simulations:          int   = 512
+    simulation_schedule:       tuple[int, ...] = ()
     max_num_considered:        int   = 16
     temperature:               float = 1.0
     temperature_drop_move:     int   = 20
@@ -77,6 +78,9 @@ class PRSTrainConfigV2:
     expansion_mask:             int   = 7
     nn_max_batch:              int   = 0
     wave_parallel:             bool  = True
+    deterministic_non_root:    bool  = False
+    virtual_q_penalty:         float = 0.25
+    non_root_sigma:            float = 4.0
     compile_forward:           bool  = False
 
     # C6 (6-fold) rotational augmentation for training batches.
@@ -87,6 +91,16 @@ class PRSTrainConfigV2:
 
     device:                    str | None = None
     use_amp:                   bool | None = None
+
+
+def _simulations_for_iteration(
+    base_simulations: int,
+    schedule: tuple[int, ...],
+    iteration: int,
+) -> int:
+    if not schedule:
+        return base_simulations
+    return int(schedule[(iteration - 1) % len(schedule)])
 
 
 # ── Loss ───────────────────────────────────────────────────────────────
@@ -180,9 +194,12 @@ class PRSTrainerV2:
     def _self_play(self, iteration: int) -> tuple[list, dict]:
         cfg = self.config
         self.best_net.eval()
+        sims_this_iter = _simulations_for_iteration(
+            cfg.mcts_simulations, cfg.simulation_schedule, iteration,
+        )
 
         mcts_cfg = PRSMCTSConfigV2(
-            num_simulations            = cfg.mcts_simulations,
+            num_simulations            = sims_this_iter,
             max_num_considered_actions = cfg.max_num_considered,
             temperature                = cfg.temperature,
             temperature_drop_move      = cfg.temperature_drop_move,
@@ -191,6 +208,9 @@ class PRSTrainerV2:
             expansion_mask             = cfg.expansion_mask,
             nn_max_batch               = cfg.nn_max_batch,
             wave_parallel              = cfg.wave_parallel,
+            deterministic_non_root     = cfg.deterministic_non_root,
+            virtual_q_penalty          = cfg.virtual_q_penalty,
+            non_root_sigma             = cfg.non_root_sigma,
             compile_forward            = cfg.compile_forward,
         )
         orchestrator = PRSMCTSOrchestratorV2(self.best_net, mcts_cfg)
@@ -302,8 +322,14 @@ class PRSTrainerV2:
         os.makedirs(self.config.checkpoint_dir, exist_ok=True)
         for iteration in range(self._start_iter, self.config.num_iterations + 1):
             self._cleanup()
+            sims_this_iter = _simulations_for_iteration(
+                self.config.mcts_simulations,
+                self.config.simulation_schedule,
+                iteration,
+            )
             print(f"\n{'='*60}")
             print(f"PRS v2 Iteration {iteration}/{self.config.num_iterations}")
+            print(f"  Simulations: {sims_this_iter}")
             print(f"{'='*60}")
 
             t0 = time.time()

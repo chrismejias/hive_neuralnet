@@ -113,6 +113,8 @@ def build_orchestrator(
     temperature: float,
     temperature_drop_move: int,
     compile_forward: bool,
+    deterministic_non_root: bool = False,
+    virtual_q_penalty: float = 0.25,
 ) -> tuple[object, object]:
     if model_type == "fnn":
         cfg = FNNMCTSConfig(
@@ -125,6 +127,8 @@ def build_orchestrator(
             expansion_mask=expansion_mask,
             wave_parallel=wave_parallel,
             wave_size=wave_size,
+            deterministic_non_root=deterministic_non_root,
+            virtual_q_penalty=virtual_q_penalty,
         )
         orch = FNNMCTSOrchestrator(net, cfg)
     else:
@@ -430,6 +434,10 @@ def main() -> None:
     ap.add_argument("--white-wave-size", type=int, default=None)
     ap.add_argument("--black-wave-size", type=int, default=None)
     ap.add_argument("--wave-parallel", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--white-deterministic-non-root", action="store_true", default=False)
+    ap.add_argument("--black-deterministic-non-root", action="store_true", default=False)
+    ap.add_argument("--white-virtual-q-penalty", type=float, default=0.25)
+    ap.add_argument("--black-virtual-q-penalty", type=float, default=0.25)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--temperature-drop-move", type=int, default=20)
     ap.add_argument("--expansion-mask", type=int, default=7)
@@ -467,11 +475,15 @@ def main() -> None:
         args.white_model, white_net, args.games, white_sims, white_k, args.wave_parallel,
         white_wave_size, args.expansion_mask, args.max_game_length, args.temperature,
         args.temperature_drop_move, args.compile_forward,
+        deterministic_non_root=args.white_deterministic_non_root,
+        virtual_q_penalty=args.white_virtual_q_penalty,
     )
     black_orch, black_cfg = build_orchestrator(
         args.black_model, black_net, args.games, black_sims, black_k, args.wave_parallel,
         black_wave_size, args.expansion_mask, args.max_game_length, args.temperature,
         args.temperature_drop_move, args.compile_forward,
+        deterministic_non_root=args.black_deterministic_non_root,
+        virtual_q_penalty=args.black_virtual_q_penalty,
     )
     ext = hive_gpu.load_extension()
 

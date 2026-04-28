@@ -82,6 +82,8 @@ nohup python3.11 -u -m hive_prs.train_prs \
   --checkpoint-keep-every 50 \
   --resume checkpoints_prs_v2/prs_v2_iter_0500.pt \
   --wave-parallel \
+  --deterministic-non-root \
+  --virtual-q-penalty 0.25 \
   >> checkpoints_prs_v2/training.log 2>&1 < /dev/null &
 
 echo $!
@@ -126,7 +128,9 @@ python3.11 -u -m hive_prs.train_prs \
   --checkpoint-dir checkpoints_prs_v2 \
   --checkpoint-keep-every 50 \
   --resume checkpoints_prs_v2/prs_v2_iter_0500.pt \
-  --wave-parallel
+  --wave-parallel \
+  --deterministic-non-root \
+  --virtual-q-penalty 0.25
 ```
 
 Some managed notebook/agent environments kill detached child processes when the
@@ -247,6 +251,7 @@ Legacy PRS v1 modules are archived under `archive/legacy_prs_v1`.
 - **Default:** Gumbel-root MCTS tree search (`PRSMCTSOrchestratorV2`)
 - Sequential-halving rounds use final Gumbel sigma scoring (`gumbel + logits + sigma * Q`) for the played move, rather than visit-count argmax.
 - Wave-parallel MCTS is enabled by default with a hard-coded per-round schedule: `1, 2, 4, 8`. Use `--no-wave-parallel` for pure serial waves.
+- `--deterministic-non-root` enables the paper-style deterministic inner selection, with `--virtual-q-penalty` used to diversify wave-parallel sims.
 - The current training/profile defaults use `k=16`.
 - PRS enables TF32 matmul precision for the transformer trunk on supported GPUs.
 - `--compile-forward` can opt in to `torch.compile` for the tensor-only trunk/head path; it is off by default because Inductor can be unstable on some hosts.
@@ -291,6 +296,8 @@ python -m profile_models --models prs-small prs-large --games 256 --sims 256 --g
 | `--simulations` | 512 | Gumbel simulation budget per move |
 | `--max-considered` | 16 | Root actions considered (k); rounds = ceil(log2(k)) |
 | `--wave-parallel` / `--no-wave-parallel` | on | Enable/disable PRS v2 per-round MCTS wave schedule (`1,2,4,8`) |
+| `--deterministic-non-root` / `--no-deterministic-non-root` | off | Use paper-style deterministic inner-node selection |
+| `--virtual-q-penalty` | 0.25 | Temporary Q penalty used to diversify deterministic wave-parallel sims |
 | `--compile-forward` / `--no-compile-forward` | off | Opt in to `torch.compile` for tensor-only trunk/head forward |
 | `--d-model` | 128 | Transformer hidden dimension |
 | `--num-heads` | 8 | Attention heads |

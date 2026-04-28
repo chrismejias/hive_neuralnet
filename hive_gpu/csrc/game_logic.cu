@@ -515,13 +515,14 @@ at::Tensor compute_centroids_batch(at::Tensor states_tensor, int batch_size) {
 namespace {
 MCTSTree build_tree(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt, int max_nodes
 ) {
     MCTSTree t;
     t.visit_count    = static_cast<int*>(vc.data_ptr());
     t.total_value    = static_cast<float*>(tv.data_ptr());
     t.prior          = static_cast<float*>(pr.data_ptr());
+    t.virtual_q_penalty = static_cast<float*>(vq.data_ptr());
     t.parent_idx     = static_cast<int*>(pa.data_ptr());
     t.move_bytes     = static_cast<uint8_t*>(mb.data_ptr());
     t.action_idx     = static_cast<int*>(ai.data_ptr());
@@ -542,7 +543,7 @@ MCTSTree build_tree(
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 mcts_select_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
     at::Tensor game_active, at::Tensor root_nodes,
     float c_puct, int B, int W, int max_nodes
@@ -557,7 +558,7 @@ mcts_select_batch(
     auto vl_paths   = at::zeros({total, MAX_TREE_DEPTH}, oi);
     auto vl_lens    = at::zeros({total}, oi);
 
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
@@ -602,7 +603,7 @@ void mcts_replay_batch(
  */
 at::Tensor mcts_expand_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
     at::Tensor leaf_indices, at::Tensor leaf_states,
     at::Tensor legal_moves, at::Tensor num_legal,
@@ -610,7 +611,7 @@ at::Tensor mcts_expand_batch(
     int B, int total, int max_nodes
 ) {
     auto was_expanded = at::zeros({total}, at::TensorOptions().dtype(c10::kChar).device(c10::kCUDA));
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
@@ -637,7 +638,7 @@ at::Tensor mcts_expand_batch(
  */
 void mcts_expand_and_backprop_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
     at::Tensor leaf_indices, at::Tensor leaf_states,
     at::Tensor legal_moves, at::Tensor num_legal,
@@ -645,7 +646,7 @@ void mcts_expand_and_backprop_batch(
     at::Tensor nn_values, at::Tensor vl_paths, at::Tensor vl_lengths,
     int B, int total, int max_nodes
 ) {
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
@@ -670,11 +671,13 @@ void mcts_expand_and_backprop_batch(
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 mcts_select_with_root_mask_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor child_init_q,
     at::Tensor game_active, at::Tensor root_nodes,
     at::Tensor alive_mask, int max_root_children,
-    float c_puct, int B, int W, int max_nodes
+    float c_puct, int B, int W, int max_nodes,
+    bool deterministic_non_root, float non_root_sigma, float q_penalty
 ) {
     int total = W * B;
     auto oi = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
@@ -686,7 +689,7 @@ mcts_select_with_root_mask_batch(
     auto vl_paths   = at::zeros({total, MAX_TREE_DEPTH}, oi);
     auto vl_lens    = at::zeros({total}, oi);
 
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
@@ -701,7 +704,9 @@ mcts_select_with_root_mask_batch(
         static_cast<const int*>(root_nodes.data_ptr()),
         static_cast<const int8_t*>(alive_mask.data_ptr()),
         max_root_children,
-        c_puct, B, total);
+        c_puct, deterministic_non_root, non_root_sigma, q_penalty,
+        static_cast<const float*>(child_init_q.data_ptr()),
+        B, total);
 
     return std::make_tuple(leaf_idx, move_paths, path_lens, vl_paths, vl_lens);
 }
@@ -712,11 +717,13 @@ mcts_select_with_root_mask_batch(
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 mcts_select_with_root_slots_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor child_init_q,
     at::Tensor game_active, at::Tensor root_nodes,
     at::Tensor root_slots, int num_candidates, int max_root_children,
-    float c_puct, int B, int W, int max_nodes
+    float c_puct, int B, int W, int max_nodes,
+    bool deterministic_non_root, float non_root_sigma, float q_penalty
 ) {
     int total = W * num_candidates * B;
     auto oi = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
@@ -728,7 +735,7 @@ mcts_select_with_root_slots_batch(
     auto vl_paths   = at::zeros({total, MAX_TREE_DEPTH}, oi);
     auto vl_lens    = at::zeros({total}, oi);
 
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
@@ -743,7 +750,9 @@ mcts_select_with_root_slots_batch(
         static_cast<const int*>(root_nodes.data_ptr()),
         static_cast<const int*>(root_slots.data_ptr()),
         num_candidates, max_root_children,
-        c_puct, B, total);
+        c_puct, deterministic_non_root, non_root_sigma, q_penalty,
+        static_cast<const float*>(child_init_q.data_ptr()),
+        B, total);
 
     return std::make_tuple(leaf_idx, move_paths, path_lens, vl_paths, vl_lens);
 }
@@ -757,12 +766,14 @@ mcts_select_with_root_slots_batch(
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 mcts_select_replay_legal_fnn_root_slots_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor child_init_q,
     at::Tensor root_states,
     at::Tensor game_active, at::Tensor root_nodes,
     at::Tensor root_slots, int num_candidates, int max_root_children,
-    float c_puct, int B, int W, int max_nodes
+    float c_puct, int B, int W, int max_nodes,
+    bool deterministic_non_root, float non_root_sigma, float q_penalty
 ) {
     int total = W * num_candidates * B;
     auto oi = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
@@ -781,7 +792,7 @@ mcts_select_replay_legal_fnn_root_slots_batch(
     auto num_legal = at::zeros({total}, oi);
     auto features = at::zeros({total, (int64_t)FNN_FEAT_DIM}, of);
 
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
@@ -796,7 +807,9 @@ mcts_select_replay_legal_fnn_root_slots_batch(
         static_cast<const int*>(root_nodes.data_ptr()),
         static_cast<const int*>(root_slots.data_ptr()),
         num_candidates, max_root_children,
-        c_puct, B, total);
+        c_puct, deterministic_non_root, non_root_sigma, q_penalty,
+        static_cast<const float*>(child_init_q.data_ptr()),
+        B, total);
 
     mcts_replay_kernel<<<blocks, threads>>>(
         reinterpret_cast<const HiveState*>(root_states.data_ptr()),
@@ -828,15 +841,16 @@ mcts_select_replay_legal_fnn_root_slots_batch(
  */
 at::Tensor mcts_expand_dense_priors_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor child_init_q, at::Tensor child_q_values,
     at::Tensor leaf_indices, at::Tensor leaf_states,
     at::Tensor legal_moves, at::Tensor num_legal,
     at::Tensor priors_per_legal, at::Tensor results,
     int B, int total, int max_nodes
 ) {
     auto was_expanded = at::zeros({total}, at::TensorOptions().dtype(c10::kChar).device(c10::kCUDA));
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
@@ -847,6 +861,8 @@ at::Tensor mcts_expand_dense_priors_batch(
         reinterpret_cast<const GPUMove*>(legal_moves.data_ptr()),
         static_cast<const int*>(num_legal.data_ptr()),
         static_cast<const float*>(priors_per_legal.data_ptr()),
+        static_cast<const float*>(child_q_values.data_ptr()),
+        static_cast<float*>(child_init_q.data_ptr()),
         static_cast<const int*>(results.data_ptr()),
         static_cast<int8_t*>(was_expanded.data_ptr()),
         B, total);
@@ -859,15 +875,16 @@ at::Tensor mcts_expand_dense_priors_batch(
  */
 void mcts_expand_and_backprop_dense_priors_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
+    at::Tensor child_init_q, at::Tensor child_q_values,
     at::Tensor leaf_indices, at::Tensor leaf_states,
     at::Tensor legal_moves, at::Tensor num_legal,
     at::Tensor priors_per_legal, at::Tensor results,
     at::Tensor nn_values, at::Tensor vl_paths, at::Tensor vl_lengths,
-    int B, int total, int max_nodes
+    int B, int total, int max_nodes, float q_penalty
 ) {
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
@@ -878,10 +895,13 @@ void mcts_expand_and_backprop_dense_priors_batch(
         reinterpret_cast<const GPUMove*>(legal_moves.data_ptr()),
         static_cast<const int*>(num_legal.data_ptr()),
         static_cast<const float*>(priors_per_legal.data_ptr()),
+        static_cast<const float*>(child_q_values.data_ptr()),
+        static_cast<float*>(child_init_q.data_ptr()),
         static_cast<const int*>(results.data_ptr()),
         static_cast<const float*>(nn_values.data_ptr()),
         static_cast<const int*>(vl_paths.data_ptr()),
         static_cast<const int*>(vl_lengths.data_ptr()),
+        q_penalty,
         B, total);
 }
 
@@ -890,13 +910,13 @@ void mcts_expand_and_backprop_dense_priors_batch(
  */
 void mcts_backprop_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
     at::Tensor leaf_indices, at::Tensor nn_values,
     at::Tensor vl_paths, at::Tensor vl_lengths, at::Tensor was_expanded,
     int B, int total, int max_nodes
 ) {
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (total + threads - 1) / threads;
@@ -917,7 +937,7 @@ void mcts_backprop_batch(
  */
 at::Tensor mcts_extract_policy_batch(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
     at::Tensor move_numbers, at::Tensor root_nodes,
     float temperature, int temp_drop_move, float pruning_threshold,
@@ -926,7 +946,7 @@ at::Tensor mcts_extract_policy_batch(
     auto policies = at::zeros(
         {B, (int64_t)ACTION_SPACE_SIZE},
         at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA));
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (B + threads - 1) / threads;
@@ -946,13 +966,13 @@ at::Tensor mcts_extract_policy_batch(
  */
 void mcts_apply_root_noise(
     at::Tensor vc, at::Tensor tv, at::Tensor pr, at::Tensor pa,
-    at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
+    at::Tensor vq, at::Tensor mb, at::Tensor ai, at::Tensor fc, at::Tensor nc,
     at::Tensor it, at::Tensor tv2, at::Tensor cnt,
     at::Tensor noise, at::Tensor root_nodes, int max_children_pad,
     float dir_eps, float root_policy_temp,
     int B, int max_nodes
 ) {
-    MCTSTree tree = build_tree(vc, tv, pr, pa, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
+    MCTSTree tree = build_tree(vc, tv, pr, pa, vq, mb, ai, fc, nc, it, tv2, cnt, max_nodes);
 
     int threads = 256;
     int blocks  = (B + threads - 1) / threads;

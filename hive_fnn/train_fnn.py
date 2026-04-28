@@ -87,7 +87,36 @@ def parse_args() -> argparse.Namespace:
             "(FNN: 2,4,8,16). Use --no-gumbel-wave-parallel for pure serial waves."
         ),
     )
-    p.add_argument("--gumbel-wave-size", type=int, default=4)
+    p.add_argument(
+        "--gumbel-deterministic-non-root",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the paper-style deterministic non-root action selection "
+            "based on completed Q-values. With wave-parallel enabled, "
+            "parallel sims are diversified by a temporary virtual-Q penalty."
+        ),
+    )
+    p.add_argument(
+        "--gumbel-virtual-q-penalty",
+        type=float,
+        default=0.25,
+        help=(
+            "Temporary per-node Q penalty used to diversify deterministic "
+            "non-root wave-parallel simulations."
+        ),
+    )
+    p.add_argument(
+        "--gumbel-non-root-sigma",
+        type=float,
+        default=4.0,
+        help=(
+            "Constant sigma for non-root Gumbel selection: "
+            "score(a) = log(prior[a]) + non_root_sigma * Q(a). "
+            "Controls how much Q (FNN initial estimate or MCTS-backed) "
+            "weighs against the log-prior."
+        ),
+    )
     p.add_argument("--puct-wave-size", type=int, default=16)
 
     # Training
@@ -149,7 +178,9 @@ def main() -> None:
         draw_keep_rate=args.draw_keep_rate,
         use_puct=args.puct,
         gumbel_wave_parallel=args.gumbel_wave_parallel,
-        gumbel_wave_size=args.gumbel_wave_size,
+        gumbel_deterministic_non_root=args.gumbel_deterministic_non_root,
+        gumbel_virtual_q_penalty=args.gumbel_virtual_q_penalty,
+        gumbel_non_root_sigma=args.gumbel_non_root_sigma,
         puct_wave_size=args.puct_wave_size,
     )
 
@@ -164,7 +195,9 @@ def main() -> None:
     else:
         print(
             "  Search: Gumbel-root MCTS "
-            f"(wave_parallel={train_config.gumbel_wave_parallel})"
+            f"(wave_parallel={train_config.gumbel_wave_parallel}, "
+            f"deterministic_non_root={train_config.gumbel_deterministic_non_root}, "
+            f"virtual_q_penalty={train_config.gumbel_virtual_q_penalty})"
         )
     if train_config.simulation_schedule:
         print(f"  Simulation schedule: {list(train_config.simulation_schedule)}")

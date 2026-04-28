@@ -76,7 +76,7 @@ fnn_selfplay_batch(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 mcts_select_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
     torch::Tensor game_active, torch::Tensor root_nodes,
     float c_puct, int B, int W, int max_nodes);
@@ -88,7 +88,7 @@ void mcts_replay_batch(
 
 torch::Tensor mcts_expand_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
     torch::Tensor leaf_indices, torch::Tensor leaf_states,
     torch::Tensor legal_moves, torch::Tensor num_legal,
@@ -97,7 +97,7 @@ torch::Tensor mcts_expand_batch(
 
 void mcts_backprop_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
     torch::Tensor leaf_indices, torch::Tensor nn_values,
     torch::Tensor vl_paths, torch::Tensor vl_lengths, torch::Tensor was_expanded,
@@ -105,7 +105,7 @@ void mcts_backprop_batch(
 
 void mcts_expand_and_backprop_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
     torch::Tensor leaf_indices, torch::Tensor leaf_states,
     torch::Tensor legal_moves, torch::Tensor num_legal,
@@ -115,7 +115,7 @@ void mcts_expand_and_backprop_batch(
 
 torch::Tensor mcts_extract_policy_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
     torch::Tensor move_numbers, torch::Tensor root_nodes,
     float temperature, int temp_drop_move, float pruning_threshold,
@@ -124,36 +124,43 @@ torch::Tensor mcts_extract_policy_batch(
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 mcts_select_with_root_mask_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor child_init_q,
     torch::Tensor game_active, torch::Tensor root_nodes,
     torch::Tensor alive_mask, int max_root_children,
-    float c_puct, int B, int W, int max_nodes);
+    float c_puct, int B, int W, int max_nodes,
+    bool deterministic_non_root, float non_root_sigma, float q_penalty);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 mcts_select_with_root_slots_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor child_init_q,
     torch::Tensor game_active, torch::Tensor root_nodes,
     torch::Tensor root_slots, int num_candidates, int max_root_children,
-    float c_puct, int B, int W, int max_nodes);
+    float c_puct, int B, int W, int max_nodes,
+    bool deterministic_non_root, float non_root_sigma, float q_penalty);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 mcts_select_replay_legal_fnn_root_slots_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor child_init_q,
     torch::Tensor root_states,
     torch::Tensor game_active, torch::Tensor root_nodes,
     torch::Tensor root_slots, int num_candidates, int max_root_children,
-    float c_puct, int B, int W, int max_nodes);
+    float c_puct, int B, int W, int max_nodes,
+    bool deterministic_non_root, float non_root_sigma, float q_penalty);
 
 torch::Tensor mcts_expand_dense_priors_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor child_init_q, torch::Tensor child_q_values,
     torch::Tensor leaf_indices, torch::Tensor leaf_states,
     torch::Tensor legal_moves, torch::Tensor num_legal,
     torch::Tensor priors_per_legal, torch::Tensor results,
@@ -161,17 +168,18 @@ torch::Tensor mcts_expand_dense_priors_batch(
 
 void mcts_expand_and_backprop_dense_priors_batch(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
+    torch::Tensor child_init_q, torch::Tensor child_q_values,
     torch::Tensor leaf_indices, torch::Tensor leaf_states,
     torch::Tensor legal_moves, torch::Tensor num_legal,
     torch::Tensor priors_per_legal, torch::Tensor results,
     torch::Tensor nn_values, torch::Tensor vl_paths, torch::Tensor vl_lengths,
-    int B, int total, int max_nodes);
+    int B, int total, int max_nodes, float q_penalty);
 
 void mcts_apply_root_noise(
     torch::Tensor vc, torch::Tensor tv, torch::Tensor pr, torch::Tensor pa,
-    torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
+    torch::Tensor vq, torch::Tensor mb, torch::Tensor ai, torch::Tensor fc, torch::Tensor nc,
     torch::Tensor it, torch::Tensor tv2, torch::Tensor cnt,
     torch::Tensor noise, torch::Tensor root_nodes, int max_children_pad,
     float dir_eps, float root_policy_temp,
@@ -284,12 +292,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mcts_apply_root_noise", &hive_gpu::mcts_apply_root_noise,
           "Apply root policy temperature + Dirichlet noise");
     m.def("mcts_select_with_root_mask_batch", &hive_gpu::mcts_select_with_root_mask_batch,
-          "MCTS PUCT selection with root alive-mask (Gumbel Sequential Halving)");
+          "MCTS selection with root alive-mask (Gumbel Sequential Halving)",
+          py::arg("vc"), py::arg("tv"), py::arg("pr"), py::arg("pa"),
+          py::arg("vq"), py::arg("mb"), py::arg("ai"), py::arg("fc"), py::arg("nc"),
+          py::arg("it"), py::arg("tv2"), py::arg("cnt"),
+          py::arg("child_init_q"),
+          py::arg("game_active"), py::arg("root_nodes"),
+          py::arg("alive_mask"), py::arg("max_root_children"),
+          py::arg("c_puct"), py::arg("B"), py::arg("W"), py::arg("max_nodes"),
+          py::arg("deterministic_non_root") = false,
+          py::arg("non_root_sigma") = 4.0f,
+          py::arg("q_penalty") = 0.0f);
     m.def("mcts_select_with_root_slots_batch", &hive_gpu::mcts_select_with_root_slots_batch,
-          "MCTS PUCT selection with explicit root slots (equal-budget Gumbel halving)");
+          "MCTS selection with explicit root slots (equal-budget Gumbel halving)",
+          py::arg("vc"), py::arg("tv"), py::arg("pr"), py::arg("pa"),
+          py::arg("vq"), py::arg("mb"), py::arg("ai"), py::arg("fc"), py::arg("nc"),
+          py::arg("it"), py::arg("tv2"), py::arg("cnt"),
+          py::arg("child_init_q"),
+          py::arg("game_active"), py::arg("root_nodes"),
+          py::arg("root_slots"), py::arg("num_candidates"),
+          py::arg("max_root_children"),
+          py::arg("c_puct"), py::arg("B"), py::arg("W"), py::arg("max_nodes"),
+          py::arg("deterministic_non_root") = false,
+          py::arg("non_root_sigma") = 4.0f,
+          py::arg("q_penalty") = 0.0f);
     m.def("mcts_select_replay_legal_fnn_root_slots_batch",
           &hive_gpu::mcts_select_replay_legal_fnn_root_slots_batch,
-          "Fused root-slot select + replay + legal/FNN features for one Gumbel wave");
+          "Fused root-slot select + replay + legal/FNN features for one Gumbel wave",
+          py::arg("vc"), py::arg("tv"), py::arg("pr"), py::arg("pa"),
+          py::arg("vq"), py::arg("mb"), py::arg("ai"), py::arg("fc"), py::arg("nc"),
+          py::arg("it"), py::arg("tv2"), py::arg("cnt"),
+          py::arg("child_init_q"),
+          py::arg("root_states"),
+          py::arg("game_active"), py::arg("root_nodes"),
+          py::arg("root_slots"), py::arg("num_candidates"),
+          py::arg("max_root_children"),
+          py::arg("c_puct"), py::arg("B"), py::arg("W"), py::arg("max_nodes"),
+          py::arg("deterministic_non_root") = false,
+          py::arg("non_root_sigma") = 4.0f,
+          py::arg("q_penalty") = 0.0f);
     m.def("mcts_expand_dense_priors_batch", &hive_gpu::mcts_expand_dense_priors_batch,
           "MCTS expand with per-legal-move priors (no ACTION_SPACE indirection)");
     m.def("mcts_expand_and_backprop_dense_priors_batch",

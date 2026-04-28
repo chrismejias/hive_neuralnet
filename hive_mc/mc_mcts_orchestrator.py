@@ -76,6 +76,7 @@ class MCMCTSOrchestrator:
             "visit_count":    torch.zeros(B, M, dtype=torch.int32,  device=dev),
             "total_value":    torch.zeros(B, M, dtype=torch.float32, device=dev),
             "prior":          torch.zeros(B, M, dtype=torch.float32, device=dev),
+            "virtual_q_penalty": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "parent_idx":     torch.full((B, M), -1, dtype=torch.int32, device=dev),
             "move_bytes":     torch.zeros(B, M, self._move_size, dtype=torch.uint8, device=dev),
             "action_idx":     torch.full((B, M), -1, dtype=torch.int32, device=dev),
@@ -85,12 +86,14 @@ class MCMCTSOrchestrator:
             "terminal_value": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "node_count":     torch.ones(B, dtype=torch.int32, device=dev),
             "root_node":      torch.zeros(B, dtype=torch.int32, device=dev),
+            "child_init_q":   torch.zeros(B, M, dtype=torch.float32, device=dev),
         }
 
     def _reset_tree(self, tree: dict[str, torch.Tensor]) -> None:
         tree["visit_count"].zero_()
         tree["total_value"].zero_()
         tree["prior"].zero_()
+        tree["virtual_q_penalty"].zero_()
         tree["parent_idx"].fill_(-1)
         tree["move_bytes"].zero_()
         tree["action_idx"].fill_(-1)
@@ -100,10 +103,12 @@ class MCMCTSOrchestrator:
         tree["terminal_value"].zero_()
         tree["node_count"].fill_(1)
         tree["root_node"].zero_()
+        tree["child_init_q"].zero_()
 
     def _tree_args(self, tree: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         return [
             tree["visit_count"], tree["total_value"], tree["prior"],
+            tree["virtual_q_penalty"],
             tree["parent_idx"], tree["move_bytes"], tree["action_idx"],
             tree["first_child"], tree["num_children"],
             tree["is_terminal"], tree["terminal_value"], tree["node_count"],
@@ -347,8 +352,10 @@ class MCMCTSOrchestrator:
             needs, leaf_indices, torch.full_like(leaf_indices, -1),
         )
         results = self.ext.check_results_batch(states, B)
+        child_q_zeros = torch.zeros(B, self._max_legal, dtype=torch.float32, device="cuda")
         self.ext.mcts_expand_dense_priors_batch(
             *self._tree_args(tree),
+            tree["child_init_q"], child_q_zeros,
             leaf_indices, states,
             legal_moves, num_legal, priors_per_legal, results,
             B, B, self._max_nodes,
@@ -393,9 +400,11 @@ class MCMCTSOrchestrator:
             leaf_idx, move_paths, path_lens, vl_paths, vl_lens = (
                 self.ext.mcts_select_with_root_mask_batch(
                     *self._tree_args(tree),
+                    tree["child_init_q"],
                     game_active_t, tree["root_node"],
                     alive_mask, self._max_legal,
                     cfg.c_puct, B, actual_w, self._max_nodes,
+                    False, 4.0, 0.0,
                 )
             )
 
@@ -448,12 +457,14 @@ class MCMCTSOrchestrator:
                     valid_slot, priors_leaf, torch.zeros_like(priors_leaf),
                 )
 
+            child_q_leaf = leaf_vals.unsqueeze(1).expand(total, self._max_legal).contiguous()
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
                 *self._tree_args(tree),
+                tree["child_init_q"], child_q_leaf,
                 leaf_idx[:total], leaf_states[:total],
                 legal_moves, num_legal, priors_leaf, results,
                 leaf_vals, vl_paths[:total], vl_lens[:total],
-                B, total, self._max_nodes,
+                B, total, self._max_nodes, 0.0,
             )
 
     def _gather_root_child_stats(
@@ -500,6 +511,7 @@ class MCMCTSOrchestrator:
                 tree["terminal_value"][i].zero_()
                 tree["node_count"][i] = 1
                 tree["root_node"][i] = 0
+                tree["child_init_q"][i].zero_()
             return
 
         # Legacy behavior: keep subtree rooted at chosen child.

@@ -63,6 +63,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iterations", type=int, default=1500)
     p.add_argument("--games", type=int, default=128)
     p.add_argument("--simulations", type=int, default=256)
+    p.add_argument(
+        "--simulation-schedule",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated per-iteration simulation schedule, "
+            "for example '1024,2048,4096'. Overrides fixed --simulations."
+        ),
+    )
     p.add_argument("--max-considered", type=int, default=16)
     p.add_argument("--max-game-len", type=int, default=300)
 
@@ -104,6 +113,35 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--deterministic-non-root",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the paper-style deterministic non-root action selection "
+            "based on completed Q-values. With wave-parallel enabled, "
+            "parallel sims are diversified by a temporary virtual-Q penalty."
+        ),
+    )
+    p.add_argument(
+        "--virtual-q-penalty",
+        type=float,
+        default=0.25,
+        help=(
+            "Temporary per-node Q penalty used to diversify deterministic "
+            "non-root wave-parallel simulations."
+        ),
+    )
+    p.add_argument(
+        "--non-root-sigma",
+        type=float,
+        default=4.0,
+        help=(
+            "Constant sigma for non-root Gumbel selection: "
+            "score(a) = log(prior[a]) + non_root_sigma * Q(a). "
+            "Controls how much Q weighs against the log-prior."
+        ),
+    )
+    p.add_argument(
         "--compile-forward",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -125,6 +163,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    sim_schedule = ()
+    if args.simulation_schedule:
+        sim_schedule = tuple(
+            int(part.strip())
+            for part in args.simulation_schedule.split(",")
+            if part.strip()
+        )
 
     net_config = PRSConfig(
         d_model=args.d_model,
@@ -137,6 +182,7 @@ def main() -> None:
         num_iterations=args.iterations,
         games_per_batch=args.games,
         mcts_simulations=args.simulations,
+        simulation_schedule=sim_schedule,
         max_num_considered=args.max_considered,
         max_game_length=args.max_game_len,
         batch_size=args.batch_size,
@@ -152,6 +198,9 @@ def main() -> None:
         draw_keep_rate=args.draw_keep_rate,
         nn_max_batch=args.nn_max_batch,
         wave_parallel=args.wave_parallel,
+        deterministic_non_root=args.deterministic_non_root,
+        virtual_q_penalty=args.virtual_q_penalty,
+        non_root_sigma=args.non_root_sigma,
         compile_forward=args.compile_forward,
         augment_prob=args.augment_prob,
     )
@@ -174,12 +223,24 @@ def main() -> None:
     print(f"\nTraining for {train_config.num_iterations} iterations")
     print(f"  LR: {train_config.learning_rate} ({train_config.lr_schedule})")
     print(f"  Games/iter: {train_config.games_per_batch}")
-    print(
-        f"  Simulations: {train_config.mcts_simulations} "
-        f"(k={train_config.max_num_considered}, "
-        f"wave_parallel={train_config.wave_parallel}, "
-        f"compile_forward={train_config.compile_forward})"
-    )
+    if train_config.simulation_schedule:
+        print(
+            f"  Simulation schedule: {list(train_config.simulation_schedule)} "
+            f"(k={train_config.max_num_considered}, "
+            f"wave_parallel={train_config.wave_parallel}, "
+            f"deterministic_non_root={train_config.deterministic_non_root}, "
+            f"virtual_q_penalty={train_config.virtual_q_penalty}, "
+            f"compile_forward={train_config.compile_forward})"
+        )
+    else:
+        print(
+            f"  Simulations: {train_config.mcts_simulations} "
+            f"(k={train_config.max_num_considered}, "
+            f"wave_parallel={train_config.wave_parallel}, "
+            f"deterministic_non_root={train_config.deterministic_non_root}, "
+            f"virtual_q_penalty={train_config.virtual_q_penalty}, "
+            f"compile_forward={train_config.compile_forward})"
+        )
     print(f"  Checkpoint dir: {train_config.checkpoint_dir}")
     print()
 

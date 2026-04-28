@@ -47,6 +47,9 @@ class FNNMCTSConfig:
     expansion_mask:              int   = 0
     wave_parallel:               bool  = True
     wave_size:                   int   = 4
+    deterministic_non_root:      bool  = False
+    virtual_q_penalty:           float = 0.25
+    non_root_sigma:              float = 4.0
     dirichlet_alpha:             float = 0.3
     dirichlet_epsilon:           float = 0.25
     max_tree_nodes:              int   = 65536
@@ -99,6 +102,7 @@ class FNNMCTSOrchestrator:
             "visit_count":    torch.zeros(B, M, dtype=torch.int32,  device=dev),
             "total_value":    torch.zeros(B, M, dtype=torch.float32, device=dev),
             "prior":          torch.zeros(B, M, dtype=torch.float32, device=dev),
+            "virtual_q_penalty": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "parent_idx":     torch.full((B, M), -1, dtype=torch.int32, device=dev),
             "move_bytes":     torch.zeros(B, M, self._move_size, dtype=torch.uint8, device=dev),
             "action_idx":     torch.full((B, M), -1, dtype=torch.int32, device=dev),
@@ -108,12 +112,15 @@ class FNNMCTSOrchestrator:
             "terminal_value": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "node_count":     torch.ones(B, dtype=torch.int32, device=dev),
             "root_node":      torch.zeros(B, dtype=torch.int32, device=dev),
+            # Separate from MCTSTree struct; passed directly to select/expand kernels
+            "child_init_q":   torch.zeros(B, M, dtype=torch.float32, device=dev),
         }
 
     def _reset_tree(self, tree: dict[str, torch.Tensor]) -> None:
         tree["visit_count"].zero_()
         tree["total_value"].zero_()
         tree["prior"].zero_()
+        tree["virtual_q_penalty"].zero_()
         tree["parent_idx"].fill_(-1)
         tree["move_bytes"].zero_()
         tree["action_idx"].fill_(-1)
@@ -123,11 +130,13 @@ class FNNMCTSOrchestrator:
         tree["terminal_value"].zero_()
         tree["node_count"].fill_(1)
         tree["root_node"].zero_()
+        tree["child_init_q"].zero_()
 
     def _tree_args(self, tree: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         return [
             tree["visit_count"], tree["total_value"], tree["prior"],
-            tree["parent_idx"], tree["move_bytes"], tree["action_idx"],
+            tree["parent_idx"], tree["virtual_q_penalty"],
+            tree["move_bytes"], tree["action_idx"],
             tree["first_child"], tree["num_children"],
             tree["is_terminal"], tree["terminal_value"], tree["node_count"],
         ]
@@ -141,13 +150,15 @@ class FNNMCTSOrchestrator:
         num_legal: torch.Tensor,
         total: int,
         root_features: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode states + score every legal successor.
 
         Returns:
-            priors_per_legal: (total, MAX_LEGAL) softmax over legal slots,
-                zeros elsewhere.
-            root_values:      (total,) scalar value estimate per state.
+            priors_per_legal:  (total, MAX_LEGAL) softmax over legal slots.
+            root_values:       (total,) scalar value estimate per state.
+            child_q_per_legal: (total, MAX_LEGAL) initial Q for each child
+                               from the parent's perspective (-v_child).
+                               Zero for invalid slots.
         """
         dev = "cuda"
         MAX_L = self._max_legal
@@ -160,7 +171,7 @@ class FNNMCTSOrchestrator:
 
         if total == 0:
             empty = torch.zeros(0, MAX_L, dtype=torch.float32, device=dev)
-            return empty, empty.new_zeros((0,))
+            return empty, empty.new_zeros((0,)), empty
 
         slot_idx = self._slot_idx
         valid = slot_idx < n64.unsqueeze(1)          # (total, MAX_L)
@@ -172,10 +183,9 @@ class FNNMCTSOrchestrator:
             with torch.inference_mode():
                 root_emb = self.net.encode(root_features)
                 root_values = self.net.value_head(root_emb).squeeze(-1).float()
-            priors_per_legal = torch.zeros(
-                total, MAX_L, dtype=torch.float32, device=dev,
-            )
-            return priors_per_legal, root_values
+            priors_per_legal = torch.zeros(total, MAX_L, dtype=torch.float32, device=dev)
+            child_q_per_legal = torch.zeros(total, MAX_L, dtype=torch.float32, device=dev)
+            return priors_per_legal, root_values, child_q_per_legal
 
         succ_features = self.ext.fnn_successor_features_batch(
             states, legal_moves, action_to_root, move_indices, N_total,
@@ -187,22 +197,26 @@ class FNNMCTSOrchestrator:
             root_emb = all_emb[:total]
             succ_emb = all_emb[total:]
             root_values = self.net.value_head(root_emb).squeeze(-1).float()
+            # Per-child value from child's perspective; negate for parent's perspective
+            child_values = self.net.value_head(succ_emb).squeeze(-1).float()  # (N_total,)
             gathered_root = root_emb[action_to_root]
             action_logits = self.net.score_actions(
                 gathered_root, succ_emb,
             ).float()                                  # (N_total,)
 
-        # Scatter logits back into the fixed-width legal tensor. Keeping
-        # MAX_L avoids a per-eval CPU sync on num_legal.max().item().
         legal_logits = torch.full(
             (total, MAX_L), -1e30, dtype=torch.float32, device=dev,
         )
         legal_logits[valid] = action_logits
 
-        # Softmax over valid slots (padded slots stay effectively -inf).
         prior_pad = torch.softmax(legal_logits, dim=1)
         prior_pad = prior_pad.masked_fill(~valid, 0.0)
-        return prior_pad, root_values
+
+        # Scatter per-child Q into fixed-width tensor (negated: child good = parent bad)
+        child_q_per_legal = torch.zeros(total, MAX_L, dtype=torch.float32, device=dev)
+        child_q_per_legal[valid] = -child_values
+
+        return prior_pad, root_values, child_q_per_legal
 
     def _find_immediate_wins(
         self,
@@ -290,12 +304,13 @@ class FNNMCTSOrchestrator:
             if cfg.max_num_considered_actions != _GUMBEL_K:
                 cfg.max_num_considered_actions = _GUMBEL_K
 
-            priors_per_legal, _root_vals = self._eval_states(
+            priors_per_legal, root_vals, child_q_per_legal = self._eval_states(
                 states, legal_moves, num_legal, B, root_features,
             )
             if bool(has_immediate_win.any().item()):
                 priors_per_legal.zero_()
                 priors_per_legal[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
+                child_q_per_legal.zero_()
 
             # Padded logits over MAX_LEGAL slots (log of prior, with -inf on invalid).
             MAX_L = self._max_legal
@@ -318,7 +333,7 @@ class FNNMCTSOrchestrator:
             game_active_t = has_actions.to(torch.int8)
             self._expand_root_if_needed(
                 tree, states, legal_moves, num_legal,
-                priors_per_legal, game_active_t, B,
+                priors_per_legal, child_q_per_legal, game_active_t, B,
             )
             self._apply_root_dirichlet(tree, B, has_actions)
 
@@ -409,20 +424,21 @@ class FNNMCTSOrchestrator:
                     candidate_slots, 1, chosen_pos.unsqueeze(1),
                 ).squeeze(1).clamp(min=0).to(torch.long)
 
-                # ── Policy target = visit distribution over legal moves ───
-                slot_visits, _slot_q = self._gather_root_child_stats(tree, B)
-                visits_f = slot_visits.float()
-                vsum = visits_f.sum(dim=1, keepdim=True)
-                probs_pad = torch.where(
-                    vsum > 0,
-                    visits_f / vsum.clamp(min=1.0),
-                    torch.zeros_like(visits_f),
+                # ── Policy target = Gumbel improved policy (paper eq. 10-12) ──
+                # completedQ(a) = q(a) if visited, else v̂_π (root value estimate)
+                slot_visits, slot_q = self._gather_root_child_stats(tree, B)
+                visited = (slot_visits > 0) & valid_slot
+                v_pi = root_vals.unsqueeze(1).expand_as(slot_q)
+                completed_q = torch.where(visited, slot_q, v_pi)
+                max_n = slot_visits.float().max(dim=1, keepdim=True).values
+                sigma_norm = (cfg.c_visit + max_n) * cfg.c_scale
+                improved_logits = legal_logits + sigma_norm * completed_q
+                improved_logits = torch.where(
+                    valid_slot, improved_logits,
+                    torch.full_like(improved_logits, -1e30),
                 )
-
-                uniform = valid_slot.float()
-                ucount = uniform.sum(dim=1, keepdim=True).clamp(min=1.0)
-                uniform = uniform / ucount
-                probs_pad = torch.where(vsum > 0, probs_pad, uniform)
+                probs_pad = torch.softmax(improved_logits, dim=1)
+                probs_pad = torch.where(valid_slot, probs_pad, torch.zeros_like(probs_pad))
 
             # ── Record history ───────────────────────────────────────
             has_actions_cpu = has_actions.cpu().numpy()
@@ -492,7 +508,7 @@ class FNNMCTSOrchestrator:
     def _expand_root_if_needed(
         self,
         tree, states, legal_moves, num_legal,
-        priors_per_legal, game_active_t, B,
+        priors_per_legal, child_q_per_legal, game_active_t, B,
     ):
         row = torch.arange(B, device="cuda")
         root_node = tree["root_node"]
@@ -508,6 +524,7 @@ class FNNMCTSOrchestrator:
         results = self.ext.check_results_batch(states, B)
         self.ext.mcts_expand_dense_priors_batch(
             *self._tree_args(tree),
+            tree["child_init_q"], child_q_per_legal,
             leaf_indices, states,
             legal_moves, num_legal, priors_per_legal, results,
             B, B, self._max_nodes,
@@ -545,6 +562,11 @@ class FNNMCTSOrchestrator:
         num_waves = math.ceil(num_sims / W)
         state_size = root_states.shape[1]
         leaf_states = torch.zeros(W * B, state_size, dtype=torch.uint8, device="cuda")
+        q_penalty = (
+            float(cfg.virtual_q_penalty)
+            if cfg.deterministic_non_root and W > 1
+            else 0.0
+        )
 
         for wave in range(num_waves):
             actual_w = min(W, num_sims - wave * W)
@@ -553,9 +575,11 @@ class FNNMCTSOrchestrator:
             leaf_idx, move_paths, path_lens, vl_paths, vl_lens = (
                 self.ext.mcts_select_with_root_mask_batch(
                     *self._tree_args(tree),
+                    tree["child_init_q"],
                     game_active_t, tree["root_node"],
                     alive_mask, self._max_legal,
                     cfg.c_puct, B, actual_w, self._max_nodes,
+                    cfg.deterministic_non_root, cfg.non_root_sigma, q_penalty,
                 )
             )
 
@@ -572,16 +596,17 @@ class FNNMCTSOrchestrator:
                 )
             )
 
-            priors_leaf, leaf_vals = self._eval_states(
+            priors_leaf, leaf_vals, child_q_leaf = self._eval_states(
                 leaf_states[:total], legal_moves, num_legal, total, leaf_features,
             )
 
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
                 *self._tree_args(tree),
+                tree["child_init_q"], child_q_leaf,
                 leaf_idx[:total], leaf_states[:total],
                 legal_moves, num_legal, priors_leaf, results,
                 leaf_vals, vl_paths[:total], vl_lens[:total],
-                B, total, self._max_nodes,
+                B, total, self._max_nodes, q_penalty,
             )
 
     def _run_simulations_for_root_slots(
@@ -592,6 +617,11 @@ class FNNMCTSOrchestrator:
         C = int(root_slots.shape[1])
         W = max(1, int(cfg.wave_size if wave_size is None else wave_size))
         num_waves = math.ceil(num_sims_per_slot / W)
+        q_penalty = (
+            float(cfg.virtual_q_penalty)
+            if cfg.deterministic_non_root and W > 1
+            else 0.0
+        )
         use_fused_prefix = hasattr(
             self.ext, "mcts_select_replay_legal_fnn_root_slots_batch",
         )
@@ -610,18 +640,22 @@ class FNNMCTSOrchestrator:
                     leaf_features, results, vl_paths, vl_lens,
                 ) = self.ext.mcts_select_replay_legal_fnn_root_slots_batch(
                     *self._tree_args(tree),
+                    tree["child_init_q"],
                     root_states,
                     game_active_t, tree["root_node"],
                     root_slots, C, self._max_legal,
                     cfg.c_puct, B, actual_w, self._max_nodes,
+                    cfg.deterministic_non_root, cfg.non_root_sigma, q_penalty,
                 )
             else:
                 leaf_idx, move_paths, path_lens, vl_paths, vl_lens = (
                     self.ext.mcts_select_with_root_slots_batch(
                         *self._tree_args(tree),
+                        tree["child_init_q"],
                         game_active_t, tree["root_node"],
                         root_slots, C, self._max_legal,
                         cfg.c_puct, B, actual_w, self._max_nodes,
+                        cfg.deterministic_non_root, cfg.non_root_sigma, q_penalty,
                     )
                 )
 
@@ -639,16 +673,17 @@ class FNNMCTSOrchestrator:
                 )
                 leaf_states_wave = leaf_states[:total]
 
-            priors_leaf, leaf_vals = self._eval_states(
+            priors_leaf, leaf_vals, child_q_leaf = self._eval_states(
                 leaf_states_wave, legal_moves, num_legal, total, leaf_features,
             )
 
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
                 *self._tree_args(tree),
+                tree["child_init_q"], child_q_leaf,
                 leaf_idx[:total], leaf_states_wave,
                 legal_moves, num_legal, priors_leaf, results,
                 leaf_vals, vl_paths[:total], vl_lens[:total],
-                B, total, self._max_nodes,
+                B, total, self._max_nodes, q_penalty,
             )
 
     def _alive_root_slots(self, alive: torch.Tensor) -> torch.Tensor:
@@ -731,6 +766,7 @@ class FNNMCTSOrchestrator:
                 tree["num_children"][i].zero_()
                 tree["is_terminal"][i].zero_()
                 tree["terminal_value"][i].zero_()
+                tree["child_init_q"][i].zero_()
                 tree["node_count"][i] = 1
                 tree["root_node"][i] = 0
             return
