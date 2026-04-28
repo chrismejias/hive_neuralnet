@@ -115,6 +115,7 @@ def build_orchestrator(
     compile_forward: bool,
     deterministic_non_root: bool = False,
     virtual_q_penalty: float = 0.25,
+    non_root_sigma: float = 4.0,
 ) -> tuple[object, object]:
     if model_type == "fnn":
         cfg = FNNMCTSConfig(
@@ -129,6 +130,7 @@ def build_orchestrator(
             wave_size=wave_size,
             deterministic_non_root=deterministic_non_root,
             virtual_q_penalty=virtual_q_penalty,
+            non_root_sigma=non_root_sigma,
         )
         orch = FNNMCTSOrchestrator(net, cfg)
     else:
@@ -278,12 +280,13 @@ def choose_fnn_moves(
         return np.zeros(B, dtype=np.int64)
     max_k = min(cfg.max_num_considered_actions, max_n)
 
-    priors_per_legal, _root_vals = orch._eval_states(
+    priors_per_legal, _root_vals, _child_q = orch._eval_states(
         states, legal_moves, num_legal, B, root_features,
     )
     if bool(has_immediate_win.any().item()):
         priors_per_legal.zero_()
         priors_per_legal[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
+        _child_q.zero_()
 
     valid_slot = (
         torch.arange(orch._max_legal, device="cuda").unsqueeze(0)
@@ -308,7 +311,7 @@ def choose_fnn_moves(
         active_t = has_actions.to(torch.int8)
         orch._expand_root_if_needed(
             tree, states, legal_moves, num_legal,
-            priors_per_legal, active_t, B,
+            priors_per_legal, _child_q, active_t, B,
         )
         orch._apply_root_dirichlet(tree, B, has_actions)
 
@@ -438,6 +441,8 @@ def main() -> None:
     ap.add_argument("--black-deterministic-non-root", action="store_true", default=False)
     ap.add_argument("--white-virtual-q-penalty", type=float, default=0.25)
     ap.add_argument("--black-virtual-q-penalty", type=float, default=0.25)
+    ap.add_argument("--white-non-root-sigma", type=float, default=4.0)
+    ap.add_argument("--black-non-root-sigma", type=float, default=4.0)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--temperature-drop-move", type=int, default=20)
     ap.add_argument("--expansion-mask", type=int, default=7)
@@ -477,6 +482,7 @@ def main() -> None:
         args.temperature_drop_move, args.compile_forward,
         deterministic_non_root=args.white_deterministic_non_root,
         virtual_q_penalty=args.white_virtual_q_penalty,
+        non_root_sigma=args.white_non_root_sigma,
     )
     black_orch, black_cfg = build_orchestrator(
         args.black_model, black_net, args.games, black_sims, black_k, args.wave_parallel,
@@ -484,6 +490,7 @@ def main() -> None:
         args.temperature_drop_move, args.compile_forward,
         deterministic_non_root=args.black_deterministic_non_root,
         virtual_q_penalty=args.black_virtual_q_penalty,
+        non_root_sigma=args.black_non_root_sigma,
     )
     ext = hive_gpu.load_extension()
 
