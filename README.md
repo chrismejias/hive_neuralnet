@@ -150,6 +150,23 @@ Based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). 
 - Rounds = `ceil(log2(k))` — for the current fixed `k=16`, that is 4 rounds
 - Scales well with VRAM: run more games in parallel, not more serial rounds
 
+#### Prior-Anchored Improved Policy
+
+The FNN (and PRS) trainers use a **prior-anchored** formulation of the Gumbel improved policy rather than the paper's original `v_pi` fallback. In the paper, unvisited moves are assigned `Q_completed(a) = v̂_π` (the root value estimate). In practice this causes problems because the value head is inconsistently calibrated between the root and its successors — `v_pi` can exceed `Q_mcts` for all sampled moves by 0.2+, flooding unsampled moves with artificially high Q and concentrating ~71% of policy mass on moves the search never evaluated.
+
+The prior-anchored approach instead:
+
+- **Sampled moves** (the k Gumbel-selected candidates): mass reshaped by MCTS Q within their prior budget
+  ```
+  π_imp(a ∈ S) = M_S × softmax(log π₀(a) + σ · Q_mcts(a))   over S
+  ```
+- **Unsampled moves**: keep their prior probability unchanged
+  ```
+  π_imp(a ∉ S) = π₀(a)
+  ```
+
+where `M_S = Σ_{s∈S} π₀(s)` is the prior mass already allocated to the sampled set. This is always a valid distribution, requires no value-head fallback, and shifts ~66% of policy mass to MCTS-searched moves (vs ~29% with the original formulation). The gradient signal to the policy head comes entirely from moves the search actually evaluated.
+
 ### Wave-parallel MCTS (opt-out, Transformer only)
 
 GPU-native tree search with W simulations per wave. Virtual loss diversifies selections within each wave. Use `--wave-size` to control parallelism.
@@ -347,6 +364,8 @@ The entire Gumbel AlphaZero game loop — move generation, feature extraction, F
 - **Default:** Gumbel-root MCTS tree search (`FNNMCTSOrchestrator`)
 - Gumbel MCTS uses a hard-coded per-round wave schedule `2, 4, 8, 16` by default; use `--no-gumbel-wave-parallel` for pure serial waves.
 - The current Gumbel implementations standardize on `k=16`.
+- Policy target uses the **prior-anchored improved policy** (see Search Algorithms section).
+- `--gumbel-deterministic-non-root` enables paper-style deterministic inner-node selection; `--gumbel-virtual-q-penalty` diversifies wave-parallel sims (default 0.25).
 - **Alternative:** plain PUCT MCTS (`FNNPUCTOrchestrator`) via `--puct`
 - PUCT MCTS uses wave-parallel virtual-loss search with `--puct-wave-size` (default 16).
 - Move-cap draws are excluded from value loss, while their policy targets are still retained.
@@ -366,19 +385,23 @@ python -m hive_fnn.train_fnn \
   --iterations 1500 \
   --checkpoint-dir checkpoints_fnn
 
+# Large model with deterministic non-root (recommended — better tree coverage)
+python -m hive_fnn.train_fnn \
+  --preset large \
+  --games 512 --simulations 2048 --gumbel-considered 16 \
+  --gumbel-wave-parallel \
+  --gumbel-deterministic-non-root \
+  --gumbel-virtual-q-penalty 0.25 \
+  --buffer-size 200000 \
+  --iterations 1000 \
+  --checkpoint-dir checkpoints_fnn_deterministic
+
 # Medium model
 python -m hive_fnn.train_fnn \
   --preset medium \
   --games 128 --simulations 512 --gumbel-considered 16 \
   --iterations 1500 \
   --checkpoint-dir checkpoints_fnn_medium
-
-# Large model (current default)
-python -m hive_fnn.train_fnn \
-  --preset large \
-  --games 128 --simulations 1024 --gumbel-considered 16 \
-  --iterations 1500 \
-  --checkpoint-dir checkpoints_fnn_large
 ```
 
 The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
@@ -396,6 +419,10 @@ The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 | `--simulations` | 128 | Gumbel simulation budget per move |
 | `--gumbel-considered` | 16 | Root actions considered (k) |
 | `--gumbel-wave-parallel` / `--no-gumbel-wave-parallel` | on | Enable/disable FNN Gumbel per-round MCTS wave schedule (`2,4,8,16`) |
+| `--gumbel-deterministic-non-root` | off | Paper-style deterministic inner-node selection (recommended with `--gumbel-wave-parallel`) |
+| `--gumbel-virtual-q-penalty` | 0.25 | Per-node Q penalty to diversify wave-parallel sims under deterministic selection |
+| `--gumbel-non-root-sigma` | 4.0 | Sigma scaling for deterministic non-root scoring: `score = log_prior + σ·Q` |
+| `--buffer-size` | 100000 | Replay buffer capacity (200000 recommended for better generalization) |
 | `--puct-wave-size` | 16 | Parallel MCTS simulations per wave for plain PUCT |
 | `--puct` | off | Use plain PUCT MCTS root policy instead of Gumbel root halving |
 | `--checkpoint-dir` | checkpoints\_fnn | Checkpoint output directory |
@@ -471,6 +498,37 @@ python probe_win_in_one.py --checkpoint checkpoints/hive_gpu_checkpoint_0124.pt
 
 ```bash
 python eval_value_head.py
+```
+
+### FNN MCTS search diagnostics
+
+Compare PUCT vs deterministic non-root exploration (depth distribution, visit entropy, new-leaf rate):
+
+```bash
+python fnn_search_diagnostic_nonroot.py \
+    --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt \
+    --sims 512 --positions 8
+```
+
+### FNN improved-policy mass analysis
+
+Measure how much policy mass lands on MCTS-searched vs unsampled moves, and diagnose value-head calibration relative to Q_mcts:
+
+```bash
+# Mass vs sim count (four sweep: 256/512/1024/2048)
+python fnn_mass_diagnostic.py \
+    --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt \
+    --positions 30
+
+# Compare three fallback strategies for unsampled moves (v_pi / child_init_q / 0.0)
+python fnn_mass_fallback_compare.py \
+    --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt \
+    --positions 50 --sims 2048
+
+# Verify the prior-anchored policy target vs old v_pi approach
+python fnn_mass_new_policy.py \
+    --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt \
+    --positions 50 --sims 2048
 ```
 
 ## GUI
