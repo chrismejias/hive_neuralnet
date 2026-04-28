@@ -424,20 +424,35 @@ class FNNMCTSOrchestrator:
                     candidate_slots, 1, chosen_pos.unsqueeze(1),
                 ).squeeze(1).clamp(min=0).to(torch.long)
 
-                # ── Policy target = Gumbel improved policy (paper eq. 10-12) ──
-                # completedQ(a) = q(a) if visited, else v̂_π (root value estimate)
+                # ── Policy target: prior-anchored Gumbel improvement ─────────
+                # Unsampled moves keep their prior probability exactly (no v_pi
+                # fallback needed — avoids value-head calibration contaminating
+                # the policy target for moves the search never evaluated).
+                # Sampled moves have their within-budget mass reshaped by MCTS Q:
+                #   π_imp(a ∈ S) = M_S × softmax(log π₀ + σ·Q_mcts) over S
+                #   π_imp(a ∉ S) = π₀(a)
+                # where M_S = Σ_{s∈S} π₀(s) is the prior's budget for sampled moves.
                 slot_visits, slot_q = self._gather_root_child_stats(tree, B)
                 visited = (slot_visits > 0) & valid_slot
-                v_pi = root_vals.unsqueeze(1).expand_as(slot_q)
-                completed_q = torch.where(visited, slot_q, v_pi)
                 max_n = slot_visits.float().max(dim=1, keepdim=True).values
                 sigma_norm = (cfg.c_visit + max_n) * cfg.c_scale
-                improved_logits = legal_logits + sigma_norm * completed_q
-                improved_logits = torch.where(
-                    valid_slot, improved_logits,
-                    torch.full_like(improved_logits, -1e30),
+
+                # Softmax over sampled moves only (−∞ on unsampled → 0 prob)
+                sampled_logits = torch.where(
+                    visited,
+                    legal_logits + sigma_norm * slot_q,
+                    torch.full_like(legal_logits, -1e30),
                 )
-                probs_pad = torch.softmax(improved_logits, dim=1)
+                sampled_dist = torch.softmax(sampled_logits, dim=1)
+
+                # Prior mass allocated to the sampled set
+                prior_mass_sampled = (priors_per_legal * visited.float()).sum(
+                    dim=1, keepdim=True
+                )
+
+                # Combine: improved sampled mass + unchanged unsampled prior
+                unsampled_prior = priors_per_legal * (~visited & valid_slot).float()
+                probs_pad = sampled_dist * prior_mass_sampled + unsampled_prior
                 probs_pad = torch.where(valid_slot, probs_pad, torch.zeros_like(probs_pad))
 
             # ── Record history ───────────────────────────────────────
