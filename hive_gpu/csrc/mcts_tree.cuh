@@ -772,6 +772,7 @@ __global__ void mcts_select_with_root_mask_kernel(
 
         int ni2 = tree_idx(tree, game, node);
         if (deterministic_non_root && !at_root) {
+            atomicAdd(&tree.visit_count[ni2], 1);
             atomicAdd(&tree.virtual_q_penalty[ni2], q_penalty);
             if (vl_len < MAX_TREE_DEPTH) {
                 my_vl[vl_len++] = node;
@@ -926,6 +927,7 @@ __global__ void mcts_select_with_root_slots_kernel(
 
         int ni2 = tree_idx(tree, game, node);
         if (deterministic_non_root) {
+            atomicAdd(&tree.visit_count[ni2], 1);
             atomicAdd(&tree.virtual_q_penalty[ni2], q_penalty);
             if (vl_len < MAX_TREE_DEPTH) {
                 my_vl[vl_len++] = node;
