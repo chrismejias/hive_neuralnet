@@ -55,9 +55,6 @@ class FNNTrainConfig:
 
     use_puct: bool = False
     gumbel_wave_parallel: bool = True
-    gumbel_deterministic_non_root: bool = False
-    gumbel_virtual_q_penalty: float = 0.25
-    gumbel_non_root_sigma: float = 4.0
     puct_wave_size: int = 16
 
 
@@ -239,9 +236,6 @@ class FNNTrainer:
                     max_game_length=cfg.max_game_length,
                     expansion_mask=cfg.expansion_mask,
                     wave_parallel=cfg.gumbel_wave_parallel,
-                    deterministic_non_root=cfg.gumbel_deterministic_non_root,
-                    virtual_q_penalty=cfg.gumbel_virtual_q_penalty,
-                    non_root_sigma=cfg.gumbel_non_root_sigma,
                 ),
             )
         raw = orch.self_play_batch()

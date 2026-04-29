@@ -37,7 +37,7 @@ _GUMBEL_WAVE_SCHEDULE = (2, 4, 8, 16)
 class FNNMCTSConfig:
     num_simulations:             int   = 128
     max_num_considered_actions:  int   = 16
-    c_puct:                      float = 1.25
+    c_puct:                      float = 2.5
     c_visit:                     float = 50.0
     c_scale:                     float = 1.0
     temperature:                 float = 1.0
@@ -424,35 +424,22 @@ class FNNMCTSOrchestrator:
                     candidate_slots, 1, chosen_pos.unsqueeze(1),
                 ).squeeze(1).clamp(min=0).to(torch.long)
 
-                # ── Policy target: prior-anchored Gumbel improvement ─────────
-                # Unsampled moves keep their prior probability exactly (no v_pi
-                # fallback needed — avoids value-head calibration contaminating
-                # the policy target for moves the search never evaluated).
-                # Sampled moves have their within-budget mass reshaped by MCTS Q:
-                #   π_imp(a ∈ S) = M_S × softmax(log π₀ + σ·Q_mcts) over S
-                #   π_imp(a ∉ S) = π₀(a)
-                # where M_S = Σ_{s∈S} π₀(s) is the prior's budget for sampled moves.
+                # ── Policy target: visited-only Gumbel improvement ───────────
+                # Keep the older target behavior used by the strongest
+                # nondeterministic checkpoints: moves the search never visits
+                # receive zero target mass, and the visited set is normalized
+                # by softmax(log π₀ + σ·Q_mcts).
                 slot_visits, slot_q = self._gather_root_child_stats(tree, B)
                 visited = (slot_visits > 0) & valid_slot
                 max_n = slot_visits.float().max(dim=1, keepdim=True).values
                 sigma_norm = (cfg.c_visit + max_n) * cfg.c_scale
 
-                # Softmax over sampled moves only (−∞ on unsampled → 0 prob)
                 sampled_logits = torch.where(
                     visited,
                     legal_logits + sigma_norm * slot_q,
                     torch.full_like(legal_logits, -1e30),
                 )
-                sampled_dist = torch.softmax(sampled_logits, dim=1)
-
-                # Prior mass allocated to the sampled set
-                prior_mass_sampled = (priors_per_legal * visited.float()).sum(
-                    dim=1, keepdim=True
-                )
-
-                # Combine: improved sampled mass + unchanged unsampled prior
-                unsampled_prior = priors_per_legal * (~visited & valid_slot).float()
-                probs_pad = sampled_dist * prior_mass_sampled + unsampled_prior
+                probs_pad = torch.softmax(sampled_logits, dim=1)
                 probs_pad = torch.where(valid_slot, probs_pad, torch.zeros_like(probs_pad))
 
             # ── Record history ───────────────────────────────────────

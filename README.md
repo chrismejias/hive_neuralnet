@@ -367,8 +367,9 @@ The entire Gumbel AlphaZero game loop — move generation, feature extraction, F
 - **Default:** Gumbel-root MCTS tree search (`FNNMCTSOrchestrator`)
 - Gumbel MCTS uses a hard-coded per-round wave schedule `2, 4, 8, 16` by default; use `--no-gumbel-wave-parallel` for pure serial waves.
 - The current Gumbel implementations standardize on `k=16`.
-- Policy target uses the **prior-anchored improved policy** (see Search Algorithms section).
-- `--gumbel-deterministic-non-root` enables paper-style deterministic inner-node selection; `--gumbel-virtual-q-penalty` diversifies wave-parallel sims (default 0.25).
+- Within the Gumbel search, inner-node selection uses standard non-root PUCT MCTS.
+- The default non-root/root PUCT exploration constant for FNN search is `c_puct = 2.5`.
+- Policy target uses the visited-only improved policy used by the strongest FNN nondeterministic checkpoints: unvisited moves receive zero policy mass.
 - **Alternative:** plain PUCT MCTS (`FNNPUCTOrchestrator`) via `--puct`
 - PUCT MCTS uses wave-parallel virtual-loss search with `--puct-wave-size` (default 16).
 - Move-cap draws are excluded from value loss, while their policy targets are still retained.
@@ -388,16 +389,14 @@ python -m hive_fnn.train_fnn \
   --iterations 1500 \
   --checkpoint-dir checkpoints_fnn
 
-# Large model with deterministic non-root (recommended — better tree coverage)
+# Large model with default Gumbel-root + non-root PUCT MCTS
 python -m hive_fnn.train_fnn \
   --preset large \
   --games 512 --simulations 2048 --gumbel-considered 16 \
   --gumbel-wave-parallel \
-  --gumbel-deterministic-non-root \
-  --gumbel-virtual-q-penalty 0.25 \
   --buffer-size 200000 \
   --iterations 1000 \
-  --checkpoint-dir checkpoints_fnn_deterministic
+  --checkpoint-dir checkpoints_fnn
 
 # Medium model
 python -m hive_fnn.train_fnn \
@@ -422,9 +421,6 @@ The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 | `--simulations` | 128 | Gumbel simulation budget per move |
 | `--gumbel-considered` | 16 | Root actions considered (k) |
 | `--gumbel-wave-parallel` / `--no-gumbel-wave-parallel` | on | Enable/disable FNN Gumbel per-round MCTS wave schedule (`2,4,8,16`) |
-| `--gumbel-deterministic-non-root` | off | Paper-style deterministic inner-node selection (recommended with `--gumbel-wave-parallel`) |
-| `--gumbel-virtual-q-penalty` | 0.25 | Per-node Q penalty to diversify wave-parallel sims under deterministic selection |
-| `--gumbel-non-root-sigma` | 4.0 | Sigma scaling for deterministic non-root scoring: `score = log_prior + σ·Q` |
 | `--buffer-size` | 100000 | Replay buffer capacity (200000 recommended for better generalization) |
 | `--puct-wave-size` | 16 | Parallel MCTS simulations per wave for plain PUCT |
 | `--puct` | off | Use plain PUCT MCTS root policy instead of Gumbel root halving |
@@ -505,12 +501,33 @@ python eval_value_head.py
 
 ### FNN MCTS search diagnostics
 
-Compare PUCT vs deterministic non-root exploration (depth distribution, visit entropy, new-leaf rate):
+Inspect FNN non-root search behavior (depth distribution, visit entropy, new-leaf rate):
 
 ```bash
 python fnn_search_diagnostic_nonroot.py \
     --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt \
     --sims 512 --positions 8
+```
+
+### PRS MCTS search diagnostics
+
+The same comparison is available for PRS v2 checkpoints:
+
+```bash
+python prs_search_diagnostic_nonroot.py \
+    --checkpoint checkpoints_prs_v2/prs_v2_iter_0600.pt \
+    --sims 256 --positions 2
+```
+
+### PRS improved-policy mass analysis
+
+Measure how much policy mass lands on MCTS-searched vs unsampled moves, and diagnose value-head calibration relative to Q_mcts:
+
+```bash
+# Mass vs sim count (four sweep: 256/512/1024/2048)
+python prs_mass_diagnostic.py \
+    --checkpoint checkpoints_prs_v2/prs_v2_iter_0600.pt \
+    --positions 30
 ```
 
 ### FNN improved-policy mass analysis

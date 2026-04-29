@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import hive_gpu
 from hive_fnn.fnn_mcts_orchestrator import FNNMCTSConfig, FNNMCTSOrchestrator
 from hive_fnn.fnn_network import HiveFNN
+from hive_fnn.fnn_puct_orchestrator import FNNPUCTConfig, FNNPUCTOrchestrator
 from hive_prs.prs_mcts_orchestrator_v2 import PRSMCTSConfigV2, PRSMCTSOrchestratorV2
 from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
 from hive_prs.slot_map import N_SLOTS
@@ -113,26 +114,43 @@ def build_orchestrator(
     temperature: float,
     temperature_drop_move: int,
     compile_forward: bool,
-    deterministic_non_root: bool = False,
-    virtual_q_penalty: float = 0.25,
-    non_root_sigma: float = 4.0,
+    use_puct: bool = False,
+    c_puct: float | None = None,
+    eval_mode: bool = True,
 ) -> tuple[object, object]:
     if model_type == "fnn":
-        cfg = FNNMCTSConfig(
-            num_simulations=sims,
-            max_num_considered_actions=k,
-            temperature=temperature,
-            temperature_drop_move=temperature_drop_move,
-            batch_size=games,
-            max_game_length=max_game_length,
-            expansion_mask=expansion_mask,
-            wave_parallel=wave_parallel,
-            wave_size=wave_size,
-            deterministic_non_root=deterministic_non_root,
-            virtual_q_penalty=virtual_q_penalty,
-            non_root_sigma=non_root_sigma,
-        )
-        orch = FNNMCTSOrchestrator(net, cfg)
+        if use_puct:
+            cfg = FNNPUCTConfig(
+                num_simulations=sims,
+                c_puct=c_puct if c_puct is not None else FNNPUCTConfig.c_puct,
+                temperature=temperature,
+                temperature_drop_move=temperature_drop_move,
+                batch_size=games,
+                max_game_length=max_game_length,
+                expansion_mask=expansion_mask,
+                wave_size=wave_size,
+            )
+            if eval_mode:
+                cfg.dirichlet_epsilon = 0.0
+                cfg.temperature_drop_move = 0
+            orch = FNNPUCTOrchestrator(net, cfg)
+        else:
+            cfg = FNNMCTSConfig(
+                num_simulations=sims,
+                max_num_considered_actions=k,
+                c_puct=c_puct if c_puct is not None else FNNMCTSConfig.c_puct,
+                temperature=temperature,
+                temperature_drop_move=temperature_drop_move,
+                batch_size=games,
+                max_game_length=max_game_length,
+                expansion_mask=expansion_mask,
+                wave_parallel=wave_parallel,
+                wave_size=wave_size,
+            )
+            if eval_mode:
+                cfg.dirichlet_epsilon = 0.0
+                cfg.temperature_drop_move = 0
+            orch = FNNMCTSOrchestrator(net, cfg)
     else:
         cfg = PRSMCTSConfigV2(
             num_simulations=sims,
@@ -146,6 +164,9 @@ def build_orchestrator(
             wave_parallel=wave_parallel,
             compile_forward=compile_forward,
         )
+        if eval_mode:
+            cfg.dirichlet_epsilon = 0.0
+            cfg.temperature_drop_move = 0
         orch = PRSMCTSOrchestratorV2(net, cfg)
     return orch, cfg
 
@@ -155,6 +176,7 @@ def choose_prs_moves(
     states: torch.Tensor,
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
+    gumbel_noise_scale: float = 0.0,
 ) -> np.ndarray:
     B = int(states.shape[0])
     cfg = orch.config
@@ -184,8 +206,12 @@ def choose_prs_moves(
         return np.zeros(B, dtype=np.int64)
     max_k = min(cfg.max_num_considered_actions, max_legal)
 
-    u = torch.rand(B, orch._max_legal, device="cuda").clamp(1e-4, 1 - 1e-4)
-    score_basis = -torch.log(-torch.log(u)) + root_logit_per_legal
+    if gumbel_noise_scale > 0.0:
+        u = torch.rand(B, orch._max_legal, device="cuda").clamp(1e-4, 1 - 1e-4)
+        gumbel = -torch.log(-torch.log(u)) * gumbel_noise_scale
+    else:
+        gumbel = torch.zeros(B, orch._max_legal, dtype=torch.float32, device="cuda")
+    score_basis = gumbel + root_logit_per_legal
 
     _, topk_slots = torch.topk(score_basis, max_k, dim=1)
     active_t = torch.tensor([1 if a else 0 for a in active], dtype=torch.int8, device="cuda")
@@ -257,11 +283,20 @@ def choose_prs_moves(
 
 
 def choose_fnn_moves(
-    orch: FNNMCTSOrchestrator,
+    orch: FNNMCTSOrchestrator | FNNPUCTOrchestrator,
     states: torch.Tensor,
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
+    gumbel_noise_scale: float = 0.0,
 ) -> np.ndarray:
+    if isinstance(orch, FNNPUCTOrchestrator):
+        return choose_fnn_puct_moves(
+            orch,
+            states,
+            move_numbers=move_numbers,
+            stochastic=stochastic,
+        )
+
     B = int(states.shape[0])
     cfg = orch.config
     tree = orch._alloc_tree(B)
@@ -302,8 +337,11 @@ def choose_fnn_moves(
         probs_pad = torch.zeros(B, orch._max_legal, dtype=torch.float32, device="cuda")
         probs_pad[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
     else:
-        u = torch.rand(B, orch._max_legal, device="cuda").clamp(1e-4, 1 - 1e-4)
-        gumbel = -torch.log(-torch.log(u))
+        if gumbel_noise_scale > 0.0:
+            u = torch.rand(B, orch._max_legal, device="cuda").clamp(1e-4, 1 - 1e-4)
+            gumbel = -torch.log(-torch.log(u)) * gumbel_noise_scale
+        else:
+            gumbel = torch.zeros(B, orch._max_legal, dtype=torch.float32, device="cuda")
         gumbel = torch.where(valid_slot, gumbel, torch.full_like(gumbel, -1e30))
         perturbed = gumbel + legal_logits
         _, topk_slots = torch.topk(perturbed, max_k, dim=1)
@@ -364,7 +402,7 @@ def choose_fnn_moves(
     else:
         active_idx = torch.nonzero(has_actions, as_tuple=False).squeeze(1)
         if active_idx.numel() > 0:
-            if move_numbers is not None:
+            if stochastic and move_numbers is not None:
                 move_numbers_np = np.asarray(move_numbers)
                 active_moves = move_numbers_np[active_idx.cpu().numpy()]
                 greedy_mask = active_moves >= cfg.temperature_drop_move
@@ -393,16 +431,123 @@ def choose_fnn_moves(
     return out
 
 
+def choose_fnn_puct_moves(
+    orch: FNNPUCTOrchestrator,
+    states: torch.Tensor,
+    move_numbers: np.ndarray | None = None,
+    stochastic: bool = False,
+) -> np.ndarray:
+    B = int(states.shape[0])
+    cfg = orch.config
+    tree = orch._alloc_tree(B)
+    orch._reset_tree(tree)
+
+    legal_moves, num_legal, root_features = orch.ext.generate_legal_moves_and_fnn_features_batch(states, B)
+    n_per_game = num_legal.to(torch.int64)
+    nlegal_np = num_legal.cpu().numpy()
+    has_actions = n_per_game > 0
+
+    immediate_wins = orch._find_immediate_wins(states, legal_moves, num_legal, B)
+    has_immediate_win = immediate_wins >= 0
+
+    max_n = int(n_per_game.max().item()) if B > 0 else 0
+    if max_n == 0:
+        return np.zeros(B, dtype=np.int64)
+
+    priors_per_legal, _root_vals, child_q_per_legal = orch._eval_states(
+        states, legal_moves, num_legal, B, root_features,
+    )
+    if bool(has_immediate_win.any().item()):
+        priors_per_legal.zero_()
+        priors_per_legal[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
+        child_q_per_legal.zero_()
+
+    game_active_t = has_actions.to(torch.int8)
+    orch._expand_root_if_needed(
+        tree, states, legal_moves, num_legal,
+        priors_per_legal, child_q_per_legal, game_active_t, B,
+    )
+    orch._apply_root_dirichlet(tree, B, has_actions)
+
+    if bool(has_immediate_win.any().item()):
+        probs_pad = torch.zeros(B, orch._max_legal, dtype=torch.float32, device="cuda")
+        probs_pad[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
+    else:
+        valid_slot = (
+            torch.arange(orch._max_legal, device="cuda").unsqueeze(0)
+            < n_per_game.unsqueeze(1)
+        )
+        alive_mask = valid_slot.to(torch.int8)
+        orch._run_simulations(tree, states, game_active_t, alive_mask, B, cfg.num_simulations)
+        slot_visits, _slot_q = orch._gather_root_child_stats(tree, B)
+        visits_f = slot_visits.float()
+        vsum = visits_f.sum(dim=1, keepdim=True)
+        probs_pad = torch.where(
+            vsum > 0,
+            visits_f / vsum.clamp(min=1.0),
+            torch.zeros_like(visits_f),
+        )
+        uniform = valid_slot.float()
+        ucount = uniform.sum(dim=1, keepdim=True).clamp(min=1.0)
+        uniform = uniform / ucount
+        probs_pad = torch.where(vsum > 0, probs_pad, uniform)
+
+    chosen = torch.zeros((B,), dtype=torch.int64, device="cuda")
+    active_idx = torch.nonzero(has_actions, as_tuple=False).squeeze(1)
+    if bool(has_immediate_win.any().item()):
+        chosen[has_immediate_win] = immediate_wins[has_immediate_win]
+    elif active_idx.numel() > 0:
+        if stochastic and move_numbers is not None:
+            move_numbers_np = np.asarray(move_numbers)
+            active_moves = move_numbers_np[active_idx.cpu().numpy()]
+            greedy_mask = active_moves >= cfg.temperature_drop_move
+            greedy_rows = active_idx[greedy_mask]
+            sample_rows = active_idx[~greedy_mask]
+        else:
+            greedy_rows = active_idx
+            sample_rows = active_idx[:0]
+        if greedy_rows.numel() > 0:
+            chosen[greedy_rows] = probs_pad[greedy_rows].argmax(dim=1)
+        if sample_rows.numel() > 0:
+            sample_policy = probs_pad[sample_rows]
+            sample_policy = sample_policy / sample_policy.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            chosen[sample_rows] = torch.multinomial(sample_policy, 1).squeeze(1)
+
+    chosen_np = chosen.cpu().numpy()
+    out = np.zeros(B, dtype=np.int64)
+    for i in range(B):
+        n_i = int(nlegal_np[i])
+        if n_i <= 0:
+            out[i] = 0
+        else:
+            k = int(chosen_np[i])
+            out[i] = 0 if k >= n_i else k
+    return out
+
+
 def choose_moves(
     model_type: ModelType,
     orch: object,
     states: torch.Tensor,
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
+    gumbel_noise_scale: float = 0.0,
 ) -> np.ndarray:
     if model_type == "fnn":
-        return choose_fnn_moves(orch, states, move_numbers=move_numbers, stochastic=stochastic)
-    return choose_prs_moves(orch, states, move_numbers=move_numbers, stochastic=stochastic)
+        return choose_fnn_moves(
+            orch,
+            states,
+            move_numbers=move_numbers,
+            stochastic=stochastic,
+            gumbel_noise_scale=gumbel_noise_scale,
+        )
+    return choose_prs_moves(
+        orch,
+        states,
+        move_numbers=move_numbers,
+        stochastic=stochastic,
+        gumbel_noise_scale=gumbel_noise_scale,
+    )
 
 
 def main() -> None:
@@ -436,24 +581,34 @@ def main() -> None:
     ap.add_argument("--black-k", type=int, default=None)
     ap.add_argument("--white-wave-size", type=int, default=None)
     ap.add_argument("--black-wave-size", type=int, default=None)
+    ap.add_argument("--white-puct", action="store_true", default=False)
+    ap.add_argument("--black-puct", action="store_true", default=False)
+    ap.add_argument("--white-c-puct", type=float, default=None)
+    ap.add_argument("--black-c-puct", type=float, default=None)
     ap.add_argument("--wave-parallel", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--white-deterministic-non-root", action="store_true", default=False)
-    ap.add_argument("--black-deterministic-non-root", action="store_true", default=False)
-    ap.add_argument("--white-virtual-q-penalty", type=float, default=0.25)
-    ap.add_argument("--black-virtual-q-penalty", type=float, default=0.25)
-    ap.add_argument("--white-non-root-sigma", type=float, default=4.0)
-    ap.add_argument("--black-non-root-sigma", type=float, default=4.0)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--temperature-drop-move", type=int, default=20)
     ap.add_argument("--expansion-mask", type=int, default=7)
     ap.add_argument("--max-game-length", type=int, default=300)
+    ap.add_argument(
+        "--alternate-colors",
+        action="store_true",
+        help="Alternate which model is white on a per-game basis.",
+    )
     ap.add_argument("--stochastic", action="store_true")
+    ap.add_argument(
+        "--gumbel-noise-scale",
+        type=float,
+        default=0.0,
+        help="Scale for root Gumbel noise in evaluation; 0 disables noise.",
+    )
     ap.add_argument("--compile-forward", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    eval_mode = not args.stochastic
 
     white_ckpt_path = args.white_checkpoint or latest_checkpoint(args.white_model)
     black_ckpt_path = args.black_checkpoint or latest_checkpoint(args.black_model)
@@ -480,17 +635,17 @@ def main() -> None:
         args.white_model, white_net, args.games, white_sims, white_k, args.wave_parallel,
         white_wave_size, args.expansion_mask, args.max_game_length, args.temperature,
         args.temperature_drop_move, args.compile_forward,
-        deterministic_non_root=args.white_deterministic_non_root,
-        virtual_q_penalty=args.white_virtual_q_penalty,
-        non_root_sigma=args.white_non_root_sigma,
+        use_puct=args.white_puct,
+        c_puct=args.white_c_puct,
+        eval_mode=eval_mode,
     )
     black_orch, black_cfg = build_orchestrator(
         args.black_model, black_net, args.games, black_sims, black_k, args.wave_parallel,
         black_wave_size, args.expansion_mask, args.max_game_length, args.temperature,
         args.temperature_drop_move, args.compile_forward,
-        deterministic_non_root=args.black_deterministic_non_root,
-        virtual_q_penalty=args.black_virtual_q_penalty,
-        non_root_sigma=args.black_non_root_sigma,
+        use_puct=args.black_puct,
+        c_puct=args.black_c_puct,
+        eval_mode=eval_mode,
     )
     ext = hive_gpu.load_extension()
 
@@ -498,8 +653,12 @@ def main() -> None:
     states = ext.create_initial_states(B, args.expansion_mask)
     active = np.ones(B, dtype=bool)
     move_numbers = np.zeros(B, dtype=np.int32)
-    white_is_model_a = np.zeros(B, dtype=bool)
-    white_is_model_a[: B // 2] = True
+    if args.alternate_colors:
+        white_is_model_a = np.zeros(B, dtype=bool)
+        white_is_model_a[::2] = True
+    else:
+        white_is_model_a = np.zeros(B, dtype=bool)
+        white_is_model_a[: B // 2] = True
 
     while bool(active.any()):
         if args.white_model == "prs":
@@ -529,6 +688,7 @@ def main() -> None:
                 sub_states,
                 move_numbers=move_numbers[idx],
                 stochastic=args.stochastic,
+                gumbel_noise_scale=args.gumbel_noise_scale,
             )
             legal_t, nlegal_t = orch.ext.generate_legal_moves_batch(sub_states, idx.size)
             legal_np = legal_t.cpu().numpy()
@@ -559,21 +719,52 @@ def main() -> None:
     draws = 0
     capped = 0
     white_score = 0.0
+    model_a_score = 0.0
+    model_a_white_games = 0
+    model_a_black_games = 0
+    model_a_white_score = 0.0
+    model_a_black_score = 0.0
     final_results = ext.check_results_batch(states, B).cpu().numpy()
     for i in range(B):
         r = int(final_results[i])
+        a_is_white = bool(white_is_model_a[i])
         if r == 0:
             capped += 1
             draws += 1
             white_score += 0.5
+            model_a_score += 0.5
+            if a_is_white:
+                model_a_white_games += 1
+                model_a_white_score += 0.5
+            else:
+                model_a_black_games += 1
+                model_a_black_score += 0.5
         elif r == 3:
             draws += 1
             white_score += 0.5
-        elif (r == 1 and white_is_model_a[i]) or (r == 2 and not white_is_model_a[i]):
+            model_a_score += 0.5
+            if a_is_white:
+                model_a_white_games += 1
+                model_a_white_score += 0.5
+            else:
+                model_a_black_games += 1
+                model_a_black_score += 0.5
+        elif (r == 1 and a_is_white) or (r == 2 and not a_is_white):
             white_wins += 1
             white_score += 1.0
+            model_a_score += 1.0
+            if a_is_white:
+                model_a_white_games += 1
+                model_a_white_score += 1.0
+            else:
+                model_a_black_games += 1
+                model_a_black_score += 1.0
         else:
             black_wins += 1
+            if a_is_white:
+                model_a_white_games += 1
+            else:
+                model_a_black_games += 1
 
     print(f"White model:      {args.white_model}")
     print(f"White checkpoint: {white_ckpt_path}")
@@ -582,15 +773,33 @@ def main() -> None:
     print(
         f"Arena config: games={B}, white_sims={white_sims}, black_sims={black_sims}, "
         f"white_k={white_k}, black_k={black_k}, "
+        f"white_root={'puct' if args.white_puct else 'gumbel'}, "
+        f"black_root={'puct' if args.black_puct else 'gumbel'}, "
+        f"white_c_puct={getattr(white_cfg, 'c_puct', 'n/a')}, "
+        f"black_c_puct={getattr(black_cfg, 'c_puct', 'n/a')}, "
         f"white_wave_size={white_cfg.wave_size if hasattr(white_cfg, 'wave_size') else 'n/a'}, "
         f"black_wave_size={black_cfg.wave_size if hasattr(black_cfg, 'wave_size') else 'n/a'}, "
         f"expansion_mask={args.expansion_mask}, max_game_length={args.max_game_length}, "
-        f"stochastic={args.stochastic}, wave_parallel={args.wave_parallel}"
+        f"stochastic={args.stochastic}, gumbel_noise_scale={args.gumbel_noise_scale}, "
+        f"wave_parallel={args.wave_parallel}, alternate_colors={args.alternate_colors}"
     )
-    print(f"White wins:      {white_wins}")
-    print(f"Black wins:      {black_wins}")
-    print(f"Draws:           {draws}  (capped={capped})")
-    print(f"White score:     {white_score:.1f}/{B} = {white_score / B:.3f}")
+    if args.alternate_colors:
+        print(f"Model A score:    {model_a_score:.1f}/{B} = {model_a_score / B:.3f}")
+        if model_a_white_games:
+            print(
+                f"Model A as white: {model_a_white_score:.1f}/{model_a_white_games} = "
+                f"{model_a_white_score / model_a_white_games:.3f}"
+            )
+        if model_a_black_games:
+            print(
+                f"Model A as black: {model_a_black_score:.1f}/{model_a_black_games} = "
+                f"{model_a_black_score / model_a_black_games:.3f}"
+            )
+    else:
+        print(f"White wins:      {white_wins}")
+        print(f"Black wins:      {black_wins}")
+        print(f"Draws:           {draws}  (capped={capped})")
+        print(f"White score:     {white_score:.1f}/{B} = {white_score / B:.3f}")
 
 
 if __name__ == "__main__":

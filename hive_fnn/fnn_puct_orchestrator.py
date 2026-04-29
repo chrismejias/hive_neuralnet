@@ -24,7 +24,7 @@ _OFF_TURN = 3412
 @dataclass
 class FNNPUCTConfig:
     num_simulations: int = 128
-    c_puct: float = 1.25
+    c_puct: float = 2.5
     temperature: float = 1.0
     temperature_drop_move: int = 20
     batch_size: int = 128
