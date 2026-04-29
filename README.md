@@ -99,11 +99,12 @@ nohup python3.11 -u -m hive_fnn.train_fnn \
   --preset large \
   --iterations 1000 \
   --games 256 \
-  --simulations 1024 \
+  --simulations 2048 \
   --gumbel-considered 16 \
   --checkpoint-dir checkpoints_fnn \
   --checkpoint-keep-every 50 \
   --gumbel-wave-parallel \
+  --gumbel-deterministic-non-root \
   >> checkpoints_fnn/training.log 2>&1 < /dev/null &
 
 echo $!
@@ -166,6 +167,8 @@ The prior-anchored approach instead:
   ```
 
 where `M_S = Σ_{s∈S} π₀(s)` is the prior mass already allocated to the sampled set. This is always a valid distribution, requires no value-head fallback, and shifts ~66% of policy mass to MCTS-searched moves (vs ~29% with the original formulation). The gradient signal to the policy head comes entirely from moves the search actually evaluated.
+
+Both `hive_fnn` and `hive_prs` use this target when recording Gumbel self-play examples, so unexplored legal moves retain their prior instead of receiving a synthetic Q value.
 
 ### Wave-parallel MCTS (opt-out, Transformer only)
 

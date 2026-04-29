@@ -423,19 +423,27 @@ class PRSMCTSOrchestratorV2:
                 candidate_slots, 1, chosen_pos.unsqueeze(1),
             ).squeeze(1).clamp(min=0).to(torch.long)            # (B,)
 
-            # ── Gumbel improved policy target (paper eq. 10-12) ─────
-            # completedQ(a) = q(a) if visited, else v̂_π (root value estimate)
+            # ── Prior-anchored improved policy target ─────────────────
+            # pi_imp(unvisited) = pi0(unvisited); no root-value/Q fallback.
+            # The total prior mass of visited moves is redistributed by
+            # softmax(log pi0 + sigma * Q_mcts) over only the visited set.
             visited_legal = (leg_visits > 0) & valid_slot
-            v_pi = root_values.float().expand_as(leg_q)  # (B, 1) → (B, MAX_L)
-            completed_q = torch.where(visited_legal, leg_q, v_pi)
             max_n = leg_visits.float().max(dim=1, keepdim=True).values
             sigma_norm_t = (cfg.c_visit + max_n) * cfg.c_scale
-            improved_logits = root_logit_per_legal + sigma_norm_t * completed_q
-            improved_logits = torch.where(
-                valid_slot, improved_logits, torch.full_like(improved_logits, -1e30),
+            sampled_logits = torch.where(
+                visited_legal,
+                root_logit_per_legal + sigma_norm_t * leg_q,
+                torch.full_like(root_logit_per_legal, -1e30),
             )
-            improved_probs = torch.softmax(improved_logits, dim=1)
-            improved_probs = torch.where(valid_slot, improved_probs, torch.zeros_like(improved_probs))
+            sampled_dist = torch.softmax(sampled_logits, dim=1)
+            prior_mass_sampled = (priors_per_legal * visited_legal.float()).sum(
+                dim=1, keepdim=True,
+            )
+            unsampled_prior = priors_per_legal * (~visited_legal & valid_slot).float()
+            improved_probs = sampled_dist * prior_mass_sampled + unsampled_prior
+            improved_probs = torch.where(
+                valid_slot, improved_probs, torch.zeros_like(improved_probs),
+            )
 
             # ── Record history (single big CPU transfer batch) ──────
             slot_of_legal_np = slot_of_legal_t.cpu().numpy().astype(np.int64)
