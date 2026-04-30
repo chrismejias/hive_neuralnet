@@ -15,7 +15,6 @@ through: rotate state → rotate moves → re-run SlotMapper → rebuild target.
 from __future__ import annotations
 
 import random
-from collections import deque
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -90,18 +89,31 @@ class PRSReplayBufferV2:
     """
 
     def __init__(self, max_size: int = 100_000) -> None:
-        self.buffer: deque[PRSTrainingExampleV2] = deque(maxlen=max_size)
+        self.max_size = int(max_size)
+        self.buffer: list[PRSTrainingExampleV2] = []
+        self._next_idx = 0
 
     def __len__(self) -> int:
         return len(self.buffer)
 
     def add_examples(self, examples: list[PRSTrainingExampleV2]) -> None:
-        self.buffer.extend(examples)
+        if not examples:
+            return
+        buf = self.buffer
+        max_size = self.max_size
+        next_idx = self._next_idx
+        for ex in examples:
+            if len(buf) < max_size:
+                buf.append(ex)
+            else:
+                buf[next_idx] = ex
+                next_idx = (next_idx + 1) % max_size
+        self._next_idx = next_idx
 
     def sample_batch(
         self, batch_size: int, augment_prob: float = 0.0,
     ) -> PRSTrainingBatchV2:
-        buf = list(self.buffer)
+        buf = self.buffer
         indices = np.random.randint(0, len(buf), size=batch_size)
         samples = [buf[i] for i in indices]
 

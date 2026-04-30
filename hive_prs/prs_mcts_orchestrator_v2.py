@@ -34,7 +34,7 @@ _GUMBEL_WAVE_SCHEDULE = (1, 2, 4, 8)
 class PRSMCTSConfigV2:
     num_simulations:             int   = 128
     max_num_considered_actions:  int   = 16
-    c_puct:                      float = 1.25
+    c_puct:                      float = 2.5
     c_visit:                     float = 50.0
     c_scale:                     float = 1.0
     temperature:                 float = 1.0
@@ -47,7 +47,7 @@ class PRSMCTSConfigV2:
     compile_forward:             bool  = False
     deterministic_non_root:      bool  = False
     virtual_q_penalty:           float = 0.25
-    non_root_sigma:              float = 4.0
+    non_root_sigma:              float = 1.0
     dirichlet_alpha:             float = 0.3
     dirichlet_epsilon:           float = 0.25
     max_tree_nodes:              int   = 65536

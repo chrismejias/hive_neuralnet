@@ -155,6 +155,7 @@ def build_orchestrator(
         cfg = PRSMCTSConfigV2(
             num_simulations=sims,
             max_num_considered_actions=k,
+            c_puct=c_puct if c_puct is not None else PRSMCTSConfigV2.c_puct,
             temperature=temperature,
             temperature_drop_move=temperature_drop_move,
             batch_size=games,
