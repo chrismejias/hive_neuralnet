@@ -80,7 +80,7 @@ class PRSTrainConfigV2:
     wave_parallel:             bool  = True
     deterministic_non_root:    bool  = False
     virtual_q_penalty:         float = 0.25
-    non_root_sigma:            float = 4.0
+    non_root_sigma:            float = 1.0
     compile_forward:           bool  = False
 
     # C6 (6-fold) rotational augmentation for training batches.
@@ -231,7 +231,10 @@ class PRSTrainerV2:
             else:
                 stats["draws"] += 1
             stats["num_games"] += 1
-            if v == 0.0 and cfg.draw_keep_rate < 1.0:
+            # Only subsample move-cap draws. Genuine drawn results
+            # (result == 3) should still train both policy and value.
+            is_capped_draw = not bool(game_exs[0].use_for_value)
+            if is_capped_draw and cfg.draw_keep_rate < 1.0:
                 if np.random.random() > cfg.draw_keep_rate:
                     continue
             flat.extend(game_exs)

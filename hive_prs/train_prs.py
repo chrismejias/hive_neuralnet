@@ -134,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--non-root-sigma",
         type=float,
-        default=4.0,
+        default=1.0,
         help=(
             "Constant sigma for non-root Gumbel selection: "
             "score(a) = log(prior[a]) + non_root_sigma * Q(a). "

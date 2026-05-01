@@ -37,7 +37,7 @@ _GUMBEL_WAVE_SCHEDULE = (2, 4, 8, 16)
 class FNNMCTSConfig:
     num_simulations:             int   = 128
     max_num_considered_actions:  int   = 16
-    c_puct:                      float = 2.5
+    c_puct:                      float = 1.25
     c_visit:                     float = 50.0
     c_scale:                     float = 1.0
     temperature:                 float = 1.0
