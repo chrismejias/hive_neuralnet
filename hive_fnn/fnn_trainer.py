@@ -256,7 +256,10 @@ class FNNTrainer:
                 stats["black_wins"] += 1
             else:
                 stats["draws"] += 1
-                if np.random.random() > cfg.draw_keep_rate:
+                # Only subsample move-cap draws. Genuine drawn results
+                # (winner == 3) should still train both policy and value.
+                is_capped_draw = not bool(game[0].use_for_value)
+                if is_capped_draw and np.random.random() > cfg.draw_keep_rate:
                     continue
             flat.extend(game)
         return flat, stats

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -40,15 +39,35 @@ class FNNTrainingBatch:
 
 class FNNReplayBuffer:
     def __init__(self, max_size: int = 100_000) -> None:
-        self.buffer: deque[FNNTrainingExample] = deque(maxlen=max_size)
+        self.max_size = int(max_size)
+        self.buffer: list[FNNTrainingExample] = []
+        self._next_idx = 0
         self._weights_dirty = True
         self._cached_weights: np.ndarray | None = None
+        self._uniform_weights = True
 
     def __len__(self) -> int:
         return len(self.buffer)
 
     def add_examples(self, examples: list[FNNTrainingExample]) -> None:
-        self.buffer.extend(examples)
+        if not examples:
+            return
+        buf = self.buffer
+        max_size = self.max_size
+        next_idx = self._next_idx
+        uniform = self._uniform_weights
+
+        for ex in examples:
+            if len(buf) < max_size:
+                buf.append(ex)
+            else:
+                buf[next_idx] = ex
+                next_idx = (next_idx + 1) % max_size
+            if ex.surprise_weight != 1.0:
+                uniform = False
+
+        self._next_idx = next_idx
+        self._uniform_weights = uniform
         self._weights_dirty = True
 
     def _get_weights(self) -> np.ndarray:
@@ -64,8 +83,12 @@ class FNNReplayBuffer:
 
     def sample_batch(self, batch_size: int) -> FNNTrainingBatch:
         buf = self.buffer
-        weights = self._get_weights()
-        indices = np.random.choice(len(buf), size=batch_size, p=weights)
+        n = len(buf)
+        if self._uniform_weights:
+            indices = np.random.randint(0, n, size=batch_size)
+        else:
+            weights = self._get_weights()
+            indices = np.random.choice(n, size=batch_size, p=weights)
         samples = [buf[i] for i in indices]
         return _collate(samples)
 
