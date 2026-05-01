@@ -132,7 +132,7 @@ launch command exits, even with `nohup`. In that case, start training inside a
 persistent shell, `tmux`, `screen`, or a long-lived PTY session and keep that
 session open. The trainer CLI help for PRS and FNN includes model-specific
 background-launch templates.
-
+```
 ## Search Algorithms
 
 ### Gumbel AlphaZero (default)
