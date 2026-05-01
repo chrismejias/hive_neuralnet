@@ -1,6 +1,5 @@
-"""
-hive_mc — Move-conditioned transformer for Hive.
+"""Compatibility wrapper for the archived move-conditioned model."""
 
-Two-stage architecture: lightweight screening head scores all legal moves,
-then top-k successors get full transformer encoding and value comparison.
-"""
+from archive.legacy_mc.hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
+
+__all__ = ["HiveMoveTransformer", "MCTransformerConfig"]

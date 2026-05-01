@@ -1,9 +1,4 @@
-"""
-hive_transformer — Transformer package for Hive AI.
-
-GPU-native transformer using self-attention over token sequences for
-global context and optimal GPU tensor core utilization.
-"""
+"""Shared token types plus compatibility wrappers for the archived transformer."""
 
 from hive_transformer.token_types import (
     HiveTokenSequence,
@@ -16,6 +11,7 @@ from hive_transformer.token_types import (
     TOKEN_TYPE_HAND,
 )
 from hive_transformer.token_encoder import TokenEncoder
+from hive_transformer.transformer_encoder import TransformerEncoder
 from hive_transformer.transformer_net import (
     TransformerConfig,
     HiveTransformer,
@@ -36,6 +32,7 @@ __all__ = [
     "TOKEN_TYPE_BOARD",
     "TOKEN_TYPE_HAND",
     "TokenEncoder",
+    "TransformerEncoder",
     "TransformerConfig",
     "HiveTransformer",
     "TransformerPolicyHead",

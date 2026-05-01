@@ -1,6 +1,8 @@
-"""Compatibility wrapper for the archived legacy transformer network."""
+"""Archived legacy transformer implementation."""
 
-from archive.legacy_transformer.hive_transformer.transformer_net import (
+from .token_encoder import TokenEncoder
+from .transformer_encoder import TransformerEncoder
+from .transformer_net import (
     TransformerConfig,
     HiveTransformer,
     TransformerPolicyHead,
@@ -11,6 +13,8 @@ from archive.legacy_transformer.hive_transformer.transformer_net import (
 )
 
 __all__ = [
+    "TokenEncoder",
+    "TransformerEncoder",
     "TransformerConfig",
     "HiveTransformer",
     "TransformerPolicyHead",
