@@ -31,7 +31,7 @@ from hive_fnn.fnn_mcts_orchestrator import (
     _GUMBEL_K, _GUMBEL_ROUNDS, _GUMBEL_WAVE_SCHEDULE,
 )
 
-CHECKPOINT  = "checkpoints_fnn/hive_fnn_checkpoint_0050.pt"
+CHECKPOINT  = "checkpoints_fnn_deterministic/hive_fnn_checkpoint_0250.pt"
 N_GEN_GAMES = 200
 PLY_TARGET  = 30
 
