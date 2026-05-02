@@ -56,6 +56,8 @@ class PRSTrainConfigV2:
     learning_rate:             float = 5e-4
     weight_decay:              float = 1e-4
     max_grad_norm:             float = 1.0
+    queen_surround_loss_weight: float = 0.15
+    final_mobility_loss_weight: float = 0.15
 
     # LR schedule
     lr_schedule:               str   = "cosine"
@@ -112,6 +114,14 @@ def compute_prs_v2_loss(
     legal_mask:    torch.Tensor,     # (B, N_SLOTS) bool
     value_targets: torch.Tensor,     # (B, 1) float32
     value_mask:    torch.Tensor,     # (B, 1) float32, 1 = include in value loss
+    aux_outputs:   dict[str, torch.Tensor],
+    queen_surround_targets: torch.Tensor,  # (total_board_tokens, 2)
+    queen_surround_mask:    torch.Tensor,  # (B, 2)
+    final_mobility_targets: torch.Tensor,  # (total_board_tokens,)
+    final_mobility_mask:    torch.Tensor,  # (B, 1)
+    board_token_batch:      torch.Tensor,  # (total_board_tokens,)
+    queen_surround_weight: float = 0.15,
+    final_mobility_weight: float = 0.15,
 ) -> tuple[torch.Tensor, dict]:
     """Masked CE over legal slots + value MSE.
 
@@ -142,7 +152,40 @@ def compute_prs_v2_loss(
     else:
         value_loss = torch.tensor(0.0, device=policy_logits.device)
     total_loss = policy_loss + value_loss
-    return total_loss, {"policy_loss": policy_loss, "value_loss": value_loss}
+    loss_dict: dict[str, torch.Tensor] = {
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+    }
+
+    if "queen_surround_logits" in aux_outputs and queen_surround_targets.numel() > 0:
+        qs_logits = aux_outputs["queen_surround_logits"]
+        per_token_mask = queen_surround_mask[board_token_batch]
+        qs_bce = F.binary_cross_entropy_with_logits(
+            qs_logits, queen_surround_targets, reduction="none",
+        )
+        qs_bce = qs_bce * per_token_mask
+        if per_token_mask.sum() > 0:
+            qs_loss = qs_bce.sum() / per_token_mask.sum()
+        else:
+            qs_loss = torch.tensor(0.0, device=policy_logits.device)
+        total_loss = total_loss + queen_surround_weight * qs_loss
+        loss_dict["queen_surround_loss"] = qs_loss
+
+    if "final_mobility_logits" in aux_outputs and final_mobility_targets.numel() > 0:
+        fm_logits = aux_outputs["final_mobility_logits"].squeeze(-1)
+        fm_token_mask = final_mobility_mask[board_token_batch].squeeze(-1)
+        fm_bce = F.binary_cross_entropy_with_logits(
+            fm_logits, final_mobility_targets, reduction="none",
+        )
+        fm_bce = fm_bce * fm_token_mask
+        if fm_token_mask.sum() > 0:
+            fm_loss = fm_bce.sum() / fm_token_mask.sum()
+        else:
+            fm_loss = torch.tensor(0.0, device=policy_logits.device)
+        total_loss = total_loss + final_mobility_weight * fm_loss
+        loss_dict["final_mobility_loss"] = fm_loss
+
+    return total_loss, loss_dict
 
 
 # ── Trainer ────────────────────────────────────────────────────────────
@@ -244,8 +287,8 @@ class PRSTrainerV2:
 
     def _forward_train(
         self, batch: PRSTrainingBatchV2,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Full v2 forward from a training batch (trunk + CUDA bridge + head)."""
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Full v2 forward from a training batch (trunk + CUDA bridge + heads)."""
         ext = hive_gpu.load_extension()
         B = batch.state_bytes.shape[0]
         # Upload state_bytes once and regenerate legal moves on GPU so the
@@ -256,7 +299,7 @@ class PRSTrainerV2:
             states_gpu, legal_t, nlegal_t, B, int(legal_t.shape[1]),
         )
 
-        return self._train_net.forward_from_kernel(batch.prs_batch, kernel_out)
+        return self._train_net.forward_train_from_kernel(batch.prs_batch, kernel_out)
 
     def _train(self, iteration: int) -> tuple[float, dict]:
         cfg = self.config
@@ -282,11 +325,19 @@ class PRSTrainerV2:
                 opt.zero_grad()
                 if self.use_amp and self._scaler is not None:
                     with torch.amp.autocast("cuda"):
-                        logits, value = self._forward_train(batch)
+                        logits, value, aux = self._forward_train(batch)
                         loss, ld = compute_prs_v2_loss(
                             logits, value,
                             batch.slot_targets, batch.legal_masks,
                             batch.value_targets, batch.value_masks,
+                            aux,
+                            batch.queen_surround_targets,
+                            batch.queen_surround_mask,
+                            batch.final_mobility_targets,
+                            batch.final_mobility_mask,
+                            batch.board_token_batch,
+                            queen_surround_weight=cfg.queen_surround_loss_weight,
+                            final_mobility_weight=cfg.final_mobility_loss_weight,
                         )
                     self._scaler.scale(loss).backward()
                     if cfg.max_grad_norm > 0:
@@ -297,11 +348,19 @@ class PRSTrainerV2:
                     self._scaler.step(opt)
                     self._scaler.update()
                 else:
-                    logits, value = self._forward_train(batch)
+                    logits, value, aux = self._forward_train(batch)
                     loss, ld = compute_prs_v2_loss(
                         logits, value,
                         batch.slot_targets, batch.legal_masks,
                         batch.value_targets, batch.value_masks,
+                        aux,
+                        batch.queen_surround_targets,
+                        batch.queen_surround_mask,
+                        batch.final_mobility_targets,
+                        batch.final_mobility_mask,
+                        batch.board_token_batch,
+                        queen_surround_weight=cfg.queen_surround_loss_weight,
+                        final_mobility_weight=cfg.final_mobility_loss_weight,
                     )
                     loss.backward()
                     if cfg.max_grad_norm > 0:
@@ -381,6 +440,12 @@ class PRSTrainerV2:
 
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.best_net.load_state_dict(ckpt["model_state"])
+        missing, unexpected = self.best_net.load_state_dict(
+            ckpt["model_state"], strict=False,
+        )
         self._start_iter = ckpt["iteration"] + 1
+        if missing:
+            print(f"Checkpoint missing keys: {missing}")
+        if unexpected:
+            print(f"Checkpoint unexpected keys: {unexpected}")
         print(f"Resumed from {path} (iter {ckpt['iteration']})")

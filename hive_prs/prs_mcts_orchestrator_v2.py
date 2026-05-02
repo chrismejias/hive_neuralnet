@@ -22,9 +22,10 @@ import torch
 import hive_gpu
 from hive_prs.prs_encoder import PRSEncoder
 from hive_prs.prs_replay_buffer_v2 import PRSTrainingExampleV2
-from hive_prs.slot_map import N_SLOTS, PASS_SLOT, map_legal_moves
+from hive_prs.slot_map import N_SLOTS, PASS_SLOT, NEIGHBORS, HEIGHT_OFFSET, map_legal_moves
 
 _OFF_TURN = 3412  # byte offset of turn counter in HiveState
+_OFF_QUEEN_CELL = 3392
 _GUMBEL_K = 16
 _GUMBEL_ROUNDS = 4
 _GUMBEL_WAVE_SCHEDULE = (1, 2, 4, 8)
@@ -34,7 +35,7 @@ _GUMBEL_WAVE_SCHEDULE = (1, 2, 4, 8)
 class PRSMCTSConfigV2:
     num_simulations:             int   = 128
     max_num_considered_actions:  int   = 16
-    c_puct:                      float = 1.25
+    c_puct:                      float = 2.5
     c_visit:                     float = 50.0
     c_scale:                     float = 1.0
     temperature:                 float = 1.0
@@ -45,7 +46,9 @@ class PRSMCTSConfigV2:
     nn_max_batch:                int   = 0
     wave_parallel:               bool  = True
     compile_forward:             bool  = False
-    wave_size:                   int   = 16
+    deterministic_non_root:      bool  = False
+    virtual_q_penalty:           float = 0.25
+    non_root_sigma:              float = 1.0
     dirichlet_alpha:             float = 0.3
     dirichlet_epsilon:           float = 0.25
     max_tree_nodes:              int   = 65536
@@ -102,6 +105,7 @@ class PRSMCTSOrchestratorV2:
             "visit_count":    torch.zeros(B, M, dtype=torch.int32,  device=dev),
             "total_value":    torch.zeros(B, M, dtype=torch.float32, device=dev),
             "prior":          torch.zeros(B, M, dtype=torch.float32, device=dev),
+            "virtual_q_penalty": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "parent_idx":     torch.full((B, M), -1, dtype=torch.int32, device=dev),
             "move_bytes":     torch.zeros(B, M, self._move_size, dtype=torch.uint8, device=dev),
             "action_idx":     torch.full((B, M), -1, dtype=torch.int32, device=dev),
@@ -111,12 +115,14 @@ class PRSMCTSOrchestratorV2:
             "terminal_value": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "node_count":     torch.ones(B, dtype=torch.int32, device=dev),
             "root_node":      torch.zeros(B, dtype=torch.int32, device=dev),
+            "child_init_q":   torch.zeros(B, M, dtype=torch.float32, device=dev),
         }
 
     def _reset_tree(self, tree: dict[str, torch.Tensor]) -> None:
         tree["visit_count"].zero_()
         tree["total_value"].zero_()
         tree["prior"].zero_()
+        tree["virtual_q_penalty"].zero_()
         tree["parent_idx"].fill_(-1)
         tree["move_bytes"].zero_()
         tree["action_idx"].fill_(-1)
@@ -126,11 +132,13 @@ class PRSMCTSOrchestratorV2:
         tree["terminal_value"].zero_()
         tree["node_count"].fill_(1)
         tree["root_node"].zero_()
+        tree["child_init_q"].zero_()
 
     def _tree_args(self, tree: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         return [
             tree["visit_count"], tree["total_value"], tree["prior"],
-            tree["parent_idx"], tree["move_bytes"], tree["action_idx"],
+            tree["parent_idx"], tree["virtual_q_penalty"],
+            tree["move_bytes"], tree["action_idx"],
             tree["first_child"], tree["num_children"],
             tree["is_terminal"], tree["terminal_value"], tree["node_count"],
         ]
@@ -215,7 +223,7 @@ class PRSMCTSOrchestratorV2:
         """
         mb = self.config.nn_max_batch
         if mb <= 0 or B <= mb:
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits, value = self.net.forward_from_kernel(prs_batch, kernel_out)
             return logits, value
         # Sub-batching: slice each kernel-output tensor along dim 0.
@@ -223,148 +231,91 @@ class PRSMCTSOrchestratorV2:
         for s in range(0, B, mb):
             e = min(s + mb, B)
             sub_kernel = tuple(t[s:e] for t in kernel_out)
-            with torch.no_grad():
+            with torch.inference_mode():
                 sub = prs_batch.slice_batch(s, e)
                 lo, value = self.net.forward_from_kernel(sub, sub_kernel)
             all_l.append(lo); all_v.append(value)
         return torch.cat(all_l, 0), torch.cat(all_v, 0)
 
-    # ── Public API ───────────────────────────────────────────────────
+    def _compute_queen_surround_target(
+        self,
+        state_bytes: np.ndarray,
+        completed: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        heights = state_bytes[HEIGHT_OFFSET:HEIGHT_OFFSET + 529]
+        occ_cells = np.where(heights > 0)[0].astype(np.int32)
+        n = int(occ_cells.shape[0])
+        target = np.zeros((n, 2), dtype=np.float32)
+        mask = np.zeros(2, dtype=np.float32)
+        if not completed or n == 0:
+            return target, mask
 
-    def select_move_gpu(self, state: torch.Tensor) -> torch.Tensor:
-        """Single-ply Gumbel MCTS on one state (PRS v2).
+        cell_to_idx = {int(cell): idx for idx, cell in enumerate(occ_cells)}
+        queen_cells = state_bytes[_OFF_QUEEN_CELL:_OFF_QUEEN_CELL + 4].view(np.uint16)
+        for color in range(2):
+            qc = int(queen_cells[color])
+            if qc == 0xFFFF:
+                continue
+            mask[color] = 1.0
+            for d in range(6):
+                nb = int(NEIGHBORS[qc, d])
+                if nb >= 0 and int(heights[nb]) > 0:
+                    idx = cell_to_idx.get(nb)
+                    if idx is not None:
+                        target[idx, color] = 1.0
+        return target, mask
 
-        Args:
-            state: (1, STATE_SIZE) uint8 on CPU or CUDA.
-        Returns:
-            (6,) uint8 on CPU — the chosen move bytes.
-        """
-        dev = "cuda"
-        B = 1
-        cfg = self.config
+    def _compute_final_mobility_targets(
+        self,
+        states: torch.Tensor,
+        final_results: np.ndarray,
+        B: int,
+    ) -> list[np.ndarray]:
+        states_np = states.cpu().numpy()
+        targets = [
+            np.zeros(int(np.count_nonzero(sb[HEIGHT_OFFSET:HEIGHT_OFFSET + 529])), dtype=np.float32)
+            for sb in states_np
+        ]
 
-        state = state.to(dev)
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
+        completed = [i for i, result in enumerate(final_results.tolist()) if int(result) != 0]
+        if not completed:
+            return targets
 
-        tree = self._alloc_tree(B)
+        dup_states = np.stack([states_np[i].copy() for i in completed for _ in range(2)], axis=0)
+        for j in range(len(completed)):
+            for color in range(2):
+                row = dup_states[2 * j + color]
+                turn = int(row[_OFF_TURN]) | (int(row[_OFF_TURN + 1]) << 8)
+                turn = (turn & ~1) | color
+                row[_OFF_TURN] = turn & 0xFF
+                row[_OFF_TURN + 1] = (turn >> 8) & 0xFF
 
-        prs_batch = self.encoder.encode_batch(state, B)
-        legal_t, nlegal_t = self.ext.generate_legal_moves_batch(state, B)
+        states_gpu = torch.from_numpy(dup_states).cuda()
+        legal_t, nlegal_t = self.ext.generate_legal_moves_batch(states_gpu, dup_states.shape[0])
+        legal_np = legal_t.cpu().numpy()
         nlegal_np = nlegal_t.cpu().numpy()
-        max_n = int(nlegal_np[0])
 
-        if max_n == 0:
-            pass_bytes = torch.zeros(6, dtype=torch.uint8)
-            pass_bytes[0] = 2  # MOVE_TYPE_PASS
-            return pass_bytes
+        for j, game_idx in enumerate(completed):
+            sb = states_np[game_idx]
+            heights = sb[HEIGHT_OFFSET:HEIGHT_OFFSET + 529]
+            occ_cells = np.where(heights > 0)[0].astype(np.int32)
+            cell_to_idx = {int(cell): idx for idx, cell in enumerate(occ_cells)}
+            fm = np.zeros(int(occ_cells.shape[0]), dtype=np.float32)
+            for color in range(2):
+                row_idx = 2 * j + color
+                nlegal = int(nlegal_np[row_idx])
+                row_moves = legal_np[row_idx, :nlegal]
+                for mv in row_moves:
+                    if int(mv[0]) != 1:
+                        continue
+                    from_cell = int(mv[2]) | (int(mv[3]) << 8)
+                    tok_idx = cell_to_idx.get(from_cell)
+                    if tok_idx is not None:
+                        fm[tok_idx] = 1.0
+            targets[game_idx] = fm
+        return targets
 
-        # Immediate-win check (fully batched)
-        turns_np = self._get_turns(state, B)
-        win_overrides = self._check_immediate_wins_v2(
-            state, legal_t, nlegal_np, [True], turns_np, B,
-        )
-
-        # CUDA classify kernel for head inputs + slot mapping
-        kernel_out = self._classify_kernel(state, legal_t, nlegal_t, B)
-        slot_of_legal_t = kernel_out[8]
-
-        policy_logits_813, _ = self._net_forward(prs_batch, kernel_out, B)
-        policy_logits_813 = policy_logits_813.float()
-
-        priors_per_legal, root_logit_per_legal = self._build_legal_priors_v2(
-            policy_logits_813, slot_of_legal_t, B,
-        )
-
-        MAX_L = self._max_legal
-        nlegal_t_gpu = nlegal_t.to(torch.int64)
-        slot_idx_t = torch.arange(MAX_L, device=dev).unsqueeze(0)
-        valid_slot = slot_idx_t < nlegal_t_gpu.unsqueeze(1)
-
-        active_t = torch.ones(B, dtype=torch.int8, device=dev)
-        self._expand_root_if_needed(
-            tree, state, legal_t, nlegal_t,
-            priors_per_legal, active_t, B,
-        )
-        self._apply_root_dirichlet(tree, B, [True])
-
-        if win_overrides:
-            chosen = win_overrides[0]
-        else:
-            u = torch.rand(B, MAX_L, device=dev).clamp(1e-4, 1 - 1e-4)
-            gumbel = -torch.log(-torch.log(u))
-            gumbel = torch.where(valid_slot, gumbel, torch.full_like(gumbel, -1e30))
-            perturbed = gumbel + root_logit_per_legal
-            k = min(_GUMBEL_K, max_n)
-            _, topk_slots = torch.topk(perturbed, k, dim=1)
-
-            candidate_slots = topk_slots.to(torch.int32)
-            candidate_valid = torch.gather(valid_slot, 1, candidate_slots.long())
-            candidate_slots = torch.where(
-                candidate_valid, candidate_slots,
-                torch.full_like(candidate_slots, -1),
-            )
-
-            sims_per_round = max(1, cfg.num_simulations // _GUMBEL_ROUNDS)
-            for round_i in range(_GUMBEL_ROUNDS):
-                root_slots = candidate_slots
-                candidate_valid = root_slots >= 0
-                num_candidates = int(root_slots.shape[1])
-                sims_per_candidate = max(1, sims_per_round // num_candidates)
-                round_wave_size = (
-                    _GUMBEL_WAVE_SCHEDULE[min(round_i, len(_GUMBEL_WAVE_SCHEDULE) - 1)]
-                    if cfg.wave_parallel else 1
-                )
-                self._run_simulations_for_root_slots(
-                    tree, state, active_t, root_slots, B, sims_per_candidate,
-                    wave_size=round_wave_size,
-                )
-                if num_candidates <= 1:
-                    continue
-                per_game_keep = (candidate_valid.sum(dim=1) // 2).clamp(min=1)
-                max_keep = num_candidates // 2
-
-                cand_visits, cand_q = self._gather_root_candidate_stats(
-                    tree, B, root_slots,
-                )
-                sigma_norm = (cfg.c_visit + cand_visits.max()) * cfg.c_scale
-                cand_idx = root_slots.long().clamp(min=0)
-                cand_score = (
-                    torch.gather(gumbel + root_logit_per_legal, 1, cand_idx)
-                    + sigma_norm * cand_q
-                ).float()
-                cand_score = torch.where(
-                    candidate_valid, cand_score,
-                    torch.full_like(cand_score, -1e30),
-                )
-                _, keep_pos = torch.topk(cand_score, max_keep, dim=1)
-                keep_rank = self._keep_rank(max_keep)
-                keep_valid = keep_rank < per_game_keep.unsqueeze(1)
-                new_slots = torch.gather(root_slots, 1, keep_pos)
-                candidate_slots = torch.where(
-                    keep_valid, new_slots, torch.full_like(new_slots, -1),
-                )
-
-            # Final Gumbel sigma selection
-            candidate_valid = candidate_slots >= 0
-            cand_visits, cand_q = self._gather_root_candidate_stats(
-                tree, B, candidate_slots,
-            )
-            sigma_norm = (cfg.c_visit + cand_visits.max()) * cfg.c_scale
-            cand_idx = candidate_slots.long().clamp(min=0)
-            final_cand_sigma = (
-                torch.gather(gumbel + root_logit_per_legal, 1, cand_idx)
-                + sigma_norm * cand_q
-            ).float()
-            final_cand_sigma = torch.where(
-                candidate_valid, final_cand_sigma,
-                torch.full_like(final_cand_sigma, -1e30),
-            )
-            chosen_pos = int(torch.argmax(final_cand_sigma[0]).item())
-            chosen = int(candidate_slots[0, chosen_pos].item())
-            chosen = max(0, min(chosen, max_n - 1))
-
-        return legal_t[0, chosen].cpu()
+    # ── Public API ───────────────────────────────────────────────────
 
     def self_play_batch(
         self,
@@ -502,7 +453,7 @@ class PRSMCTSOrchestratorV2:
                 )
 
             # ── Final action selection (Gumbel sigma score) ──────────
-            leg_visits, _leg_q = self._gather_root_child_stats(tree, B)
+            leg_visits, leg_q = self._gather_root_child_stats(tree, B)
             # leg_visits: (B, MAX_L) int32 — visits per legal-move index.
             if cfg.debug_zero_visit_logging and zero_visit_logs_emitted < cfg.debug_zero_visit_limit:
                 leg_visit_sums = leg_visits.sum(dim=1).cpu().numpy()
@@ -551,11 +502,33 @@ class PRSMCTSOrchestratorV2:
                 candidate_slots, 1, chosen_pos.unsqueeze(1),
             ).squeeze(1).clamp(min=0).to(torch.long)            # (B,)
 
+            # ── Visited-only improved policy target ──────────────────
+            # Only moves actually reached by the tree receive target mass.
+            # Unvisited legal moves are intentionally zeroed.
+            visited_legal = (leg_visits > 0) & valid_slot
+            max_n = leg_visits.float().max(dim=1, keepdim=True).values
+            sigma_norm_t = (cfg.c_visit + max_n) * cfg.c_scale
+            sampled_logits = torch.where(
+                visited_legal,
+                root_logit_per_legal + sigma_norm_t * leg_q,
+                torch.full_like(root_logit_per_legal, -1e30),
+            )
+            sampled_dist = torch.softmax(sampled_logits, dim=1)
+            improved_probs = torch.where(
+                visited_legal,
+                sampled_dist,
+                torch.zeros_like(sampled_dist),
+            )
+            improved_probs = torch.where(
+                valid_slot, improved_probs, torch.zeros_like(improved_probs),
+            )
+
             # ── Record history (single big CPU transfer batch) ──────
             slot_of_legal_np = slot_of_legal_t.cpu().numpy().astype(np.int64)
             states_cpu       = states.cpu().numpy()
             legal_np         = legal_t.cpu().numpy()
             leg_visits_np    = leg_visits.cpu().numpy()
+            improved_probs_np = improved_probs.cpu().numpy()
             chosen_np        = chosen_slot_idx.cpu().numpy().copy()
             turns_np         = turns_np_early  # already computed above
 
@@ -576,14 +549,14 @@ class PRSMCTSOrchestratorV2:
                 n_i = int(nlegal_np[i])
                 if n_i == 0:
                     continue
-                # Slot-space visit target (aggregates duplicates)
+                # Slot-space Gumbel improved policy target (aggregates duplicates)
                 slot_target = np.zeros(N_SLOTS, dtype=np.float32)
                 legal_mask_np = np.zeros(N_SLOTS, dtype=bool)
                 for k in range(n_i):
                     s = int(slot_of_legal_np[i, k])
                     if s < 0:
                         continue
-                    slot_target[s] += float(leg_visits_np[i, k])
+                    slot_target[s] += float(improved_probs_np[i, k])
                     legal_mask_np[s] = True
                 ssum = slot_target.sum()
                 if ssum > 0:
@@ -661,7 +634,13 @@ class PRSMCTSOrchestratorV2:
                     active[i] = False
 
         final_results = self.ext.check_results_batch(states, B).cpu().numpy()
-        return self._build_examples(histories, final_results)
+        states_np = states.cpu().numpy()
+        final_mobility = self._compute_final_mobility_targets(states, final_results, B)
+        final_queen_surround = [
+            self._compute_queen_surround_target(states_np[i], int(final_results[i]) != 0)
+            for i in range(B)
+        ]
+        return self._build_examples(histories, final_results, final_mobility, final_queen_surround)
 
     # ── Tree expansion / simulations (same as v1) ────────────────────
 
@@ -711,8 +690,14 @@ class PRSMCTSOrchestratorV2:
             torch.full_like(leaf_indices, -1),
         )
         results = self.ext.check_results_batch(states, B)
+        # For PRS root expansion, child Q fallback = leaf value (parent's value).
+        # This matches old parent_value behavior for non-root selection.
+        child_q_zeros = torch.zeros(
+            B, self._max_legal, dtype=torch.float32, device="cuda",
+        )
         self.ext.mcts_expand_dense_priors_batch(
             *self._tree_args(tree),
+            tree["child_init_q"], child_q_zeros,
             leaf_indices, states,
             legal_moves, num_legal, priors_per_legal, results,
             B, B, self._max_nodes,
@@ -771,8 +756,13 @@ class PRSMCTSOrchestratorV2:
         num_sims: int, wave_size: int | None = None,
     ) -> None:
         cfg = self.config
-        W = max(1, int(cfg.wave_size if wave_size is None else wave_size))
+        W = max(1, int(1 if wave_size is None else wave_size))
         num_waves = math.ceil(num_sims / W)
+        q_penalty = (
+            float(cfg.virtual_q_penalty)
+            if cfg.deterministic_non_root and W > 1
+            else 0.0
+        )
 
         state_size = root_states.shape[1]
         leaf_states = torch.zeros(W * B, state_size, dtype=torch.uint8, device="cuda")
@@ -784,9 +774,11 @@ class PRSMCTSOrchestratorV2:
             leaf_idx, move_paths, path_lens, vl_paths, vl_lens = (
                 self.ext.mcts_select_with_root_mask_batch(
                     *self._tree_args(tree),
+                    tree["child_init_q"],
                     game_active, tree["root_node"],
                     alive_mask, self._max_legal,
                     cfg.c_puct, B, actual_w, self._max_nodes,
+                    cfg.deterministic_non_root, cfg.non_root_sigma, q_penalty,
                 )
             )
             if (
@@ -837,12 +829,19 @@ class PRSMCTSOrchestratorV2:
                 leaf_logits, slot_of_leaf_t, total,
             )
 
+            # For PRS, use the leaf's own value as the child Q fallback (matches
+            # old parent_value behavior: parent_value = nn_value after backprop).
+            child_q_leaf = leaf_values.unsqueeze(1).expand(
+                total, self._max_legal,
+            ).contiguous()
+
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
                 *self._tree_args(tree),
+                tree["child_init_q"], child_q_leaf,
                 leaf_idx[:total], leaf_states[:total],
                 legal_moves, num_legal, priors_leaf, results,
                 leaf_values, vl_paths[:total], vl_lens[:total],
-                B, total, self._max_nodes,
+                B, total, self._max_nodes, q_penalty,
             )
 
     def _run_simulations_for_root_slots(
@@ -851,8 +850,13 @@ class PRSMCTSOrchestratorV2:
     ) -> None:
         cfg = self.config
         C = int(root_slots.shape[1])
-        W = max(1, int(cfg.wave_size if wave_size is None else wave_size))
+        W = max(1, int(1 if wave_size is None else wave_size))
         num_waves = math.ceil(num_sims_per_slot / W)
+        q_penalty = (
+            float(cfg.virtual_q_penalty)
+            if cfg.deterministic_non_root and W > 1
+            else 0.0
+        )
 
         state_size = root_states.shape[1]
         leaf_states = torch.zeros(W * C * B, state_size, dtype=torch.uint8, device="cuda")
@@ -864,9 +868,11 @@ class PRSMCTSOrchestratorV2:
             leaf_idx, move_paths, path_lens, vl_paths, vl_lens = (
                 self.ext.mcts_select_with_root_slots_batch(
                     *self._tree_args(tree),
+                    tree["child_init_q"],
                     game_active, tree["root_node"],
                     root_slots, C, self._max_legal,
                     cfg.c_puct, B, actual_w, self._max_nodes,
+                    cfg.deterministic_non_root, cfg.non_root_sigma, q_penalty,
                 )
             )
 
@@ -897,12 +903,17 @@ class PRSMCTSOrchestratorV2:
                 leaf_logits, slot_of_leaf_t, total,
             )
 
+            child_q_leaf = leaf_values.unsqueeze(1).expand(
+                total, self._max_legal,
+            ).contiguous()
+
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
                 *self._tree_args(tree),
+                tree["child_init_q"], child_q_leaf,
                 leaf_idx[:total], leaf_states[:total],
                 legal_moves, num_legal, priors_leaf, results,
                 leaf_values, vl_paths[:total], vl_lens[:total],
-                B, total, self._max_nodes,
+                B, total, self._max_nodes, q_penalty,
             )
 
     def _alive_root_slots(self, alive: torch.Tensor) -> torch.Tensor:
@@ -950,31 +961,24 @@ class PRSMCTSOrchestratorV2:
     def _gather_root_child_stats(
         self, tree, B: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        row = torch.arange(B, device="cuda")
+        row = torch.arange(B, device="cuda", dtype=torch.long)
         root = tree["root_node"]
-        fc   = tree["first_child"][row, root]
-        nc   = tree["num_children"][row, root]
+        fc = tree["first_child"][row, root].to(torch.long)
+        nc = tree["num_children"][row, root].to(torch.long)
 
-        visits = torch.zeros(B, self._max_legal, dtype=torch.int32,  device="cuda")
-        q      = torch.zeros(B, self._max_legal, dtype=torch.float32, device="cuda")
+        slots = torch.arange(self._max_legal, device="cuda", dtype=torch.long).unsqueeze(0)
+        valid = (fc.unsqueeze(1) >= 0) & (slots < nc.unsqueeze(1))
+        child_idx = (fc.unsqueeze(1) + slots).clamp(min=0, max=self._max_nodes - 1)
+        row2 = row.unsqueeze(1).expand_as(child_idx)
 
-        fc_cpu = fc.cpu().numpy()
-        nc_cpu = nc.cpu().numpy()
-        for i in range(B):
-            fci = int(fc_cpu[i])
-            nci = int(nc_cpu[i])
-            if fci < 0 or nci == 0:
-                continue
-            lim = min(nci, self._max_legal)
-            vc_slice = tree["visit_count"][i, fci:fci + lim]
-            tv_slice = tree["total_value"][i, fci:fci + lim]
-            visits[i, :lim] = vc_slice
-            with torch.no_grad():
-                q[i, :lim] = torch.where(
-                    vc_slice > 0,
-                    -tv_slice / vc_slice.clamp(min=1).float(),
-                    torch.zeros_like(tv_slice),
-                )
+        visits_raw = tree["visit_count"][row2, child_idx]
+        total_raw = tree["total_value"][row2, child_idx]
+        visits = torch.where(valid, visits_raw, torch.zeros_like(visits_raw))
+        q = torch.where(
+            valid & (visits_raw > 0),
+            -total_raw / visits_raw.clamp(min=1).float(),
+            torch.zeros_like(total_raw),
+        )
         return visits, q
 
     def _reroot_tree(
@@ -983,21 +987,26 @@ class PRSMCTSOrchestratorV2:
         if self.config.rebase_tree_each_move:
             # Hard rebase: drop previous ply's tree for moved games and start
             # the next ply from a fresh root node at index 0.
-            for i in range(B):
-                if not (active[i] and chosen_child_nodes[i] >= 0):
-                    continue
-                tree["visit_count"][i].zero_()
-                tree["total_value"][i].zero_()
-                tree["prior"][i].zero_()
-                tree["parent_idx"][i].fill_(-1)
-                tree["move_bytes"][i].zero_()
-                tree["action_idx"][i].fill_(-1)
-                tree["first_child"][i].fill_(-1)
-                tree["num_children"][i].zero_()
-                tree["is_terminal"][i].zero_()
-                tree["terminal_value"][i].zero_()
-                tree["node_count"][i] = 1
-                tree["root_node"][i] = 0
+            rows = [
+                i for i in range(B)
+                if active[i] and chosen_child_nodes[i] >= 0
+            ]
+            if not rows:
+                return
+            row_t = torch.tensor(rows, dtype=torch.long, device="cuda")
+            tree["visit_count"][row_t] = 0
+            tree["total_value"][row_t] = 0
+            tree["prior"][row_t] = 0
+            tree["parent_idx"][row_t] = -1
+            tree["move_bytes"][row_t] = 0
+            tree["action_idx"][row_t] = -1
+            tree["first_child"][row_t] = -1
+            tree["num_children"][row_t] = 0
+            tree["is_terminal"][row_t] = 0
+            tree["terminal_value"][row_t] = 0
+            tree["child_init_q"][row_t] = 0
+            tree["node_count"][row_t] = 1
+            tree["root_node"][row_t] = 0
             return
 
         # Legacy behavior: keep subtree rooted at chosen child.
@@ -1080,13 +1089,16 @@ class PRSMCTSOrchestratorV2:
         self,
         histories:     list[list[dict]],
         final_results: np.ndarray,
+        final_mobility: list[np.ndarray],
+        final_queen_surround: list[tuple[np.ndarray, np.ndarray]],
     ) -> list[list[PRSTrainingExampleV2]]:
         all_examples: list[list[PRSTrainingExampleV2]] = []
         for i, history in enumerate(histories):
             result = int(final_results[i])
             use_for_value = (result != 0)
             game_exs: list[PRSTrainingExampleV2] = []
-            for step in history:
+            num_steps = len(history)
+            for step_idx, step in enumerate(history):
                 turn = step["turn"]
                 player_is_white = (turn % 2 == 0)
                 if result == 0 or result == 3:
@@ -1095,6 +1107,26 @@ class PRSMCTSOrchestratorV2:
                     value = 1.0 if player_is_white else -1.0
                 else:
                     value = -1.0 if player_is_white else 1.0
+
+                nbt = int(step["num_board_tokens"])
+                is_final = (step_idx == num_steps - 1)
+                if is_final and result != 0:
+                    qs_target, qs_mask = final_queen_surround[i]
+                    if qs_target.shape[0] != nbt:
+                        qs_target = np.zeros((nbt, 2), dtype=np.float32)
+                        qs_mask = np.zeros(2, dtype=np.float32)
+                else:
+                    qs_target = np.zeros((nbt, 2), dtype=np.float32)
+                    qs_mask = np.zeros(2, dtype=np.float32)
+
+                if is_final and result != 0:
+                    fm_target = final_mobility[i]
+                    fm_mask = 1.0 if fm_target.shape[0] == nbt else 0.0
+                    if fm_target.shape[0] != nbt:
+                        fm_target = np.zeros(nbt, dtype=np.float32)
+                else:
+                    fm_target = np.zeros(nbt, dtype=np.float32)
+                    fm_mask = 0.0
 
                 game_exs.append(PRSTrainingExampleV2(
                     token_features   = step["token_features"],
@@ -1111,6 +1143,10 @@ class PRSMCTSOrchestratorV2:
                     num_occupied     = step["num_occupied"],
                     slot_target      = step["slot_target"],
                     legal_mask       = step["legal_mask"],
+                    queen_surround_target = qs_target,
+                    queen_surround_mask   = qs_mask,
+                    final_mobility_target = fm_target,
+                    final_mobility_mask   = fm_mask,
                     value_target     = value,
                     use_for_value    = use_for_value,
                 ))
