@@ -18,6 +18,7 @@ That makes PRS interesting architecturally, but it currently needs much more wal
 | Model | Package | Params | Self-play |
 |-------|---------|--------|-----------|
 | FNN (recommended default) | `hive_fnn` | 1.0K – 18.8K | Gumbel-root MCTS / PUCT MCTS |
+| Hybrid GNN (experimental) | `hive_hybrid_gnn` | 80K+ | FNN policy + graph value trunk |
 | PRS Transformer (research path) | `hive_prs` | 1.7M / 9.8M | Gumbel-root MCTS (v3 default trunk) |
 
 All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels for move generation, state encoding, and legal move lookup.
@@ -334,6 +335,58 @@ The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 
 ---
 
+## Hybrid GNN (experimental FNN policy + graph value)
+
+The hybrid GNN research direction lives in `hive_hybrid_gnn`.
+
+The hybrid model keeps the part of FNN that has worked best:
+
+- root and successor states are encoded as `110`-dim FNN feature vectors
+- policy logits come from the FNN successor-conditioned action tower
+- a trained FNN policy can be copied into the hybrid model's `fnn` submodule
+
+It changes the value side:
+
+- the value head receives the FNN root embedding
+- it also receives a pooled graph embedding over the full board state
+- graph nodes include all board pieces, including buried stack pieces, plus grouped hand nodes
+- graph edges connect vertical stack neighbors and nearby top pieces
+
+The default graph radius is `2`, so a top piece connects to occupied cells
+within the 18 hexes at distance 1 or 2. Radius 1 is still available and gives
+the classic 6-neighbor local graph. Radius 2 increases the edge count, but it
+should improve message passing because two-step tactical motifs are available
+in a single layer rather than requiring an additional round of propagation.
+
+Current status:
+
+- model scaffold is implemented
+- CPU `GameState` graph encoding is implemented for prototyping
+- CUDA `HiveState` graph encoding is implemented as a padded batched tensor path for training/search integration
+- GPU-native self-play and training are implemented through `hive_hybrid_gnn.train_hybrid`
+- the trainer reuses the FNN raw-state replay format and rebuilds FNN features, successor features, and graph tensors on GPU
+- this is intended as a lighter alternative to giving the value head a full PRS transformer trunk
+
+Quick smoke test:
+
+```bash
+python3.11 -m hive_hybrid_gnn.train_hybrid \
+  --preset small \
+  --iterations 1 \
+  --games 32 \
+  --simulations 64 \
+  --gumbel-considered 16 \
+  --checkpoint-dir checkpoints_hybrid_gnn_smoke
+```
+
+Quick parameter summary:
+
+```bash
+python3.11 -m hive_hybrid_gnn
+```
+
+---
+
 ## PRS Transformer (Piece-Relative Space, current default trunk: v3)
 
 PRS is the experimental line in this repository. Its goal is to learn a richer
@@ -596,6 +649,9 @@ hive_fnn/          # HiveGo-style FNN with multiple search paths
   fnn_puct_orchestrator.py  # Plain PUCT MCTS tree search
   fnn_trainer.py       # FNNTrainer training loop
   train_fnn.py         # CLI entry point
+hive_hybrid_gnn/   # Experimental FNN policy + graph value model
+  hybrid_gnn_net.py    # HiveHybridGNN
+  graph_encoder.py     # CPU GameState -> radius-1/radius-2 graph encoder
 tests/             # Test suite (250+ tests)
 archive/           # Archived legacy models, diagnostics, and old CPU training code
 Dockerfile         # Container for cloud/RunPod deployment

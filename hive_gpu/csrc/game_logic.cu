@@ -310,6 +310,112 @@ encode_states_batch(at::Tensor states_tensor, int batch_size) {
     );
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+hybrid_gnn_encode_batch(at::Tensor states_tensor, int batch_size, int radius) {
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto opts_i = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto opts_l = at::TensorOptions().dtype(c10::kLong).device(c10::kCUDA);
+    auto opts_b = at::TensorOptions().dtype(c10::kBool).device(c10::kCUDA);
+
+    auto node_features = at::zeros(
+        {batch_size, HYBRID_MAX_NODES, HYBRID_NODE_FEAT_DIM}, opts_f);
+    auto edge_src = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_l);
+    auto edge_dst = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_l);
+    auto edge_features = at::zeros(
+        {batch_size, HYBRID_MAX_EDGES, HYBRID_EDGE_FEAT_DIM}, opts_f);
+    auto node_mask = at::zeros({batch_size, HYBRID_MAX_NODES}, opts_b);
+    auto edge_mask = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_b);
+    auto global_features = at::zeros(
+        {batch_size, HYBRID_GLOBAL_FEAT_DIM}, opts_f);
+    auto num_nodes = at::zeros({batch_size}, opts_i);
+    auto num_edges = at::zeros({batch_size}, opts_i);
+
+    HiveState* states_ptr = reinterpret_cast<HiveState*>(states_tensor.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    hybrid_gnn_encode_states_kernel<<<blocks, threads>>>(
+        states_ptr,
+        nullptr,
+        nullptr,
+        static_cast<float*>(node_features.data_ptr()),
+        static_cast<int64_t*>(edge_src.data_ptr()),
+        static_cast<int64_t*>(edge_dst.data_ptr()),
+        static_cast<float*>(edge_features.data_ptr()),
+        static_cast<bool*>(node_mask.data_ptr()),
+        static_cast<bool*>(edge_mask.data_ptr()),
+        static_cast<float*>(global_features.data_ptr()),
+        static_cast<int*>(num_nodes.data_ptr()),
+        static_cast<int*>(num_edges.data_ptr()),
+        batch_size,
+        radius,
+        false
+    );
+
+    return std::make_tuple(
+        node_features, edge_src, edge_dst, edge_features,
+        node_mask, edge_mask, global_features, num_nodes, num_edges
+    );
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+hybrid_gnn_encode_with_moves_batch(
+    at::Tensor states_tensor,
+    at::Tensor legal_moves_tensor,
+    at::Tensor num_legal_tensor,
+    int batch_size,
+    int radius
+) {
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto opts_i = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto opts_l = at::TensorOptions().dtype(c10::kLong).device(c10::kCUDA);
+    auto opts_b = at::TensorOptions().dtype(c10::kBool).device(c10::kCUDA);
+
+    auto node_features = at::zeros(
+        {batch_size, HYBRID_MAX_NODES, HYBRID_NODE_FEAT_DIM}, opts_f);
+    auto edge_src = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_l);
+    auto edge_dst = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_l);
+    auto edge_features = at::zeros(
+        {batch_size, HYBRID_MAX_EDGES, HYBRID_EDGE_FEAT_DIM}, opts_f);
+    auto node_mask = at::zeros({batch_size, HYBRID_MAX_NODES}, opts_b);
+    auto edge_mask = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_b);
+    auto global_features = at::zeros(
+        {batch_size, HYBRID_GLOBAL_FEAT_DIM}, opts_f);
+    auto num_nodes = at::zeros({batch_size}, opts_i);
+    auto num_edges = at::zeros({batch_size}, opts_i);
+
+    HiveState* states_ptr = reinterpret_cast<HiveState*>(states_tensor.data_ptr());
+    GPUMove* legal_moves_ptr = reinterpret_cast<GPUMove*>(legal_moves_tensor.data_ptr());
+    int* num_legal_ptr = static_cast<int*>(num_legal_tensor.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    hybrid_gnn_encode_states_kernel<<<blocks, threads>>>(
+        states_ptr,
+        legal_moves_ptr,
+        num_legal_ptr,
+        static_cast<float*>(node_features.data_ptr()),
+        static_cast<int64_t*>(edge_src.data_ptr()),
+        static_cast<int64_t*>(edge_dst.data_ptr()),
+        static_cast<float*>(edge_features.data_ptr()),
+        static_cast<bool*>(node_mask.data_ptr()),
+        static_cast<bool*>(edge_mask.data_ptr()),
+        static_cast<float*>(global_features.data_ptr()),
+        static_cast<int*>(num_nodes.data_ptr()),
+        static_cast<int*>(num_edges.data_ptr()),
+        batch_size,
+        radius,
+        true
+    );
+
+    return std::make_tuple(
+        node_features, edge_src, edge_dst, edge_features,
+        node_mask, edge_mask, global_features, num_nodes, num_edges
+    );
+}
+
 /**
  * Generate legal action masks for the 29407-dim action space.
  * Calls move generation internally, then maps moves to action indices.
