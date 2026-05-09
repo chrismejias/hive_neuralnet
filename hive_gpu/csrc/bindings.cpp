@@ -31,6 +31,17 @@ torch::Tensor check_results_batch(torch::Tensor states_tensor, int batch_size);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 encode_states_batch(torch::Tensor states_tensor, int batch_size);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+hybrid_gnn_encode_batch(torch::Tensor states_tensor, int batch_size, int radius);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+hybrid_gnn_encode_with_moves_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    int batch_size,
+    int radius);
 std::tuple<torch::Tensor, torch::Tensor> generate_legal_mask_batch(
     torch::Tensor states_tensor, int batch_size);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> generate_legal_moves_and_mask_batch(
@@ -228,6 +239,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Encode batch of HiveStates into NN input features",
           py::arg("states"), py::arg("batch_size"));
 
+    m.def("hybrid_gnn_encode_batch", &hive_gpu::hybrid_gnn_encode_batch,
+          "Encode HiveStates into padded graph tensors for the hybrid GNN",
+          py::arg("states"), py::arg("batch_size"), py::arg("radius") = 2);
+    m.def("hybrid_gnn_encode_with_moves_batch", &hive_gpu::hybrid_gnn_encode_with_moves_batch,
+          "Encode HiveStates into padded graph tensors using a precomputed legal move list",
+          py::arg("states"), py::arg("legal_moves"), py::arg("num_legal"),
+          py::arg("batch_size"), py::arg("radius") = 2);
+
     m.def("generate_legal_mask_batch", &hive_gpu::generate_legal_mask_batch,
           "Generate legal action masks (29407-dim) for a batch of states",
           py::arg("states"), py::arg("batch_size"));
@@ -355,6 +374,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("NODE_FEAT_DIM") = hive_gpu::NODE_FEAT_DIM;
     m.attr("EDGE_FEAT_DIM") = hive_gpu::EDGE_FEAT_DIM;
     m.attr("GLOBAL_FEAT_DIM") = hive_gpu::GLOBAL_FEAT_DIM;
+    m.attr("HYBRID_MAX_NODES") = hive_gpu::HYBRID_MAX_NODES;
+    m.attr("HYBRID_MAX_EDGES") = hive_gpu::HYBRID_MAX_EDGES;
+    m.attr("HYBRID_NODE_FEAT_DIM") = hive_gpu::HYBRID_NODE_FEAT_DIM;
+    m.attr("HYBRID_EDGE_FEAT_DIM") = hive_gpu::HYBRID_EDGE_FEAT_DIM;
+    m.attr("HYBRID_GLOBAL_FEAT_DIM") = hive_gpu::HYBRID_GLOBAL_FEAT_DIM;
     m.attr("ENC_GRID") = hive_gpu::ENC_GRID;
     m.attr("ACTION_SPACE_SIZE") = hive_gpu::ACTION_SPACE_SIZE;
     m.attr("PASS_ACTION_INDEX") = hive_gpu::PASS_ACTION_INDEX;
