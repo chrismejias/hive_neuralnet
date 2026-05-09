@@ -21,8 +21,13 @@ import torch
 
 import hive_gpu
 from hive_prs.prs_encoder import PRSEncoder
+from hive_prs.action_space import MAX_BOARD
+from hive_prs.prs_aux_targets import compute_articulation_target
 from hive_prs.prs_replay_buffer_v2 import PRSTrainingExampleV2
-from hive_prs.slot_map import N_SLOTS, PASS_SLOT, NEIGHBORS, HEIGHT_OFFSET, map_legal_moves
+from hive_prs.slot_map import (
+    N_SLOTS, PASS_SLOT, NEIGHBORS, HEIGHT_OFFSET,
+    decode_top_colors_and_types, map_legal_moves,
+)
 
 _OFF_TURN = 3412  # byte offset of turn counter in HiveState
 _OFF_QUEEN_CELL = 3392
@@ -241,48 +246,35 @@ class PRSMCTSOrchestratorV2:
         self,
         state_bytes: np.ndarray,
         completed: bool,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        heights = state_bytes[HEIGHT_OFFSET:HEIGHT_OFFSET + 529]
-        occ_cells = np.where(heights > 0)[0].astype(np.int32)
-        n = int(occ_cells.shape[0])
-        target = np.zeros((n, 2), dtype=np.float32)
-        mask = np.zeros(2, dtype=np.float32)
-        if not completed or n == 0:
-            return target, mask
-
-        cell_to_idx = {int(cell): idx for idx, cell in enumerate(occ_cells)}
+    ) -> np.ndarray:
+        target = np.zeros(32, dtype=np.float32)
+        if not completed:
+            return target
+        top_color, top_type, heights = decode_top_colors_and_types(state_bytes)
         queen_cells = state_bytes[_OFF_QUEEN_CELL:_OFF_QUEEN_CELL + 4].view(np.uint16)
-        for color in range(2):
-            qc = int(queen_cells[color])
+        for queen_color in range(2):
+            qc = int(queen_cells[queen_color])
             if qc == 0xFFFF:
                 continue
-            mask[color] = 1.0
             for d in range(6):
                 nb = int(NEIGHBORS[qc, d])
                 if nb >= 0 and int(heights[nb]) > 0:
-                    idx = cell_to_idx.get(nb)
-                    if idx is not None:
-                        target[idx, color] = 1.0
-        return target, mask
+                    pt = int(top_type[nb])
+                    pc = int(top_color[nb])
+                    if pt > 0 and pc >= 0:
+                        target[queen_color * 16 + pc * 8 + (pt - 1)] += 1.0
+        return target
 
-    def _compute_final_mobility_targets(
+    def _compute_mobility_count_vectors(
         self,
-        states: torch.Tensor,
-        final_results: np.ndarray,
-        B: int,
+        step_states: list[np.ndarray],
     ) -> list[np.ndarray]:
-        states_np = states.cpu().numpy()
-        targets = [
-            np.zeros(int(np.count_nonzero(sb[HEIGHT_OFFSET:HEIGHT_OFFSET + 529])), dtype=np.float32)
-            for sb in states_np
-        ]
+        if not step_states:
+            return []
+        targets = [np.zeros(16, dtype=np.float32) for _ in step_states]
 
-        completed = [i for i, result in enumerate(final_results.tolist()) if int(result) != 0]
-        if not completed:
-            return targets
-
-        dup_states = np.stack([states_np[i].copy() for i in completed for _ in range(2)], axis=0)
-        for j in range(len(completed)):
+        dup_states = np.stack([sb.copy() for sb in step_states for _ in range(2)], axis=0)
+        for j in range(len(step_states)):
             for color in range(2):
                 row = dup_states[2 * j + color]
                 turn = int(row[_OFF_TURN]) | (int(row[_OFF_TURN + 1]) << 8)
@@ -295,24 +287,26 @@ class PRSMCTSOrchestratorV2:
         legal_np = legal_t.cpu().numpy()
         nlegal_np = nlegal_t.cpu().numpy()
 
-        for j, game_idx in enumerate(completed):
-            sb = states_np[game_idx]
-            heights = sb[HEIGHT_OFFSET:HEIGHT_OFFSET + 529]
-            occ_cells = np.where(heights > 0)[0].astype(np.int32)
-            cell_to_idx = {int(cell): idx for idx, cell in enumerate(occ_cells)}
-            fm = np.zeros(int(occ_cells.shape[0]), dtype=np.float32)
+        for j, sb in enumerate(step_states):
+            top_color, top_type, _ = decode_top_colors_and_types(sb)
+            fm = np.zeros(16, dtype=np.float32)
             for color in range(2):
                 row_idx = 2 * j + color
                 nlegal = int(nlegal_np[row_idx])
                 row_moves = legal_np[row_idx, :nlegal]
+                seen: set[int] = set()
                 for mv in row_moves:
                     if int(mv[0]) != 1:
                         continue
                     from_cell = int(mv[2]) | (int(mv[3]) << 8)
-                    tok_idx = cell_to_idx.get(from_cell)
-                    if tok_idx is not None:
-                        fm[tok_idx] = 1.0
-            targets[game_idx] = fm
+                    if from_cell in seen:
+                        continue
+                    seen.add(from_cell)
+                    pt = int(top_type[from_cell])
+                    pc = int(top_color[from_cell])
+                    if pt > 0 and pc >= 0:
+                        fm[pc * 8 + (pt - 1)] += 1.0
+            targets[j] = fm
         return targets
 
     # ── Public API ───────────────────────────────────────────────────
@@ -635,12 +629,29 @@ class PRSMCTSOrchestratorV2:
 
         final_results = self.ext.check_results_batch(states, B).cpu().numpy()
         states_np = states.cpu().numpy()
-        final_mobility = self._compute_final_mobility_targets(states, final_results, B)
-        final_queen_surround = [
-            self._compute_queen_surround_target(states_np[i], int(final_results[i]) != 0)
-            for i in range(B)
-        ]
-        return self._build_examples(histories, final_results, final_mobility, final_queen_surround)
+        queen_surround_targets: list[np.ndarray] = []
+        final_mobility_targets: list[np.ndarray] = []
+        for i, history in enumerate(histories):
+            if int(final_results[i]) == 0 or not history:
+                queen_surround_targets.append(np.zeros(32, dtype=np.float32))
+                final_mobility_targets.append(np.zeros(32, dtype=np.float32))
+                continue
+            queen_surround_targets.append(
+                self._compute_queen_surround_target(states_np[i], True)
+            )
+            tail_start = max(0, len(history) - 2)
+            tail_states = [history[idx]["state_bytes"] for idx in range(tail_start, len(history))]
+            tail_counts = self._compute_mobility_count_vectors(tail_states)
+            packed = np.zeros(32, dtype=np.float32)
+            if len(tail_counts) == 1:
+                packed[16:] = tail_counts[0]
+            elif len(tail_counts) >= 2:
+                packed[:16] = tail_counts[-2]
+                packed[16:] = tail_counts[-1]
+            final_mobility_targets.append(packed)
+        return self._build_examples(
+            histories, final_results, final_mobility_targets, queen_surround_targets,
+        )
 
     # ── Tree expansion / simulations (same as v1) ────────────────────
 
@@ -1090,7 +1101,7 @@ class PRSMCTSOrchestratorV2:
         histories:     list[list[dict]],
         final_results: np.ndarray,
         final_mobility: list[np.ndarray],
-        final_queen_surround: list[tuple[np.ndarray, np.ndarray]],
+        final_queen_surround: list[np.ndarray],
     ) -> list[list[PRSTrainingExampleV2]]:
         all_examples: list[list[PRSTrainingExampleV2]] = []
         for i, history in enumerate(histories):
@@ -1108,25 +1119,9 @@ class PRSMCTSOrchestratorV2:
                 else:
                     value = -1.0 if player_is_white else 1.0
 
-                nbt = int(step["num_board_tokens"])
-                is_final = (step_idx == num_steps - 1)
-                if is_final and result != 0:
-                    qs_target, qs_mask = final_queen_surround[i]
-                    if qs_target.shape[0] != nbt:
-                        qs_target = np.zeros((nbt, 2), dtype=np.float32)
-                        qs_mask = np.zeros(2, dtype=np.float32)
-                else:
-                    qs_target = np.zeros((nbt, 2), dtype=np.float32)
-                    qs_mask = np.zeros(2, dtype=np.float32)
-
-                if is_final and result != 0:
-                    fm_target = final_mobility[i]
-                    fm_mask = 1.0 if fm_target.shape[0] == nbt else 0.0
-                    if fm_target.shape[0] != nbt:
-                        fm_target = np.zeros(nbt, dtype=np.float32)
-                else:
-                    fm_target = np.zeros(nbt, dtype=np.float32)
-                    fm_mask = 0.0
+                art_target, art_mask = compute_articulation_target(
+                    step["state_bytes"], MAX_BOARD,
+                )
 
                 game_exs.append(PRSTrainingExampleV2(
                     token_features   = step["token_features"],
@@ -1143,10 +1138,8 @@ class PRSMCTSOrchestratorV2:
                     num_occupied     = step["num_occupied"],
                     slot_target      = step["slot_target"],
                     legal_mask       = step["legal_mask"],
-                    queen_surround_target = qs_target,
-                    queen_surround_mask   = qs_mask,
-                    final_mobility_target = fm_target,
-                    final_mobility_mask   = fm_mask,
+                    articulation_target = art_target,
+                    articulation_mask   = art_mask,
                     value_target     = value,
                     use_for_value    = use_for_value,
                 ))

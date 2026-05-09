@@ -49,6 +49,7 @@ from hive_fnn.fnn_network import HiveFNN
 from hive_fnn.fnn_puct_orchestrator import FNNPUCTConfig, FNNPUCTOrchestrator
 from hive_prs.prs_mcts_orchestrator_v2 import PRSMCTSConfigV2, PRSMCTSOrchestratorV2
 from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
+from hive_prs.prs_transformer_v3 import HivePRSTransformerV3
 from hive_prs.slot_map import N_SLOTS
 
 ModelType = Literal["fnn", "prs"]
@@ -90,14 +91,34 @@ def default_wave_size(model_type: ModelType) -> int:
     return 4 if model_type == "fnn" else 16
 
 
+def parse_wave_schedule(spec: str | None) -> list[int] | None:
+    if spec is None:
+        return None
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    if not parts:
+        return None
+    return [max(1, int(p)) for p in parts]
+
+
 def load_checkpoint(model_type: ModelType, path: str) -> torch.nn.Module:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if model_type == "fnn":
         net = HiveFNN(ckpt["net_config"]).cuda().eval()
         net.load_state_dict(ckpt["model_state_dict"])
     else:
-        net = HivePRSTransformerV2(ckpt["net_config"]).cuda().eval()
-        net.load_state_dict(ckpt["model_state"])
+        prs_version = ckpt.get("model_version", "v2")
+        net_cls = HivePRSTransformerV3 if prs_version == "v3" else HivePRSTransformerV2
+        net = net_cls(ckpt["net_config"]).cuda().eval()
+        model_state = ckpt["model_state"]
+        current = net.state_dict()
+        filtered_state = {}
+        for key, tensor in model_state.items():
+            if key not in current:
+                continue
+            if current[key].shape != tensor.shape:
+                continue
+            filtered_state[key] = tensor
+        net.load_state_dict(filtered_state, strict=False)
     return net
 
 
@@ -283,6 +304,55 @@ def choose_prs_moves(
     return chosen
 
 
+def choose_prs_policy_moves(
+    orch: PRSMCTSOrchestratorV2,
+    states: torch.Tensor,
+    move_numbers: np.ndarray | None = None,
+    stochastic: bool = False,
+    gumbel_noise_scale: float = 0.0,
+) -> np.ndarray:
+    B = int(states.shape[0])
+    cfg = orch.config
+    prs_batch = orch.encoder.encode_batch(states, B)
+    legal_t, nlegal_t = orch.ext.generate_legal_moves_batch(states, B)
+    nlegal_np = nlegal_t.cpu().numpy()
+
+    kernel_out = orch._classify_kernel(states, legal_t, nlegal_t, B)
+    slot_of_legal_t = kernel_out[8]
+    policy_logits_813, _ = orch._net_forward(prs_batch, kernel_out, B)
+    policy_logits_813 = policy_logits_813.float()
+    priors_per_legal, root_logit_per_legal = orch._build_legal_priors_v2(
+        policy_logits_813, slot_of_legal_t, B,
+    )
+
+    nlegal_t_gpu = nlegal_t.to(torch.int64)
+    valid_slot = torch.arange(orch._max_legal, device="cuda").unsqueeze(0) < nlegal_t_gpu.unsqueeze(1)
+    if gumbel_noise_scale > 0.0:
+        u = torch.rand(B, orch._max_legal, device="cuda").clamp(1e-4, 1 - 1e-4)
+        gumbel = -torch.log(-torch.log(u)) * gumbel_noise_scale
+        scores = torch.where(valid_slot, root_logit_per_legal + gumbel, torch.full_like(root_logit_per_legal, -1e30))
+    else:
+        scores = torch.where(valid_slot, priors_per_legal, torch.full_like(priors_per_legal, -1.0))
+
+    chosen = np.zeros(B, dtype=np.int64)
+    for i in range(B):
+        n_i = int(nlegal_np[i])
+        if n_i <= 0:
+            chosen[i] = 0
+            continue
+        row_scores = scores[i, :n_i]
+        if stochastic and move_numbers is not None and int(move_numbers[i]) < cfg.temperature_drop_move:
+            if gumbel_noise_scale > 0.0:
+                probs = torch.softmax(row_scores.float(), dim=0)
+            else:
+                probs = row_scores.float().clamp_min(0)
+                probs = probs / probs.sum().clamp_min(1e-8)
+            chosen[i] = int(torch.multinomial(probs, 1).item())
+        else:
+            chosen[i] = int(torch.argmax(row_scores).item())
+    return chosen
+
+
 def choose_fnn_moves(
     orch: FNNMCTSOrchestrator | FNNPUCTOrchestrator,
     states: torch.Tensor,
@@ -361,7 +431,14 @@ def choose_fnn_moves(
         sims_per_round = max(1, cfg.num_simulations // n_rounds)
 
         for _ in range(n_rounds):
-            round_wave_size = orch.config.wave_size if cfg.wave_parallel else 1
+            if cfg.wave_parallel:
+                custom_schedule = getattr(cfg, "wave_schedule", None)
+                if custom_schedule:
+                    round_wave_size = custom_schedule[min(_, len(custom_schedule) - 1)]
+                else:
+                    round_wave_size = orch.config.wave_size
+            else:
+                round_wave_size = 1
             orch._run_simulations(
                 tree, states, active_t, alive_mask, B, sims_per_round,
                 wave_size=round_wave_size,
@@ -430,6 +507,55 @@ def choose_fnn_moves(
             k = int(chosen_np[i])
             out[i] = 0 if k >= n_i else k
     return out
+
+
+def choose_fnn_policy_moves(
+    orch: FNNMCTSOrchestrator | FNNPUCTOrchestrator,
+    states: torch.Tensor,
+    move_numbers: np.ndarray | None = None,
+    stochastic: bool = False,
+    gumbel_noise_scale: float = 0.0,
+) -> np.ndarray:
+    B = int(states.shape[0])
+    if isinstance(orch, FNNPUCTOrchestrator):
+        cfg = orch.config
+        max_legal = orch._max_legal
+    else:
+        cfg = orch.config
+        max_legal = orch._max_legal
+
+    legal_moves, num_legal, root_features = orch.ext.generate_legal_moves_and_fnn_features_batch(states, B)
+    priors_per_legal, _root_vals, _child_q = orch._eval_states(
+        states, legal_moves, num_legal, B, root_features,
+    )
+    nlegal_np = num_legal.cpu().numpy()
+    nlegal_t = num_legal.to(torch.int64)
+    valid_slot = torch.arange(max_legal, device="cuda").unsqueeze(0) < nlegal_t.unsqueeze(1)
+    safe_prior = priors_per_legal.clamp(min=1e-20)
+    legal_logits = torch.where(valid_slot, safe_prior.log(), torch.full_like(priors_per_legal, -1e30))
+    if gumbel_noise_scale > 0.0:
+        u = torch.rand(B, max_legal, device="cuda").clamp(1e-4, 1 - 1e-4)
+        scores = legal_logits + (-torch.log(-torch.log(u)) * gumbel_noise_scale)
+    else:
+        scores = torch.where(valid_slot, priors_per_legal, torch.full_like(priors_per_legal, -1.0))
+
+    chosen = np.zeros(B, dtype=np.int64)
+    for i in range(B):
+        n_i = int(nlegal_np[i])
+        if n_i <= 0:
+            chosen[i] = 0
+            continue
+        row_scores = scores[i, :n_i]
+        if stochastic and move_numbers is not None and int(move_numbers[i]) < cfg.temperature_drop_move:
+            if gumbel_noise_scale > 0.0:
+                probs = torch.softmax(row_scores.float(), dim=0)
+            else:
+                probs = row_scores.float().clamp_min(0)
+                probs = probs / probs.sum().clamp_min(1e-8)
+            chosen[i] = int(torch.multinomial(probs, 1).item())
+        else:
+            chosen[i] = int(torch.argmax(row_scores).item())
+    return chosen
 
 
 def choose_fnn_puct_moves(
@@ -533,7 +659,24 @@ def choose_moves(
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
     gumbel_noise_scale: float = 0.0,
+    policy_only: bool = False,
 ) -> np.ndarray:
+    if policy_only:
+        if model_type == "fnn":
+            return choose_fnn_policy_moves(
+                orch,
+                states,
+                move_numbers=move_numbers,
+                stochastic=stochastic,
+                gumbel_noise_scale=gumbel_noise_scale,
+            )
+        return choose_prs_policy_moves(
+            orch,
+            states,
+            move_numbers=move_numbers,
+            stochastic=stochastic,
+            gumbel_noise_scale=gumbel_noise_scale,
+        )
     if model_type == "fnn":
         return choose_fnn_moves(
             orch,
@@ -582,8 +725,22 @@ def main() -> None:
     ap.add_argument("--black-k", type=int, default=None)
     ap.add_argument("--white-wave-size", type=int, default=None)
     ap.add_argument("--black-wave-size", type=int, default=None)
+    ap.add_argument(
+        "--white-fnn-wave-schedule",
+        type=str,
+        default=None,
+        help="Comma-separated per-round FNN wave sizes for white/model A, e.g. 1,2,4,8,16",
+    )
+    ap.add_argument(
+        "--black-fnn-wave-schedule",
+        type=str,
+        default=None,
+        help="Comma-separated per-round FNN wave sizes for black/model B, e.g. 2,4,8,16",
+    )
     ap.add_argument("--white-puct", action="store_true", default=False)
     ap.add_argument("--black-puct", action="store_true", default=False)
+    ap.add_argument("--white-policy-only", action="store_true", default=False)
+    ap.add_argument("--black-policy-only", action="store_true", default=False)
     ap.add_argument("--white-c-puct", type=float, default=None)
     ap.add_argument("--black-c-puct", type=float, default=None)
     ap.add_argument("--wave-parallel", action=argparse.BooleanOptionalAction, default=True)
@@ -631,6 +788,8 @@ def main() -> None:
     black_wave_size = (
         args.black_wave_size if args.black_wave_size is not None else default_wave_size(args.black_model)
     )
+    white_wave_schedule = parse_wave_schedule(args.white_fnn_wave_schedule)
+    black_wave_schedule = parse_wave_schedule(args.black_fnn_wave_schedule)
 
     white_orch, white_cfg = build_orchestrator(
         args.white_model, white_net, args.games, white_sims, white_k, args.wave_parallel,
@@ -648,6 +807,10 @@ def main() -> None:
         c_puct=args.black_c_puct,
         eval_mode=eval_mode,
     )
+    if args.white_model == "fnn":
+        setattr(white_cfg, "wave_schedule", white_wave_schedule)
+    if args.black_model == "fnn":
+        setattr(black_cfg, "wave_schedule", black_wave_schedule)
     ext = hive_gpu.load_extension()
 
     B = args.games
@@ -690,6 +853,7 @@ def main() -> None:
                 move_numbers=move_numbers[idx],
                 stochastic=args.stochastic,
                 gumbel_noise_scale=args.gumbel_noise_scale,
+                policy_only=args.white_policy_only if model_type == args.white_model and orch is white_orch else args.black_policy_only,
             )
             legal_t, nlegal_t = orch.ext.generate_legal_moves_batch(sub_states, idx.size)
             legal_np = legal_t.cpu().numpy()
@@ -776,6 +940,8 @@ def main() -> None:
         f"white_k={white_k}, black_k={black_k}, "
         f"white_root={'puct' if args.white_puct else 'gumbel'}, "
         f"black_root={'puct' if args.black_puct else 'gumbel'}, "
+        f"white_policy_only={args.white_policy_only}, "
+        f"black_policy_only={args.black_policy_only}, "
         f"white_c_puct={getattr(white_cfg, 'c_puct', 'n/a')}, "
         f"black_c_puct={getattr(black_cfg, 'c_puct', 'n/a')}, "
         f"white_wave_size={white_cfg.wave_size if hasattr(white_cfg, 'wave_size') else 'n/a'}, "

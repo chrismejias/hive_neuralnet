@@ -1,13 +1,24 @@
 # Hive Neural Network
 
-AlphaZero-style self-play training for the board game [Hive](https://en.wikipedia.org/wiki/Hive_(game)), focused on the PRS and FNN models plus a GPU-native game engine.
+AlphaZero-style self-play training for the board game [Hive](https://en.wikipedia.org/wiki/Hive_(game)), focused on a fast recommended FNN engine, an experimental PRS transformer line, and a shared GPU-native game engine.
+
+## Recommended Engine
+
+**FNN is the default recommended engine.** It is the strongest and most practical training path in this repository today: it is much faster, reaches strong play with far less compute, and benefits from a compact handcrafted state representation that already encodes a lot of useful Hive structure.
+
+**PRS is a work in progress research engine.** It learns a richer board representation from scratch and is therefore slower in two ways:
+
+- each search evaluation is much heavier than FNN
+- it has to spend training capacity learning useful board and legality structure that FNN already gets from engineered features
+
+That makes PRS interesting architecturally, but it currently needs much more wall-clock time to approach the same strength.
 
 ## Architecture Overview
 
 | Model | Package | Params | Self-play |
 |-------|---------|--------|-----------|
-| PRS Transformer | `hive_prs` | 1.3M / 9.7M | Gumbel-root MCTS (v2 default) |
-| FNN (HiveGo-style) | `hive_fnn` | 1.0K – 18.8K | Gumbel-root MCTS / PUCT MCTS |
+| FNN (recommended default) | `hive_fnn` | 1.0K – 18.8K | Gumbel-root MCTS / PUCT MCTS |
+| PRS Transformer (research path) | `hive_prs` | 1.7M / 9.8M | Gumbel-root MCTS (v3 default trunk) |
 
 All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels for move generation, state encoding, and legal move lookup.
 
@@ -16,6 +27,8 @@ All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels fo
 - Python 3.11+
 - PyTorch 2.4+ (tested with 2.10.0+cu128)
 - CUDA 12.4+ / driver supporting CUDA 12.8
+
+If you do not have an NVIDIA GPU, the repository also includes a **single-game CPU FNN fallback** for play and analysis. It is much slower than the GPU engine and is not used for self-play training, but it does let you play against the recommended FNN model on CPU-only machines.
 
 ## Setup
 
@@ -58,34 +71,39 @@ pip install -e hive_gpu/
 
 Or if a prebuilt `.pyd`/`.so` is already present in `hive_gpu/`, it loads automatically.
 
+## Playing Against The Engine
+
+For the recommended GUI path on a machine without an NVIDIA GPU, use the CPU FNN fallback:
+
+```bash
+cd /workspace/hive_neuralnet
+python3.11 gui.py \
+  --engine fnn-cpu \
+  --checkpoint checkpoints_fnn/resume0500_24576/hive_fnn_checkpoint_0500.pt \
+  --simulations 256 \
+  --root-workers 2
+```
+
+There is also a text-mode CPU player:
+
+```bash
+cd /workspace/hive_neuralnet
+python3.11 play_fnn_cpu.py \
+  --checkpoint checkpoints_fnn/resume0500_24576/hive_fnn_checkpoint_0500.pt \
+  --mode human_vs_ai \
+  --simulations 256 \
+  --gumbel-root \
+  --root-workers 2
+```
+
+The old `gui.py --engine legacy` path is still available for the archived GNN / NNUE / transformer checkpoints, but the FNN CPU option is the recommended fallback when CUDA is unavailable.
+
 ## Long-Running Background Training
 
 Use `python -u`, redirect stdin from `/dev/null`, append both stdout and stderr
 to a log, and capture the PID. This is more reliable than a bare `nohup`
 because startup output is unbuffered and the process does not inherit an
 interactive stdin handle.
-
-PRS example:
-
-```bash
-cd /workspace/hive_neuralnet
-mkdir -p checkpoints_prs_v2
-
-nohup python3.11 -u -m hive_prs.train_prs \
-  --iterations 1000 \
-  --games 256 \
-  --simulations 256 \
-  --max-considered 16 \
-  --checkpoint-dir checkpoints_prs_v2 \
-  --checkpoint-keep-every 50 \
-  --resume checkpoints_prs_v2/prs_v2_iter_0500.pt \
-  --wave-parallel \
-  --deterministic-non-root \
-  --virtual-q-penalty 0.25 \
-  >> checkpoints_prs_v2/training.log 2>&1 < /dev/null &
-
-echo $!
-```
 
 FNN example:
 
@@ -108,11 +126,32 @@ nohup python3.11 -u -m hive_fnn.train_fnn \
 echo $!
 ```
 
+PRS example:
+
+```bash
+cd /workspace/hive_neuralnet
+mkdir -p checkpoints_prs_v3
+
+nohup python3.11 -u -m hive_prs.train_prs \
+  --model-version v3 \
+  --iterations 1000 \
+  --games 256 \
+  --simulations 256 \
+  --max-considered 16 \
+  --checkpoint-dir checkpoints_prs_v3 \
+  --checkpoint-keep-every 50 \
+  --resume checkpoints_prs_v2/prs_v2_iter_1500.pt \
+  --wave-parallel \
+  >> checkpoints_prs_v3/training.log 2>&1 < /dev/null &
+
+echo $!
+```
+
 Check that exactly one intended trainer is running:
 
 ```bash
 pgrep -af 'hive_prs.train_prs|train_prs|hive_fnn.train_fnn|train_fnn'
-tail -f checkpoints_prs_v2/training.log
+tail -f checkpoints_prs_v3/training.log
 ```
 
 If no process appears and the log does not update, run the same command in the
@@ -120,13 +159,14 @@ foreground first to catch startup errors:
 
 ```bash
 python3.11 -u -m hive_prs.train_prs \
+  --model-version v3 \
   --iterations 1000 \
   --games 256 \
   --simulations 256 \
   --max-considered 16 \
-  --checkpoint-dir checkpoints_prs_v2 \
+  --checkpoint-dir checkpoints_prs_v3 \
   --checkpoint-keep-every 50 \
-  --resume checkpoints_prs_v2/prs_v2_iter_0500.pt \
+  --resume checkpoints_prs_v2/prs_v2_iter_1500.pt \
   --wave-parallel
 ```
 
@@ -187,118 +227,9 @@ So the active PRS/FNN target is:
 3. **Non-root nodes are explored in an escalating wave-parallel fashion.**
    The paper's serial schedule shrinks the amount of parallel work as halving proceeds. On GPU, that leaves batch efficiency on the table. In this project, each later round increases the number of parallel sims per surviving root move so the total batch stays roughly constant. For example, PRS uses `1,2,4,8` waves per round and FNN uses `2,4,8,16`.
    
-## PRS Transformer (Piece-Relative Space, v2 default)
-
-The default PRS training path now uses **PRS v2**: a structured **813-slot legal-masked head** over dynamic legal move structure. This replaced the old fixed 6,841-action v1 head as the default `train_prs` path.
-
-### Architecture
-
-- **Tokenization:** up to `60` tokens per state
-  - `1` CLS token
-  - up to `28` board tokens, one per occupied cell / top piece
-  - up to `28` hand tokens
-- **Per-token input features:** `25` floats from the CUDA state encoder
-- **Global features:** `6` floats appended to the value head
-- **Positions:** absolute `23x23 = 529` board-cell ids plus one off-board sentinel
-- **Trunk:** token projection + learned position/type embeddings + Transformer encoder
-- **Value head:** CLS embedding + global features -> MLP -> `tanh`
-- **Policy head:** structured **813-slot** legal-masked head built around move geometry rather than a flat board-wide action lattice
-- **Auxiliary heads:** per-board-token `queen_surround` and `final_mobility` heads trained on completed non-capped games only
-
-The important design choice is the split between a generic board encoder and a structured action head. The transformer trunk learns a board representation from scratch, while the policy head does not score all theoretically possible actions. Instead it scores only a compact structured action basis derived from the current legal geometry.
-
-The 813 slots are:
-- `48` direction slots for queen / beetle / grasshopper / pillbug / mosquito local moves
-- `60` throw slots for pillbug-style throws
-- `448` long-move slots for ant / spider / ladybug / mosquito long-range moves
-- `256` hand-placement slots
-- `1` pass slot
-
-At runtime, the CUDA bridge maps the current legal moves into that 813-slot space, including:
-- which piece instances exist
-- which move / place cells are active
-- neighbor structure for those cells
-- destination structure for direction and throw moves
-
-This keeps the policy space compact without giving up a learned board representation.
-
-- **Small config** (default): about `1.66M` parameters — `d_model=128`, `heads=8`, `layers=6`, `dim_ff=512`
-- **Large config**: `d_model=256`, `heads=8`, `layers=12`, `dim_ff=1024`
-
-Legacy PRS v1 modules are archived under `archive/legacy_prs_v1`.
-
-### Search Pattern
-
-- **Default:** Gumbel-root MCTS tree search (`PRSMCTSOrchestratorV2`)
-- Sequential-halving rounds use final Gumbel sigma scoring (`gumbel + logits + sigma * Q`) for the played move, rather than visit-count argmax.
-- Wave-parallel MCTS is enabled by default with a hard-coded per-round schedule: `1, 2, 4, 8`. Use `--no-wave-parallel` for pure serial waves.
-- `--deterministic-non-root` enables the paper-style deterministic inner selection, with `--virtual-q-penalty` used to diversify wave-parallel sims.
-- The current training/profile defaults use `k=16`.
-- PRS v2 also trains two endgame auxiliary heads on **completed non-capped games only**:
-  - `queen_surround`: which top pieces end adjacent to each queen
-  - `final_mobility`: which top pieces are mobile in the completed final position
-- PRS enables TF32 matmul precision for the transformer trunk on supported GPUs.
-- `--compile-forward` can opt in to `torch.compile` for the tensor-only trunk/head path; it is off by default because Inductor can be unstable on some hosts.
-- Current `train_prs` path is v2-only; legacy PRS-v1 search paths are archived.
-- Policy target now matches FNN's visited-only improved policy: unvisited legal moves receive zero target mass.
-- Move-cap draws are excluded from value loss, while genuine draws are retained.
-- `profile_models.py` exposes `prs-small` and `prs-large` for direct preset comparison.
-
-### Training
-
-```bash
-# Quick benchmark (1 iteration, 128 games, 256 sims, k=16)
-python -m hive_prs.train_prs \
-  --iterations 1 --games 128 --simulations 256 --max-considered 16
-
-# Full training run
-python -m hive_prs.train_prs \
-  --iterations 1500 --games 128 --simulations 512 --max-considered 16 \
-  --checkpoint-dir checkpoints_prs_v2
-
-# Large model
-python -m hive_prs.train_prs \
-  --d-model 256 --num-heads 16 --num-layers 8 --dim-ff 1024 \
-  --iterations 1500 --games 128 --simulations 512 --max-considered 16 \
-  --checkpoint-dir checkpoints_prs_large
-
-# Compare small vs large
-python -m profile_models --models prs-small prs-large --games 256 --sims 256 --gumbel-k 16
-```
-
-### Performance (RTX 4090, small model)
-
-| Config | Self-play | Training | Total |
-|--------|-----------|----------|-------|
-| 128 games, 256 sims, k=16 | ~60s | ~34s | ~94s/iter |
-
-### PRS Key Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--iterations` | 1500 | Training iterations |
-| `--games` | 128 | Parallel self-play games per iteration |
-| `--simulations` | 512 | Gumbel simulation budget per move |
-| `--max-considered` | 16 | Root actions considered (k); rounds = ceil(log2(k)) |
-| `--wave-parallel` / `--no-wave-parallel` | on | Enable/disable PRS v2 per-round MCTS wave schedule (`1,2,4,8`) |
-| `--deterministic-non-root` / `--no-deterministic-non-root` | off | Use paper-style deterministic inner-node selection |
-| `--virtual-q-penalty` | 0.25 | Temporary Q penalty used to diversify deterministic wave-parallel sims |
-| `--compile-forward` / `--no-compile-forward` | off | Opt in to `torch.compile` for tensor-only trunk/head forward |
-| `--d-model` | 128 | Transformer hidden dimension |
-| `--num-heads` | 8 | Attention heads |
-| `--num-layers` | 6 | Transformer layers |
-| `--dim-ff` | 512 | Feed-forward hidden dimension |
-| `--expansion-mask` | 7 | Expansion piece mask: 0=base, 1=+Mosquito, 2=+Ladybug, 4=+Pillbug, 7=all |
-| `--augment-prob` | 0.5 | Probability of C6 rotational augmentation per training batch |
-| `--buffer-size` | 150000 | Replay buffer capacity |
-| `--checkpoint-dir` | checkpoints\_prs\_v2 | Checkpoint output directory |
-| `--resume` | — | Path to checkpoint to resume from |
-
----
-
 ## FNN (HiveGo-style Feedforward Network)
 
-A tiny feedforward network inspired by HiveGo's AlphaZeroFNN. The key idea: encode root + all successor states independently, then score each action as `f(root_emb ‖ successor_emb)`. The network never sees the actual board position, just a tiny set of abstracted features which keeps the network tiny and allows for very fast search. No action-space enumeration, no attention — just board features.
+This is the **recommended engine** for current use. It is inspired by HiveGo's AlphaZeroFNN. The key idea is to encode root + successor states independently, then score each action as `f(root_emb ‖ successor_emb)`. The network never sees the raw board directly; instead it operates on a compact engineered feature set. That keeps the network tiny, the search fast, and the training signal much more sample-efficient than PRS.
 
 ### Architecture
 
@@ -333,7 +264,7 @@ Global scalar features:
 
 ### GPU-Native Self-Play
 
-The active FNN trainer does **not** run the entire self-play loop in one fused kernel. The live path is a Python/Torch orchestrator (`FNNMCTSOrchestrator`) that repeatedly calls batched CUDA kernels for move generation, successor feature extraction, tree select/expand/backprop, and move application, while running the FNN forward pass in PyTorch on GPU.
+The live path is a Python/Torch orchestrator (`FNNMCTSOrchestrator`) that repeatedly calls batched CUDA kernels for move generation, successor feature extraction, tree select/expand/backprop, and move application, while running the FNN forward pass in PyTorch on GPU.
 
 There is also an experimental fused FNN self-play kernel in `hive_gpu/csrc/fnn_selfplay.cuh`, but it is not the current training path.
 
@@ -400,6 +331,152 @@ The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 | `--puct-wave-size` | 16 | Parallel MCTS simulations per wave for plain PUCT |
 | `--puct` | off | Use plain PUCT MCTS root policy instead of Gumbel root halving |
 | `--checkpoint-dir` | checkpoints\_fnn | Checkpoint output directory |
+
+---
+
+## PRS Transformer (Piece-Relative Space, current default trunk: v3)
+
+PRS is the experimental line in this repository. Its goal is to learn a richer
+board representation than the FNN, but in practice that means much slower
+self-play and training, and much slower strength gain. The PRS policy/value
+stack has to discover legality, geometry, and tactical structure from the board
+tokens themselves, while FNN already starts from handcrafted features that encode a lot of that structure cheaply. Based on current trends, this model will likely require months worth of RTX 4090 equievlent compute to equal the FNN. It remains to be seen whether it would eventually surpass the FNN.
+
+The active PRS policy head is still the structured **813-slot legal-masked**
+head introduced in v2. **PRS v3** keeps that same tokenization, value head,
+policy head, trainer, and search path, but replaces the trunk with custom
+encoder layers that add a learned per-head relative attention bias based on
+pairwise `23x23` board-cell offsets. Absolute cell embeddings are still
+present, so v3 is a hybrid absolute+relative design rather than a purely
+relative transformer.
+
+The relative bias tensors are zero-initialized, so PRS v2 checkpoints can be
+migrated to v3: all old trunk/head weights load, and only the new per-layer
+`relative_bias` parameters start fresh.
+
+### Architecture
+
+- **Tokenization:** up to `60` tokens per state
+  - `1` CLS token
+  - up to `28` board tokens, one per piece in board-stack order
+  - up to `28` hand tokens
+- **Per-token input features:** `25` floats from the CUDA state encoder
+- **Global features:** `6` floats appended to the value head
+- **Positions:** absolute `23x23 = 529` board-cell ids plus one off-board sentinel
+- **Trunk (v2):** token projection + learned absolute position/type embeddings + Transformer encoder
+- **Trunk (v3):** the same, plus learned per-head relative attention bias from clipped board-cell offsets
+- **Value head:** CLS embedding + global features -> MLP -> `tanh`
+- **Policy head:** structured **813-slot** legal-masked head built around move geometry rather than a flat board-wide action lattice
+
+The important design choice is the split between a generic board encoder and a structured action head. The transformer trunk learns a board representation from scratch, while the policy head does not score all theoretically possible actions. Instead it scores only a compact structured action basis derived from the current legal geometry.
+
+The 813 slots are:
+- `48` direction slots for queen / beetle / grasshopper / pillbug / mosquito local moves
+- `60` throw slots for pillbug-style throws
+- `448` long-move slots for ant / spider / ladybug / mosquito long-range moves
+- `256` hand-placement slots
+- `1` pass slot
+
+At runtime, the CUDA bridge maps the current legal moves into that 813-slot space, including:
+- which piece instances exist
+- which move / place cells are active
+- neighbor structure for those cells
+- destination structure for direction and throw moves
+
+This keeps the policy space compact without giving up a learned board representation.
+
+- **Small config** (default): about `1.66M` parameters for v2, `1.72M` for v3 — `d_model=128`, `heads=8`, `layers=6`, `dim_ff=512`
+- **Large config**: `d_model=256`, `heads=8`, `layers=12`, `dim_ff=1024`
+
+Legacy PRS v1 modules are archived under `archive/legacy_prs_v1`.
+
+### Archived Auxiliary Heads
+
+Four auxiliary-head experiments were tried on PRS and all degraded playing
+strength, so they are now archived and disabled by default:
+
+- `queen_surround` / endgame pieces surrounding each queen
+- `final_mobility` / endgame mobility of each piece on the final two turns
+- `slot_legality` / current legal move prediction
+- `articulation` / one-hive articulation-point prediction
+
+Those heads were informative as diagnostics, but in training they slowed the
+model down and produced weaker checkpoints.
+
+### Search Pattern
+
+- **Default:** Gumbel-root MCTS tree search (`PRSMCTSOrchestratorV2`)
+- Sequential-halving rounds use final Gumbel sigma scoring (`gumbel + logits + sigma * Q`) for the played move, rather than visit-count argmax.
+- Wave-parallel MCTS is enabled by default with a hard-coded per-round schedule: `1, 2, 4, 8`. Use `--no-wave-parallel` for pure serial waves.
+- `--deterministic-non-root` enables the paper-style deterministic inner selection, with `--virtual-q-penalty` used to diversify wave-parallel sims.
+- The current training/profile defaults use `k=16`.
+- PRS enables TF32 matmul precision for the transformer trunk on supported GPUs.
+- `--compile-forward` can opt in to `torch.compile` for the tensor-only trunk/head path; it is off by default because Inductor can be unstable on some hosts.
+- Current `train_prs` default is PRS v3; legacy PRS-v1 search paths are archived.
+- Policy target now matches FNN's visited-only improved policy: unvisited legal moves receive zero target mass.
+- Move-cap draws are excluded from value loss, while genuine draws are retained.
+- `profile_models.py` exposes `prs-small` and `prs-large` for direct preset comparison.
+
+### Training
+
+```bash
+# Quick benchmark (1 iteration, 128 games, 256 sims, k=16)
+python -m hive_prs.train_prs \
+  --iterations 1 --games 128 --simulations 256 --max-considered 16
+
+# Default PRS v3 run
+python -m hive_prs.train_prs \
+  --iterations 1500 --games 128 --simulations 512 --max-considered 16 \
+  --checkpoint-dir checkpoints_prs_v3
+
+# PRS v3 run migrated from a v2 checkpoint
+python -m hive_prs.train_prs \
+  --model-version v3 \
+  --iterations 2000 --games 256 --simulations 256 --max-considered 16 \
+  --checkpoint-dir checkpoints_prs_v3 \
+  --resume checkpoints_prs_v2/prs_v2_iter_1500.pt
+
+# Large model
+python -m hive_prs.train_prs \
+  --d-model 256 --num-heads 16 --num-layers 8 --dim-ff 1024 \
+  --iterations 1500 --games 128 --simulations 512 --max-considered 16 \
+  --checkpoint-dir checkpoints_prs_large
+
+# Compare small vs large
+python -m profile_models --models prs-small prs-large --games 256 --sims 256 --gumbel-k 16
+```
+
+### Performance (RTX 4090, small model)
+
+| Config | Self-play | Training | Total |
+|--------|-----------|----------|-------|
+| 128 games, 256 sims, k=16 | ~60s | ~34s | ~94s/iter |
+
+### PRS Key Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--iterations` | 1500 | Training iterations |
+| `--games` | 128 | Parallel self-play games per iteration |
+| `--simulations` | 512 | Gumbel simulation budget per move |
+| `--max-considered` | 16 | Root actions considered (k); rounds = ceil(log2(k)) |
+| `--wave-parallel` / `--no-wave-parallel` | on | Enable/disable PRS v2 per-round MCTS wave schedule (`1,2,4,8`) |
+| `--deterministic-non-root` / `--no-deterministic-non-root` | off | Use paper-style deterministic inner-node selection |
+| `--virtual-q-penalty` | 0.25 | Temporary Q penalty used to diversify deterministic wave-parallel sims |
+| `--compile-forward` / `--no-compile-forward` | off | Opt in to `torch.compile` for tensor-only trunk/head forward |
+| `--d-model` | 128 | Transformer hidden dimension |
+| `--num-heads` | 8 | Attention heads |
+| `--num-layers` | 6 | Transformer layers |
+| `--dim-ff` | 512 | Feed-forward hidden dimension |
+| `--model-version` | v3 | `v2` standard trunk or `v3` trunk with relative attention bias |
+| `--relative-position-clip` | 8 | PRS v3 relative row/col offset clipping radius |
+| `--expansion-mask` | 7 | Expansion piece mask: 0=base, 1=+Mosquito, 2=+Ladybug, 4=+Pillbug, 7=all |
+| `--augment-prob` | 0.5 | Probability of C6 rotational augmentation per training batch |
+| `--buffer-size` | 150000 | Replay buffer capacity |
+| `--slot-legality-loss-weight` | 0.0 | Archived auxiliary head; keep at 0 unless explicitly re-testing |
+| `--articulation-loss-weight` | 0.0 | Archived auxiliary head; keep at 0 unless explicitly re-testing |
+| `--checkpoint-dir` | checkpoints\_prs\_v3 | Checkpoint output directory |
+| `--resume` | — | Path to checkpoint to resume from |
 
 ## Diagnostics
 
@@ -507,11 +584,12 @@ hive_gpu/          # CUDA extension, GPU-native MCTS/Gumbel, shared kernels
     fnn_selfplay.cuh   # Experimental fused FNN self-play kernel (not the active trainer path)
     state_encoder.cuh  # Transformer state encoding
     mcts_tree.cuh      # GPU-native MCTS tree
-hive_prs/          # PRS v2 default (structured 813-slot head)
+hive_prs/          # PRS v2/v3 (structured 813-slot head)
   prs_transformer_v2.py        # HivePRSTransformerV2
+  prs_transformer_v3.py        # HivePRSTransformerV3 with relative attention bias
   prs_mcts_orchestrator_v2.py  # PRS v2 Gumbel-root MCTS
   prs_trainer_v2.py            # PRS v2 trainer
-  train_prs.py                 # CLI entry point (v2 default)
+  train_prs.py                 # CLI entry point (v3 default trunk)
 hive_fnn/          # HiveGo-style FNN with multiple search paths
   fnn_network.py       # HiveFNN: shared encoder + value head + action tower
   fnn_mcts_orchestrator.py  # Gumbel-root MCTS tree search

@@ -28,6 +28,7 @@ from hive_engine.elo import EloTracker
 
 from hive_prs.prs_transformer import PRSConfig
 from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
+from hive_prs.prs_transformer_v3 import HivePRSTransformerV3
 from hive_prs.prs_replay_buffer_v2 import PRSReplayBufferV2, PRSTrainingBatchV2
 from hive_prs.prs_mcts_orchestrator_v2 import (
     PRSMCTSConfigV2, PRSMCTSOrchestratorV2,
@@ -56,8 +57,8 @@ class PRSTrainConfigV2:
     learning_rate:             float = 5e-4
     weight_decay:              float = 1e-4
     max_grad_norm:             float = 1.0
-    queen_surround_loss_weight: float = 0.15
-    final_mobility_loss_weight: float = 0.15
+    slot_legality_loss_weight:  float = 0.0
+    articulation_loss_weight:   float = 0.0
 
     # LR schedule
     lr_schedule:               str   = "cosine"
@@ -68,7 +69,7 @@ class PRSTrainConfigV2:
     buffer_max_size:           int   = 150_000
 
     # Checkpointing
-    checkpoint_dir:            str   = "checkpoints_prs_v2"
+    checkpoint_dir:            str   = "checkpoints_prs_v3"
     checkpoint_keep_every:     int   = 0
 
     # Arena
@@ -84,6 +85,7 @@ class PRSTrainConfigV2:
     virtual_q_penalty:         float = 0.25
     non_root_sigma:            float = 1.0
     compile_forward:           bool  = False
+    model_version:             str   = "v3"
 
     # C6 (6-fold) rotational augmentation for training batches.
     # With this probability, a random rotation k∈{1..5} is applied to every
@@ -115,13 +117,10 @@ def compute_prs_v2_loss(
     value_targets: torch.Tensor,     # (B, 1) float32
     value_mask:    torch.Tensor,     # (B, 1) float32, 1 = include in value loss
     aux_outputs:   dict[str, torch.Tensor],
-    queen_surround_targets: torch.Tensor,  # (total_board_tokens, 2)
-    queen_surround_mask:    torch.Tensor,  # (B, 2)
-    final_mobility_targets: torch.Tensor,  # (total_board_tokens,)
-    final_mobility_mask:    torch.Tensor,  # (B, 1)
-    board_token_batch:      torch.Tensor,  # (total_board_tokens,)
-    queen_surround_weight: float = 0.15,
-    final_mobility_weight: float = 0.15,
+    articulation_targets: torch.Tensor,    # (B, MAX_BOARD)
+    articulation_mask:    torch.Tensor,    # (B, MAX_BOARD)
+    slot_legality_weight: float = 0.15,
+    articulation_weight:  float = 0.15,
 ) -> tuple[torch.Tensor, dict]:
     """Masked CE over legal slots + value MSE.
 
@@ -157,33 +156,31 @@ def compute_prs_v2_loss(
         "value_loss": value_loss,
     }
 
-    if "queen_surround_logits" in aux_outputs and queen_surround_targets.numel() > 0:
-        qs_logits = aux_outputs["queen_surround_logits"]
-        per_token_mask = queen_surround_mask[board_token_batch]
-        qs_bce = F.binary_cross_entropy_with_logits(
-            qs_logits, queen_surround_targets, reduction="none",
-        )
-        qs_bce = qs_bce * per_token_mask
-        if per_token_mask.sum() > 0:
-            qs_loss = qs_bce.sum() / per_token_mask.sum()
-        else:
-            qs_loss = torch.tensor(0.0, device=policy_logits.device)
-        total_loss = total_loss + queen_surround_weight * qs_loss
-        loss_dict["queen_surround_loss"] = qs_loss
+    if (
+        slot_legality_weight > 0.0
+        and "slot_legality_logits" in aux_outputs
+    ):
+        sl_logits = aux_outputs["slot_legality_logits"]
+        sl_target = legal_mask.float()
+        sl_loss = F.binary_cross_entropy_with_logits(sl_logits, sl_target)
+        total_loss = total_loss + slot_legality_weight * sl_loss
+        loss_dict["slot_legality_loss"] = sl_loss
 
-    if "final_mobility_logits" in aux_outputs and final_mobility_targets.numel() > 0:
-        fm_logits = aux_outputs["final_mobility_logits"].squeeze(-1)
-        fm_token_mask = final_mobility_mask[board_token_batch].squeeze(-1)
-        fm_bce = F.binary_cross_entropy_with_logits(
-            fm_logits, final_mobility_targets, reduction="none",
+    if (
+        articulation_weight > 0.0
+        and "articulation_logits" in aux_outputs
+        and articulation_targets.numel() > 0
+    ):
+        art_logits = aux_outputs["articulation_logits"]
+        art_bce = F.binary_cross_entropy_with_logits(
+            art_logits, articulation_targets, reduction="none",
         )
-        fm_bce = fm_bce * fm_token_mask
-        if fm_token_mask.sum() > 0:
-            fm_loss = fm_bce.sum() / fm_token_mask.sum()
+        if articulation_mask.sum() > 0:
+            art_loss = (art_bce * articulation_mask).sum() / articulation_mask.sum()
         else:
-            fm_loss = torch.tensor(0.0, device=policy_logits.device)
-        total_loss = total_loss + final_mobility_weight * fm_loss
-        loss_dict["final_mobility_loss"] = fm_loss
+            art_loss = torch.tensor(0.0, device=policy_logits.device)
+        total_loss = total_loss + articulation_weight * art_loss
+        loss_dict["articulation_loss"] = art_loss
 
     return total_loss, loss_dict
 
@@ -206,7 +203,8 @@ class PRSTrainerV2:
 
         # Compile only tensor-heavy trunk/head paths; the CUDA bridge stays
         # outside Dynamo because its output structure depends on game state.
-        self.best_net: HivePRSTransformerV2 = HivePRSTransformerV2(self.net_config).to(self.device)
+        net_cls = HivePRSTransformerV3 if self.config.model_version == "v3" else HivePRSTransformerV2
+        self.best_net: HivePRSTransformerV2 = net_cls(self.net_config).to(self.device)
         self.best_net.enable_compiled_forward(cfg.compile_forward and self.device.type == "cuda")
         self._train_net = self.best_net   # same instance; no compile gap
 
@@ -299,6 +297,10 @@ class PRSTrainerV2:
             states_gpu, legal_t, nlegal_t, B, int(legal_t.shape[1]),
         )
 
+        cfg = self.config
+        if cfg.slot_legality_loss_weight <= 0.0 and cfg.articulation_loss_weight <= 0.0:
+            logits, value = self._train_net.forward_from_kernel(batch.prs_batch, kernel_out)
+            return logits, value, {}
         return self._train_net.forward_train_from_kernel(batch.prs_batch, kernel_out)
 
     def _train(self, iteration: int) -> tuple[float, dict]:
@@ -331,13 +333,10 @@ class PRSTrainerV2:
                             batch.slot_targets, batch.legal_masks,
                             batch.value_targets, batch.value_masks,
                             aux,
-                            batch.queen_surround_targets,
-                            batch.queen_surround_mask,
-                            batch.final_mobility_targets,
-                            batch.final_mobility_mask,
-                            batch.board_token_batch,
-                            queen_surround_weight=cfg.queen_surround_loss_weight,
-                            final_mobility_weight=cfg.final_mobility_loss_weight,
+                            batch.articulation_targets,
+                            batch.articulation_mask,
+                            slot_legality_weight=cfg.slot_legality_loss_weight,
+                            articulation_weight=cfg.articulation_loss_weight,
                         )
                     self._scaler.scale(loss).backward()
                     if cfg.max_grad_norm > 0:
@@ -354,13 +353,10 @@ class PRSTrainerV2:
                         batch.slot_targets, batch.legal_masks,
                         batch.value_targets, batch.value_masks,
                         aux,
-                        batch.queen_surround_targets,
-                        batch.queen_surround_mask,
-                        batch.final_mobility_targets,
-                        batch.final_mobility_mask,
-                        batch.board_token_batch,
-                        queen_surround_weight=cfg.queen_surround_loss_weight,
-                        final_mobility_weight=cfg.final_mobility_loss_weight,
+                        batch.articulation_targets,
+                        batch.articulation_mask,
+                        slot_legality_weight=cfg.slot_legality_loss_weight,
+                        articulation_weight=cfg.articulation_loss_weight,
                     )
                     loss.backward()
                     if cfg.max_grad_norm > 0:
@@ -390,7 +386,7 @@ class PRSTrainerV2:
                 iteration,
             )
             print(f"\n{'='*60}")
-            print(f"PRS v2 Iteration {iteration}/{self.config.num_iterations}")
+            print(f"PRS {self.config.model_version} Iteration {iteration}/{self.config.num_iterations}")
             print(f"  Simulations: {sims_this_iter}")
             print(f"{'='*60}")
 
@@ -430,20 +426,35 @@ class PRSTrainerV2:
         keep = cfg.checkpoint_keep_every
         if keep > 0 and iteration % keep != 0:
             return
-        path = os.path.join(cfg.checkpoint_dir, f"prs_v2_iter_{iteration:04d}.pt")
+        prefix = "prs_v3" if cfg.model_version == "v3" else "prs_v2"
+        path = os.path.join(cfg.checkpoint_dir, f"{prefix}_iter_{iteration:04d}.pt")
         torch.save({
             "iteration":   iteration,
             "model_state": self.best_net.state_dict(),
             "net_config":  self.net_config,
+            "model_version": cfg.model_version,
         }, path)
         print(f"  Saved: {path}")
 
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        model_state = ckpt["model_state"]
+        current = self.best_net.state_dict()
+        filtered_state = {}
+        skipped: list[str] = []
+        for key, tensor in model_state.items():
+            if key not in current:
+                continue
+            if current[key].shape != tensor.shape:
+                skipped.append(key)
+                continue
+            filtered_state[key] = tensor
         missing, unexpected = self.best_net.load_state_dict(
-            ckpt["model_state"], strict=False,
+            filtered_state, strict=False,
         )
         self._start_iter = ckpt["iteration"] + 1
+        if skipped:
+            print(f"Checkpoint shape-mismatch keys skipped: {skipped}")
         if missing:
             print(f"Checkpoint missing keys: {missing}")
         if unexpected:

@@ -3,8 +3,8 @@ pygame GUI for playing Hive against a trained AI.
 
 Run from hive_neuralnet/:
     python gui.py
-    python gui.py --checkpoint checkpoints_gpu/hive_gpu_checkpoint_0068.pt
-    python gui.py --color black --simulations 200
+    python gui.py --engine fnn-cpu --color black --simulations 256
+    python gui.py --engine legacy --checkpoint checkpoints_gnn/hive_gnn_checkpoint_0020.pt
 
 Controls:
     Click hand panel       → select piece type to place
@@ -357,7 +357,7 @@ class GPUValidator:
 # ── GUI class ───────────────────────────────────────────────────────
 
 class HiveGUI:
-    """pygame-based Hive board for human vs GNN AI."""
+    """pygame-based Hive board for human vs AI."""
 
     # ── Init ───────────────────────────────────────────────────────
 
@@ -367,6 +367,7 @@ class HiveGUI:
         encoder,
         mcts_config: MCTSConfig,
         human_color: Color,
+        cpu_player=None,
         self_play: bool = False,
         gpu_validate: bool = False,
         expansions: ExpansionConfig | None = None,
@@ -375,6 +376,7 @@ class HiveGUI:
         self.encoder = encoder
         self.mcts_config = mcts_config
         self.human_color = human_color
+        self.cpu_player = cpu_player
         self.self_play = self_play  # True = no AI, human controls both sides
         self.expansions = expansions
         self.gpu_validator: GPUValidator | None = None
@@ -424,26 +426,30 @@ class HiveGUI:
     def _start_ai_think(self) -> None:
         self.ai_thinking = True
         gen = self._game_gen
+        game_snapshot = self.game.copy()
 
         def worker() -> None:
             # Check for immediate win before running MCTS
-            immediate = find_immediate_win(self.game)
+            immediate = find_immediate_win(game_snapshot)
             if immediate is not None:
                 with self._ai_lock:
                     self._ai_result = (immediate, gen)
                 self.ai_thinking = False
                 return
 
-            mcts = MCTS(self.net, self.encoder, self.mcts_config)
-            policy = mcts.search(self.game, move_number=self.move_number)
-            action = int(np.argmax(policy))
-            mask = self.encoder.get_legal_action_mask(self.game)
-            if mask[action] > 0:
-                move = self.encoder.decode_action(action, self.game)
+            if self.cpu_player is not None:
+                move = self.cpu_player.choose_move(game_snapshot)
             else:
-                legal = np.where(mask > 0)[0]
-                best = legal[np.argmax(policy[legal])]
-                move = self.encoder.decode_action(int(best), self.game)
+                mcts = MCTS(self.net, self.encoder, self.mcts_config)
+                policy = mcts.search(game_snapshot, move_number=self.move_number)
+                action = int(np.argmax(policy))
+                mask = self.encoder.get_legal_action_mask(game_snapshot)
+                if mask[action] > 0:
+                    move = self.encoder.decode_action(action, game_snapshot)
+                else:
+                    legal = np.where(mask > 0)[0]
+                    best = legal[np.argmax(policy[legal])]
+                    move = self.encoder.decode_action(int(best), game_snapshot)
             with self._ai_lock:
                 self._ai_result = (move, gen)
             self.ai_thinking = False
@@ -1036,11 +1042,17 @@ def load_checkpoint(
 # ── Entry point ─────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Play Hive against a trained AI (GNN or NNUE)")
+    parser = argparse.ArgumentParser(description="Play Hive against a trained AI")
+    parser.add_argument(
+        "--engine",
+        choices=["fnn-cpu", "legacy"],
+        default="fnn-cpu",
+        help="AI engine to use. 'fnn-cpu' is the recommended CPU fallback for systems without an NVIDIA GPU.",
+    )
     parser.add_argument(
         "--checkpoint",
         default=None,
-        help="Path to checkpoint — GNN or NNUE auto-detected (default: GNN iter 20)",
+        help="Checkpoint path. Defaults depend on --engine.",
     )
     parser.add_argument(
         "--simulations",
@@ -1057,7 +1069,7 @@ def main() -> None:
     parser.add_argument(
         "--device",
         default=None,
-        help="Compute device: cuda, cpu, or auto (default: auto)",
+        help="Legacy engine only: compute device: cuda, cpu, or auto (default: auto)",
     )
     parser.add_argument(
         "--self-play",
@@ -1067,7 +1079,19 @@ def main() -> None:
     parser.add_argument(
         "--gpu-validate",
         action="store_true",
-        help="Run GPU move gen in parallel and compare with CPU (requires CUDA)",
+        help="Legacy engine only: run GPU move gen in parallel and compare with CPU (requires CUDA)",
+    )
+    parser.add_argument(
+        "--root-workers",
+        type=int,
+        default=2,
+        help="FNN CPU engine: process count for parallel root-candidate Gumbel search (default: 2).",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="FNN CPU engine: torch CPU thread count per process (default: 1).",
     )
     parser.add_argument(
         "--expansion",
@@ -1081,10 +1105,38 @@ def main() -> None:
 
     if args.self_play:
         # No AI needed — pass dummy values
-        net, encoder, title = None, None, "Hive — Self-Play"
+        net, encoder, cpu_player, title = None, None, None, "Hive — Self-Play"
         print("Self-play mode: you control both WHITE and BLACK.")
         print("Controls: click to play · R = restart · Escape = quit\n")
+    elif args.engine == "fnn-cpu":
+        from hive_fnn.fnn_cpu_player import FNNCPUPlayer, FNNCPUMCTSConfig
+
+        checkpoint = (
+            args.checkpoint
+            or "checkpoints_fnn/resume0500_24576/hive_fnn_checkpoint_0500.pt"
+        )
+        net, encoder = None, None
+        cpu_player = FNNCPUPlayer.from_checkpoint(
+            checkpoint,
+            config=FNNCPUMCTSConfig(
+                num_simulations=args.simulations,
+                use_gumbel_root=True,
+                gumbel_considered=16,
+                gumbel_noise_scale=0.0,
+                temperature=0.0,
+                root_parallel_workers=args.root_workers,
+                torch_threads=args.threads,
+            ),
+        )
+        title = "Hive — vs FNN CPU"
+        print(f"\nYou are playing as {human_color.name}.")
+        print("AI engine: FNN CPU fallback")
+        print(f"Checkpoint: {checkpoint}")
+        print(f"AI uses {args.simulations} simulations per move.")
+        print(f"CPU root workers: {args.root_workers}")
+        print("Controls: click to play · R = restart · Escape = quit\n")
     else:
+        cpu_player = None
         checkpoint = args.checkpoint or "checkpoints_gnn/hive_gnn_checkpoint_0020.pt"
 
         # Device selection
@@ -1111,9 +1163,21 @@ def main() -> None:
         pillbug="P" in exp_str,
     ) if exp_str else None
 
-    gui = HiveGUI(net, encoder, mcts_config, human_color, self_play=args.self_play,
-                   gpu_validate=args.gpu_validate, expansions=expansion_config)
-    gui.run(title=title)
+    gui = HiveGUI(
+        net,
+        encoder,
+        mcts_config,
+        human_color,
+        cpu_player=cpu_player,
+        self_play=args.self_play,
+        gpu_validate=args.gpu_validate,
+        expansions=expansion_config,
+    )
+    try:
+        gui.run(title=title)
+    finally:
+        if cpu_player is not None:
+            cpu_player.close()
 
 
 if __name__ == "__main__":

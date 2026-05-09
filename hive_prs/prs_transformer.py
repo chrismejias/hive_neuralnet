@@ -60,6 +60,10 @@ class PRSConfig:
     # Position table: 529 board cells + 1 off-board sentinel
     max_positions:   int   = BOARD_CELLS + 1   # 530
 
+    # PRS v3 relative attention bias. The clip value buckets offsets outside
+    # [-clip, clip] in row/col space, plus one bucket for off-board/hand/pad.
+    relative_position_clip: int = 8
+
     # Bilinear key dimension for the policy head
     d_key:           int   = 64
 

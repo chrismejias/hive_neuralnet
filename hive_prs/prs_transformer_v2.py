@@ -29,7 +29,7 @@ from hive_prs.prs_v2_bridge import (
 )
 
 
-class _PerBoardHead(nn.Module):
+class _GlobalHead(nn.Module):
     def __init__(self, d_model: int, out_dim: int, hidden: int = 64) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
@@ -38,8 +38,17 @@ class _PerBoardHead(nn.Module):
             nn.Linear(hidden, out_dim),
         )
 
-    def forward(self, board_embeddings: torch.Tensor) -> torch.Tensor:
-        return self.mlp(board_embeddings)
+    def forward(self, global_embedding: torch.Tensor) -> torch.Tensor:
+        return self.mlp(global_embedding)
+
+
+class _PerBoardHead(nn.Module):
+    def __init__(self, d_model: int, out_dim: int = 1) -> None:
+        super().__init__()
+        self.proj = nn.Linear(d_model, out_dim)
+
+    def forward(self, board_h: torch.Tensor) -> torch.Tensor:
+        return self.proj(board_h)
 
 
 class HivePRSTransformerV2(nn.Module):
@@ -79,29 +88,11 @@ class HivePRSTransformerV2(nn.Module):
         # ── Heads ─────────────────────────────────────────────────────
         self.head = PRSv2PolicyHead(d)
         self.value_head = PRSValueHead(d, config.global_feat_dim)
-        self.queen_surround_head = _PerBoardHead(d, out_dim=2)
-        self.final_mobility_head = _PerBoardHead(d, out_dim=1)
+        self.slot_legality_head = _GlobalHead(d, out_dim=813)
+        self.articulation_head = _PerBoardHead(d, out_dim=1)
         self._compiled_trunk = None
         self._compiled_head = None
         self._compile_warned = False
-
-    def _extract_board_embeddings(
-        self,
-        board_h: torch.Tensor,
-        batch: PRSTokenBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        counts = batch.num_board_tokens.to(torch.int64)
-        if counts.numel() == 0:
-            empty = torch.zeros(0, board_h.size(-1), device=board_h.device, dtype=board_h.dtype)
-            return empty, torch.zeros(0, device=board_h.device, dtype=torch.int64)
-        max_board = board_h.size(1)
-        token_idx = torch.arange(max_board, device=board_h.device).unsqueeze(0)
-        valid = token_idx < counts.unsqueeze(1)
-        if not valid.any():
-            empty = torch.zeros(0, board_h.size(-1), device=board_h.device, dtype=board_h.dtype)
-            return empty, torch.zeros(0, device=board_h.device, dtype=torch.int64)
-        batch_idx, board_idx = torch.where(valid)
-        return board_h[batch_idx, board_idx], batch_idx
 
     def enable_compiled_forward(self, enabled: bool = True) -> None:
         """Compile tensor-only trunk/head paths when available.
@@ -239,11 +230,9 @@ class HivePRSTransformerV2(nn.Module):
         board_h, cls_h, full_h, value = self.forward_trunk(batch)
         inp, _ = build_head_inputs_from_kernel(board_h, cls_h, full_h, kernel_out)
         policy_logits = self.forward_head(inp)
-        board_embeddings, _ = self._extract_board_embeddings(board_h, batch)
         aux_outputs: dict[str, torch.Tensor] = {}
-        if board_embeddings.numel() > 0:
-            aux_outputs["queen_surround_logits"] = self.queen_surround_head(board_embeddings)
-            aux_outputs["final_mobility_logits"] = self.final_mobility_head(board_embeddings)
+        aux_outputs["slot_legality_logits"] = self.slot_legality_head(cls_h)
+        aux_outputs["articulation_logits"] = self.articulation_head(board_h).squeeze(-1)
         return policy_logits, value, aux_outputs
 
     # ── Full forward, given state bytes ──────────────────────────────
