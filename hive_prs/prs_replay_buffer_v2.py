@@ -53,10 +53,8 @@ class PRSTrainingExampleV2(NamedTuple):
     slot_target:      np.ndarray   # (N_SLOTS,) float32 — MCTS visit distribution
     legal_mask:       np.ndarray   # (N_SLOTS,) bool    — True for legal slots
 
-    queen_surround_target: np.ndarray  # (num_board_tokens, 2) float32
-    queen_surround_mask:   np.ndarray  # (2,) float32
-    final_mobility_target: np.ndarray  # (num_board_tokens,) float32
-    final_mobility_mask:   float
+    articulation_target: np.ndarray  # (MAX_BOARD,) float32
+    articulation_mask:   np.ndarray  # (MAX_BOARD,) float32
 
     value_target:     float
     use_for_value:    bool
@@ -72,11 +70,8 @@ class PRSTrainingBatchV2:
     legal_masks:     torch.Tensor     # (B, N_SLOTS) bool
     value_targets:   torch.Tensor     # (B, 1) float32
     value_masks:     torch.Tensor     # (B, 1) float32, 1 = include in value loss
-    queen_surround_targets: torch.Tensor  # (total_board_tokens, 2) float32
-    queen_surround_mask:    torch.Tensor  # (B, 2) float32
-    final_mobility_targets: torch.Tensor  # (total_board_tokens,) float32
-    final_mobility_mask:    torch.Tensor  # (B, 1) float32
-    board_token_batch:      torch.Tensor  # (total_board_tokens,) int64
+    articulation_targets: torch.Tensor  # (B, MAX_BOARD) float32
+    articulation_mask:    torch.Tensor  # (B, MAX_BOARD) float32
     augmentation_k:  int = 0          # rotation applied to this batch (0..5)
 
     def to(self, device, non_blocking: bool = False) -> "PRSTrainingBatchV2":
@@ -87,11 +82,8 @@ class PRSTrainingBatchV2:
             legal_masks    = self.legal_masks.to(device, non_blocking=non_blocking),
             value_targets  = self.value_targets.to(device, non_blocking=non_blocking),
             value_masks    = self.value_masks.to(device, non_blocking=non_blocking),
-            queen_surround_targets = self.queen_surround_targets.to(device, non_blocking=non_blocking),
-            queen_surround_mask    = self.queen_surround_mask.to(device, non_blocking=non_blocking),
-            final_mobility_targets = self.final_mobility_targets.to(device, non_blocking=non_blocking),
-            final_mobility_mask    = self.final_mobility_mask.to(device, non_blocking=non_blocking),
-            board_token_batch      = self.board_token_batch.to(device, non_blocking=non_blocking),
+            articulation_targets = self.articulation_targets.to(device, non_blocking=non_blocking),
+            articulation_mask    = self.articulation_mask.to(device, non_blocking=non_blocking),
             augmentation_k = self.augmentation_k,
         )
 
@@ -163,11 +155,8 @@ def _collate_noaug(samples: list[PRSTrainingExampleV2]) -> PRSTrainingBatchV2:
     lmask   = np.zeros((B, N_SLOTS),      dtype=bool)
     value   = np.zeros((B, 1),            dtype=np.float32)
     vmask   = np.zeros((B, 1),            dtype=np.float32)
-    qsmask  = np.zeros((B, 2),            dtype=np.float32)
-    fmmask  = np.zeros((B, 1),            dtype=np.float32)
-    qs_list: list[np.ndarray] = []
-    fm_list: list[np.ndarray] = []
-    btb_list: list[np.ndarray] = []
+    art_t   = np.zeros((B, MAX_BOARD),    dtype=np.float32)
+    art_m   = np.zeros((B, MAX_BOARD),    dtype=np.float32)
 
     for i, s in enumerate(samples):
         S = s.seq_length
@@ -186,23 +175,8 @@ def _collate_noaug(samples: list[PRSTrainingExampleV2]) -> PRSTrainingBatchV2:
         lmask[i]      = s.legal_mask
         value[i, 0]   = s.value_target
         vmask[i, 0]   = float(s.use_for_value)
-        qsmask[i]     = s.queen_surround_mask
-        fmmask[i, 0]  = float(s.final_mobility_mask)
-        nbt = s.num_board_tokens
-        if nbt > 0:
-            qs_list.append(s.queen_surround_target[:nbt])
-            fm_list.append(s.final_mobility_target[:nbt])
-            btb_list.append(np.full(nbt, i, dtype=np.int64))
-
-    queen_surround_targets = (
-        np.concatenate(qs_list, axis=0) if qs_list else np.zeros((0, 2), dtype=np.float32)
-    )
-    final_mobility_targets = (
-        np.concatenate(fm_list, axis=0) if fm_list else np.zeros((0,), dtype=np.float32)
-    )
-    board_token_batch = (
-        np.concatenate(btb_list, axis=0) if btb_list else np.zeros((0,), dtype=np.int64)
-    )
+        art_t[i]      = s.articulation_target
+        art_m[i]      = s.articulation_mask
 
     prs = PRSTokenBatch(
         token_features   = torch.from_numpy(feat).pin_memory(),
@@ -223,11 +197,8 @@ def _collate_noaug(samples: list[PRSTrainingExampleV2]) -> PRSTrainingBatchV2:
         legal_masks    = torch.from_numpy(lmask).pin_memory(),
         value_targets  = torch.from_numpy(value).pin_memory(),
         value_masks    = torch.from_numpy(vmask).pin_memory(),
-        queen_surround_targets = torch.from_numpy(queen_surround_targets).pin_memory(),
-        queen_surround_mask    = torch.from_numpy(qsmask).pin_memory(),
-        final_mobility_targets = torch.from_numpy(final_mobility_targets).pin_memory(),
-        final_mobility_mask    = torch.from_numpy(fmmask).pin_memory(),
-        board_token_batch      = torch.from_numpy(board_token_batch).pin_memory(),
+        articulation_targets = torch.from_numpy(art_t).pin_memory(),
+        articulation_mask    = torch.from_numpy(art_m).pin_memory(),
         augmentation_k = 0,
     )
 
@@ -327,11 +298,13 @@ def _collate_rotated(
 
     value = np.array([[s.value_target] for s in samples], dtype=np.float32)
     vmask = np.array([[float(s.use_for_value)] for s in samples], dtype=np.float32)
-    qsmask = np.zeros((B, 2), dtype=np.float32)
-    fmmask = np.zeros((B, 1), dtype=np.float32)
-    qst = np.zeros((0, 2), dtype=np.float32)
-    fmt = np.zeros((0,), dtype=np.float32)
-    btb = np.zeros((0,), dtype=np.int64)
+    from hive_prs.prs_aux_targets import compute_articulation_target
+    art_t = np.zeros((B, MAX_BOARD), dtype=np.float32)
+    art_m = np.zeros((B, MAX_BOARD), dtype=np.float32)
+    for i in range(B):
+        t, m = compute_articulation_target(sb_rot[i], MAX_BOARD)
+        art_t[i] = t
+        art_m[i] = m
 
     return PRSTrainingBatchV2(
         prs_batch      = prs_batch,
@@ -340,10 +313,7 @@ def _collate_rotated(
         legal_masks    = torch.from_numpy(lmask),
         value_targets  = torch.from_numpy(value),
         value_masks    = torch.from_numpy(vmask),
-        queen_surround_targets = torch.from_numpy(qst),
-        queen_surround_mask    = torch.from_numpy(qsmask),
-        final_mobility_targets = torch.from_numpy(fmt),
-        final_mobility_mask    = torch.from_numpy(fmmask),
-        board_token_batch      = torch.from_numpy(btb),
+        articulation_targets = torch.from_numpy(art_t),
+        articulation_mask    = torch.from_numpy(art_m),
         augmentation_k = k,
     )

@@ -467,7 +467,7 @@ class GPUValidator:
 # ── GUI class ───────────────────────────────────────────────────────
 
 class HiveGUI:
-    """pygame-based Hive board for human vs AI (GNN/NNUE/Transformer/FNN/PRS v2)."""
+    """pygame-based Hive board for human vs AI."""
 
     # ── Init ───────────────────────────────────────────────────────
 
@@ -477,6 +477,7 @@ class HiveGUI:
         encoder,
         mcts_config: MCTSConfig,
         human_color: Color,
+        cpu_player=None,
         self_play: bool = False,
         gpu_validate: bool = False,
         expansions: ExpansionConfig | None = None,
@@ -488,6 +489,7 @@ class HiveGUI:
         self.encoder = encoder
         self.mcts_config = mcts_config
         self.human_color = human_color
+        self.cpu_player = cpu_player
         self.self_play = self_play  # True = no AI, human controls both sides
         self.expansions = expansions
         self.gpu_validator: GPUValidator | None = None
@@ -537,6 +539,7 @@ class HiveGUI:
     def _start_ai_think(self) -> None:
         self.ai_thinking = True
         gen = self._game_gen
+        game_snapshot = self.game.copy()
 
         if self.gpu_ai is not None:
             # ── GPU Gumbel MCTS path (FNN / PRS v2) ──────────────────
@@ -559,25 +562,28 @@ class HiveGUI:
 
             threading.Thread(target=gpu_worker, daemon=True).start()
         else:
-            # ── CPU MCTS path (GNN / NNUE / Transformer) ──────────────
+            # ── CPU path (FNN fallback or legacy CPU MCTS) ────────────
             def worker() -> None:
-                immediate = find_immediate_win(self.game)
+                immediate = find_immediate_win(game_snapshot)
                 if immediate is not None:
                     with self._ai_lock:
                         self._ai_result = (immediate, gen)
                     self.ai_thinking = False
                     return
 
-                mcts = MCTS(self.net, self.encoder, self.mcts_config)
-                policy = mcts.search(self.game, move_number=self.move_number)
-                action = int(np.argmax(policy))
-                mask = self.encoder.get_legal_action_mask(self.game)
-                if mask[action] > 0:
-                    move = self.encoder.decode_action(action, self.game)
+                if self.cpu_player is not None:
+                    move = self.cpu_player.choose_move(game_snapshot)
                 else:
-                    legal = np.where(mask > 0)[0]
-                    best = legal[np.argmax(policy[legal])]
-                    move = self.encoder.decode_action(int(best), self.game)
+                    mcts = MCTS(self.net, self.encoder, self.mcts_config)
+                    policy = mcts.search(game_snapshot, move_number=self.move_number)
+                    action = int(np.argmax(policy))
+                    mask = self.encoder.get_legal_action_mask(game_snapshot)
+                    if mask[action] > 0:
+                        move = self.encoder.decode_action(action, game_snapshot)
+                    else:
+                        legal = np.where(mask > 0)[0]
+                        best = legal[np.argmax(policy[legal])]
+                        move = self.encoder.decode_action(int(best), game_snapshot)
                 with self._ai_lock:
                     self._ai_result = (move, gen)
                 self.ai_thinking = False
@@ -1238,18 +1244,21 @@ def load_checkpoint(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Play Hive against a trained AI (GNN / NNUE / FNN / PRS v2)"
+        description="Play Hive against a trained AI"
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["fnn-cpu", "legacy"],
+        default="fnn-cpu",
+        help="AI engine to use. 'fnn-cpu' is the recommended CPU fallback for systems without an NVIDIA GPU.",
     )
     parser.add_argument(
         "--checkpoint",
         default=None,
         help=(
-            "Path to checkpoint file.  Auto-detected by net_config type. "
-            "Defaults: prs_v2 -> checkpoints_prs_v2/prs_v2_iter_0600.pt, "
-            "fnn_large -> checkpoints_fnn_large/hive_fnn_checkpoint_0100.pt, "
-            "fnn_medium -> checkpoints_fnn_medium/hive_fnn_checkpoint_0100.pt, "
-            "fnn_small -> checkpoints_fnn_small/hive_fnn_checkpoint_0100.pt, "
-            "gnn -> checkpoints_gnn/hive_gnn_checkpoint_0020.pt"
+            "Checkpoint path. For --engine fnn-cpu the default is the latest "
+            "recommended FNN checkpoint. For --engine legacy it follows the "
+            "selected --model path or auto-detect behavior."
         ),
     )
     parser.add_argument(
@@ -1257,8 +1266,8 @@ def main() -> None:
         choices=["auto", "prs_v2", "fnn_large", "fnn_medium", "fnn_small", "gnn"],
         default="auto",
         help=(
-            "Which model to use (default: auto = infer from checkpoint). "
-            "Specify to use a default checkpoint path without --checkpoint."
+            "Legacy engine only. Which model to use "
+            "(default: auto = infer from checkpoint)."
         ),
     )
     parser.add_argument(
@@ -1279,7 +1288,7 @@ def main() -> None:
     parser.add_argument(
         "--device",
         default=None,
-        help="Compute device: cuda, cpu, or auto (default: auto)",
+        help="Legacy engine only: compute device: cuda, cpu, or auto (default: auto)",
     )
     parser.add_argument(
         "--self-play",
@@ -1289,7 +1298,19 @@ def main() -> None:
     parser.add_argument(
         "--gpu-validate",
         action="store_true",
-        help="Run GPU move gen in parallel and compare with CPU (requires CUDA)",
+        help="Legacy engine only: run GPU move gen in parallel and compare with CPU (requires CUDA)",
+    )
+    parser.add_argument(
+        "--root-workers",
+        type=int,
+        default=2,
+        help="FNN CPU engine: process count for parallel root-candidate Gumbel search (default: 2).",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=1,
+        help="FNN CPU engine: torch CPU thread count per process (default: 1).",
     )
     parser.add_argument(
         "--expansion",
@@ -1315,11 +1336,41 @@ def main() -> None:
     }
 
     if args.self_play:
-        net, encoder, gpu_ai, title = None, None, None, "Hive — Self-Play"
+        net, encoder, gpu_ai, cpu_player, title = None, None, None, None, "Hive — Self-Play"
         mcts_config = MCTSConfig(num_simulations=200, temperature=0.0)
         print("Self-play mode: you control both WHITE and BLACK.")
         print("Controls: click to play · R = restart · Escape = quit\n")
+    elif args.engine == "fnn-cpu":
+        from hive_fnn.fnn_cpu_player import FNNCPUPlayer, FNNCPUMCTSConfig
+
+        checkpoint = (
+            args.checkpoint
+            or "checkpoints_fnn/resume0500_24576/hive_fnn_checkpoint_0500.pt"
+        )
+        net, encoder, gpu_ai = None, None, None
+        n_sims = args.simulations if args.simulations is not None else 256
+        mcts_config = MCTSConfig(num_simulations=n_sims, temperature=0.0)
+        cpu_player = FNNCPUPlayer.from_checkpoint(
+            checkpoint,
+            config=FNNCPUMCTSConfig(
+                num_simulations=n_sims,
+                use_gumbel_root=True,
+                gumbel_considered=16,
+                gumbel_noise_scale=0.0,
+                temperature=0.0,
+                root_parallel_workers=args.root_workers,
+                torch_threads=args.threads,
+            ),
+        )
+        title = "Hive — vs FNN CPU"
+        print(f"\nYou are playing as {human_color.name}.")
+        print("AI engine: FNN CPU fallback")
+        print(f"Checkpoint: {checkpoint}")
+        print(f"AI uses {n_sims} simulations per move.")
+        print(f"CPU root workers: {args.root_workers}")
+        print("Controls: click to play · R = restart · Escape = quit\n")
     else:
+        cpu_player = None
         # Resolve checkpoint path
         if args.checkpoint:
             checkpoint = args.checkpoint
@@ -1378,15 +1429,22 @@ def main() -> None:
                 ladybug=bool(exp_mask & 2),
                 pillbug=bool(exp_mask & 4),
             )
+    elif args.engine == "fnn-cpu" and not exp_str and not args.base_game:
+        expansion_config = ExpansionConfig(mosquito=True, ladybug=True, pillbug=True)
 
     gui = HiveGUI(
         net, encoder, mcts_config, human_color,
+        cpu_player=cpu_player,
         self_play=args.self_play,
         gpu_validate=args.gpu_validate,
         expansions=expansion_config,
         gpu_ai=gpu_ai,
     )
-    gui.run(title=title)
+    try:
+        gui.run(title=title)
+    finally:
+        if cpu_player is not None:
+            cpu_player.close()
 
 
 if __name__ == "__main__":
