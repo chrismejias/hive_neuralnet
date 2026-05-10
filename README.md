@@ -18,7 +18,7 @@ That makes PRS interesting architecturally, but it currently needs much more wal
 | Model | Package | Params | Self-play |
 |-------|---------|--------|-----------|
 | FNN (recommended default) | `hive_fnn` | 1.0K – 18.8K | Gumbel-root MCTS / PUCT MCTS |
-| Hybrid GNN (experimental) | `hive_hybrid_gnn` | 80K+ | FNN policy + graph value trunk |
+| Hybrid GNN (experimental) | `hive_hybrid_gnn` | 125K+ | FNN successor features + graph-aware policy/value |
 | PRS Transformer (research path) | `hive_prs` | 1.7M / 9.8M | Gumbel-root MCTS (v3 default trunk) |
 
 All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels for move generation, state encoding, and legal move lookup.
@@ -335,17 +335,17 @@ The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 
 ---
 
-## Hybrid GNN (experimental FNN policy + graph value)
+## Hybrid GNN (experimental FNN successor features + graph policy/value)
 
 The hybrid GNN research direction lives in `hive_hybrid_gnn`.
 
 The hybrid model keeps the part of FNN that has worked best:
 
 - root and successor states are encoded as `110`-dim FNN feature vectors
-- policy logits come from the FNN successor-conditioned action tower
-- a trained FNN policy can be copied into the hybrid model's `fnn` submodule
+- policy logits compare the root FNN embedding, root graph embedding, and successor FNN embedding
+- a trained FNN checkpoint can initialize the shared FNN feature encoder, but the graph-aware policy tower is not weight-compatible with the FNN action tower
 
-It changes the value side:
+It changes both policy and value:
 
 - the value head receives the FNN root embedding
 - it also receives a pooled graph embedding over the full board state
@@ -357,6 +357,8 @@ within the 18 hexes at distance 1 or 2. Radius 1 is still available and gives
 the classic 6-neighbor local graph. Radius 2 increases the edge count, but it
 should improve message passing because two-step tactical motifs are available
 in a single layer rather than requiring an additional round of propagation.
+The default small preset now uses `5` graph layers with global-pool bias
+enabled; the large preset remains `5` layers at a wider hidden size.
 
 Current status:
 

@@ -1,8 +1,8 @@
 """Hybrid GNN + FNN network.
 
-Policy stays exactly in the FNN style: encode root and successor feature
-vectors, then score each successor relative to the root. Value gets additional
-full-board graph context through a small message-passing trunk.
+Policy keeps the FNN successor-state feature path, but scores each action with
+both the root graph embedding and the root/successor FNN embeddings. Value uses
+the same root graph context through a small message-passing trunk.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from hive_hybrid_gnn.graph_types import (
 class HybridGNNConfig:
     fnn_config: FNNConfig | None = None
     graph_hidden_dim: int = 64
-    graph_layers: int = 3
+    graph_layers: int = 5
     graph_radius: int = 2
     graph_mlp_hidden: int = 64
     global_pool_bias: bool = True
@@ -41,7 +41,7 @@ class HybridGNNConfig:
         return cls(
             fnn_config=FNNConfig.medium(),
             graph_hidden_dim=48,
-            graph_layers=3,
+            graph_layers=5,
             graph_radius=2,
             graph_mlp_hidden=48,
             value_hidden=96,
@@ -241,7 +241,7 @@ class HybridGraphValueTrunk(nn.Module):
 
 
 class HiveHybridGNN(nn.Module):
-    """FNN policy plus graph-enhanced value network."""
+    """FNN successor features plus graph-aware policy/value heads."""
 
     model_version = "hybrid_gnn"
 
@@ -254,6 +254,11 @@ class HiveHybridGNN(nn.Module):
 
         self.fnn = HiveFNN(fnn_config)
         self.graph_trunk = HybridGraphValueTrunk(self.config)
+        self.policy_fc1 = nn.Linear(
+            fnn_config.embed_dim * 2 + self.graph_trunk.out_dim,
+            fnn_config.action_hidden,
+        )
+        self.policy_fc2 = nn.Linear(fnn_config.action_hidden, 1)
         self.value_head = nn.Sequential(
             nn.Linear(
                 fnn_config.embed_dim + self.graph_trunk.out_dim + self.config.global_feat_dim,
@@ -271,31 +276,51 @@ class HiveHybridGNN(nn.Module):
         num_actions: torch.Tensor,
         graph_batch: HybridGraphBatch | HybridGraphTensorBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return FNN-style action logits and graph-enhanced root values."""
+        """Return graph-aware action logits and graph-enhanced root values."""
         root_emb = self.fnn.encode(root_features)
+        graph_summary = self.graph_trunk(graph_batch)
 
         if action_to_root.shape[0] == 0:
             action_logits = root_features.new_zeros((0,))
         else:
             succ_emb = self.fnn.encode(successor_features)
-            action_logits = self.fnn.score_actions(root_emb[action_to_root], succ_emb)
+            action_logits = self.score_hybrid_actions(
+                root_emb[action_to_root],
+                graph_summary[action_to_root],
+                succ_emb,
+            )
 
-        graph_summary = self.graph_trunk(graph_batch)
         value_in = torch.cat([root_emb, graph_summary, graph_batch.global_features], dim=1)
         values = torch.tanh(self.value_head(value_in))
         return action_logits, values
+
+    def score_hybrid_actions(
+        self,
+        root_emb: torch.Tensor,
+        root_graph_emb: torch.Tensor,
+        successor_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        combined = torch.cat([root_emb, root_graph_emb, successor_emb], dim=1)
+        x = torch.sigmoid(self.policy_fc1(combined))
+        return self.policy_fc2(x).squeeze(-1)
 
     def policy_forward(
         self,
         root_features: torch.Tensor,
         successor_features: torch.Tensor,
         action_to_root: torch.Tensor,
+        graph_batch: HybridGraphBatch | HybridGraphTensorBatch,
     ) -> torch.Tensor:
         root_emb = self.fnn.encode(root_features)
         if action_to_root.shape[0] == 0:
             return root_features.new_zeros((0,))
         succ_emb = self.fnn.encode(successor_features)
-        return self.fnn.score_actions(root_emb[action_to_root], succ_emb)
+        graph_summary = self.graph_trunk(graph_batch)
+        return self.score_hybrid_actions(
+            root_emb[action_to_root],
+            graph_summary[action_to_root],
+            succ_emb,
+        )
 
     def value_forward(
         self,
@@ -308,7 +333,11 @@ class HiveHybridGNN(nn.Module):
         return torch.tanh(self.value_head(value_in))
 
     def load_fnn_policy_weights(self, fnn: HiveFNN) -> None:
-        """Initialize the policy-side FNN from a trained HiveFNN."""
+        """Initialize the shared FNN encoder from a trained HiveFNN.
+
+        The hybrid policy tower is graph-aware and is not weight-compatible
+        with the FNN action tower.
+        """
         self.fnn.load_state_dict(fnn.state_dict())
 
     def count_parameters(self) -> int:
