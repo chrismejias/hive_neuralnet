@@ -33,6 +33,7 @@ Defaults mirror the most common training-time search settings:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import glob
 import os
 import sys
@@ -63,6 +64,12 @@ FNN_DEFAULT_PATTERNS = (
 PRS_DEFAULT_PATTERNS = (
     "checkpoints_prs_v2/prs_v2_iter_*.pt",
 )
+
+
+@dataclass
+class ArenaMoveResult:
+    chosen_slots: np.ndarray
+    move_bytes: np.ndarray
 
 
 def _latest_by_mtime(paths: list[str]) -> str | None:
@@ -196,21 +203,24 @@ def build_orchestrator(
 def choose_prs_moves(
     orch: PRSMCTSOrchestratorV2,
     states: torch.Tensor,
+    active_mask: np.ndarray,
+    tree: dict[str, torch.Tensor] | None = None,
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
     gumbel_noise_scale: float = 0.0,
-) -> np.ndarray:
+) -> ArenaMoveResult:
     B = int(states.shape[0])
     cfg = orch.config
-    tree = orch._alloc_tree(B)
-    orch._reset_tree(tree)
+    if tree is None:
+        tree = orch._alloc_tree(B)
+        orch._reset_tree(tree)
 
     prs_batch = orch.encoder.encode_batch(states, B)
     legal_t, nlegal_t = orch.ext.generate_legal_moves_batch(states, B)
     nlegal_np = nlegal_t.cpu().numpy()
 
     turns_np = orch._get_turns(states, B)
-    active = [int(n) > 0 for n in nlegal_np]
+    active = [bool(active_mask[i]) and int(n) > 0 for i, n in enumerate(nlegal_np)]
     win_overrides = orch._check_immediate_wins_v2(
         states, legal_t, nlegal_np, active, turns_np, B,
     )
@@ -225,7 +235,10 @@ def choose_prs_moves(
 
     max_legal = int(nlegal_np.max()) if nlegal_np.size > 0 else 0
     if max_legal <= 0:
-        return np.zeros(B, dtype=np.int64)
+        return ArenaMoveResult(
+            chosen_slots=np.zeros(B, dtype=np.int64),
+            move_bytes=np.zeros((B, orch.ext.SIZEOF_GPU_MOVE), dtype=np.uint8),
+        )
     max_k = min(cfg.max_num_considered_actions, max_legal)
 
     if gumbel_noise_scale > 0.0:
@@ -283,34 +296,38 @@ def choose_prs_moves(
     agg_np = agg_per_legal.cpu().numpy()
 
     chosen = np.zeros(B, dtype=np.int64)
+    legal_np = legal_t.cpu().numpy()
+    move_bytes = np.zeros((B, orch.ext.SIZEOF_GPU_MOVE), dtype=np.uint8)
     for i in range(B):
         n_i = int(nlegal_np[i])
-        if n_i <= 0:
+        if n_i <= 0 or not active[i]:
             chosen[i] = 0
             continue
         if i in win_overrides:
             chosen[i] = int(win_overrides[i])
-            continue
-        scores = agg_np[i, :n_i].astype(np.float64, copy=True)
-        if stochastic and move_numbers is not None and int(move_numbers[i]) < cfg.temperature_drop_move:
-            ssum = float(scores.sum())
-            if ssum > 0 and np.isfinite(ssum):
-                probs = scores / ssum
-            else:
-                probs = np.full(n_i, 1.0 / n_i, dtype=np.float64)
-            chosen[i] = int(np.random.choice(n_i, p=probs))
         else:
-            chosen[i] = int(np.argmax(scores))
-    return chosen
+            scores = agg_np[i, :n_i].astype(np.float64, copy=True)
+            if stochastic and move_numbers is not None and int(move_numbers[i]) < cfg.temperature_drop_move:
+                ssum = float(scores.sum())
+                if ssum > 0 and np.isfinite(ssum):
+                    probs = scores / ssum
+                else:
+                    probs = np.full(n_i, 1.0 / n_i, dtype=np.float64)
+                chosen[i] = int(np.random.choice(n_i, p=probs))
+            else:
+                chosen[i] = int(np.argmax(scores))
+        move_bytes[i] = legal_np[i, chosen[i]]
+    return ArenaMoveResult(chosen_slots=chosen, move_bytes=move_bytes)
 
 
 def choose_prs_policy_moves(
     orch: PRSMCTSOrchestratorV2,
     states: torch.Tensor,
+    active_mask: np.ndarray,
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
     gumbel_noise_scale: float = 0.0,
-) -> np.ndarray:
+) -> ArenaMoveResult:
     B = int(states.shape[0])
     cfg = orch.config
     prs_batch = orch.encoder.encode_batch(states, B)
@@ -335,9 +352,10 @@ def choose_prs_policy_moves(
         scores = torch.where(valid_slot, priors_per_legal, torch.full_like(priors_per_legal, -1.0))
 
     chosen = np.zeros(B, dtype=np.int64)
+    move_bytes = np.zeros((B, orch.ext.SIZEOF_GPU_MOVE), dtype=np.uint8)
     for i in range(B):
         n_i = int(nlegal_np[i])
-        if n_i <= 0:
+        if n_i <= 0 or not bool(active_mask[i]):
             chosen[i] = 0
             continue
         row_scores = scores[i, :n_i]
@@ -350,40 +368,50 @@ def choose_prs_policy_moves(
             chosen[i] = int(torch.multinomial(probs, 1).item())
         else:
             chosen[i] = int(torch.argmax(row_scores).item())
-    return chosen
+        move_bytes[i] = legal_t[i, chosen[i]].cpu().numpy()
+    return ArenaMoveResult(chosen_slots=chosen, move_bytes=move_bytes)
 
 
 def choose_fnn_moves(
     orch: FNNMCTSOrchestrator | FNNPUCTOrchestrator,
     states: torch.Tensor,
+    active_mask: np.ndarray,
+    tree: dict[str, torch.Tensor] | None = None,
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
     gumbel_noise_scale: float = 0.0,
-) -> np.ndarray:
+) -> ArenaMoveResult:
     if isinstance(orch, FNNPUCTOrchestrator):
         return choose_fnn_puct_moves(
             orch,
             states,
+            active_mask=active_mask,
+            tree=tree,
             move_numbers=move_numbers,
             stochastic=stochastic,
         )
 
     B = int(states.shape[0])
     cfg = orch.config
-    tree = orch._alloc_tree(B)
-    orch._reset_tree(tree)
+    if tree is None:
+        tree = orch._alloc_tree(B)
+        orch._reset_tree(tree)
 
     legal_moves, num_legal, root_features = orch.ext.generate_legal_moves_and_fnn_features_batch(states, B)
     n_per_game = num_legal.to(torch.int64)
     nlegal_np = num_legal.cpu().numpy()
 
-    has_actions = n_per_game > 0
+    active_mask_t = torch.from_numpy(active_mask).to(device="cuda", dtype=torch.bool)
+    has_actions = active_mask_t & (n_per_game > 0)
     immediate_wins = orch._find_immediate_wins(states, legal_moves, num_legal, B)
     has_immediate_win = immediate_wins >= 0
 
     max_n = int(n_per_game.max().item()) if B > 0 else 0
     if max_n == 0:
-        return np.zeros(B, dtype=np.int64)
+        return ArenaMoveResult(
+            chosen_slots=np.zeros(B, dtype=np.int64),
+            move_bytes=np.zeros((B, orch.ext.SIZEOF_GPU_MOVE), dtype=np.uint8),
+        )
     max_k = min(cfg.max_num_considered_actions, max_n)
 
     priors_per_legal, _root_vals, _child_q = orch._eval_states(
@@ -499,23 +527,27 @@ def choose_fnn_moves(
 
     chosen_np = chosen.cpu().numpy()
     out = np.zeros(B, dtype=np.int64)
+    move_bytes = np.zeros((B, orch.ext.SIZEOF_GPU_MOVE), dtype=np.uint8)
+    legal_np = legal_moves.cpu().numpy()
     for i in range(B):
         n_i = int(nlegal_np[i])
-        if n_i <= 0:
+        if n_i <= 0 or not bool(active_mask[i]):
             out[i] = 0
         else:
             k = int(chosen_np[i])
             out[i] = 0 if k >= n_i else k
-    return out
+            move_bytes[i] = legal_np[i, out[i]]
+    return ArenaMoveResult(chosen_slots=out, move_bytes=move_bytes)
 
 
 def choose_fnn_policy_moves(
     orch: FNNMCTSOrchestrator | FNNPUCTOrchestrator,
     states: torch.Tensor,
+    active_mask: np.ndarray,
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
     gumbel_noise_scale: float = 0.0,
-) -> np.ndarray:
+) -> ArenaMoveResult:
     B = int(states.shape[0])
     if isinstance(orch, FNNPUCTOrchestrator):
         cfg = orch.config
@@ -540,9 +572,11 @@ def choose_fnn_policy_moves(
         scores = torch.where(valid_slot, priors_per_legal, torch.full_like(priors_per_legal, -1.0))
 
     chosen = np.zeros(B, dtype=np.int64)
+    move_bytes = np.zeros((B, orch.ext.SIZEOF_GPU_MOVE), dtype=np.uint8)
+    legal_np = legal_moves.cpu().numpy()
     for i in range(B):
         n_i = int(nlegal_np[i])
-        if n_i <= 0:
+        if n_i <= 0 or not bool(active_mask[i]):
             chosen[i] = 0
             continue
         row_scores = scores[i, :n_i]
@@ -555,31 +589,39 @@ def choose_fnn_policy_moves(
             chosen[i] = int(torch.multinomial(probs, 1).item())
         else:
             chosen[i] = int(torch.argmax(row_scores).item())
-    return chosen
+        move_bytes[i] = legal_np[i, chosen[i]]
+    return ArenaMoveResult(chosen_slots=chosen, move_bytes=move_bytes)
 
 
 def choose_fnn_puct_moves(
     orch: FNNPUCTOrchestrator,
     states: torch.Tensor,
+    active_mask: np.ndarray,
+    tree: dict[str, torch.Tensor] | None = None,
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
-) -> np.ndarray:
+) -> ArenaMoveResult:
     B = int(states.shape[0])
     cfg = orch.config
-    tree = orch._alloc_tree(B)
-    orch._reset_tree(tree)
+    if tree is None:
+        tree = orch._alloc_tree(B)
+        orch._reset_tree(tree)
 
     legal_moves, num_legal, root_features = orch.ext.generate_legal_moves_and_fnn_features_batch(states, B)
     n_per_game = num_legal.to(torch.int64)
     nlegal_np = num_legal.cpu().numpy()
-    has_actions = n_per_game > 0
+    active_mask_t = torch.from_numpy(active_mask).to(device="cuda", dtype=torch.bool)
+    has_actions = active_mask_t & (n_per_game > 0)
 
     immediate_wins = orch._find_immediate_wins(states, legal_moves, num_legal, B)
     has_immediate_win = immediate_wins >= 0
 
     max_n = int(n_per_game.max().item()) if B > 0 else 0
     if max_n == 0:
-        return np.zeros(B, dtype=np.int64)
+        return ArenaMoveResult(
+            chosen_slots=np.zeros(B, dtype=np.int64),
+            move_bytes=np.zeros((B, orch.ext.SIZEOF_GPU_MOVE), dtype=np.uint8),
+        )
 
     priors_per_legal, _root_vals, child_q_per_legal = orch._eval_states(
         states, legal_moves, num_legal, B, root_features,
@@ -642,30 +684,36 @@ def choose_fnn_puct_moves(
 
     chosen_np = chosen.cpu().numpy()
     out = np.zeros(B, dtype=np.int64)
+    move_bytes = np.zeros((B, orch.ext.SIZEOF_GPU_MOVE), dtype=np.uint8)
+    legal_np = legal_moves.cpu().numpy()
     for i in range(B):
         n_i = int(nlegal_np[i])
-        if n_i <= 0:
+        if n_i <= 0 or not bool(active_mask[i]):
             out[i] = 0
         else:
             k = int(chosen_np[i])
             out[i] = 0 if k >= n_i else k
-    return out
+            move_bytes[i] = legal_np[i, out[i]]
+    return ArenaMoveResult(chosen_slots=out, move_bytes=move_bytes)
 
 
 def choose_moves(
     model_type: ModelType,
     orch: object,
     states: torch.Tensor,
+    active_mask: np.ndarray,
+    tree: dict[str, torch.Tensor] | None = None,
     move_numbers: np.ndarray | None = None,
     stochastic: bool = False,
     gumbel_noise_scale: float = 0.0,
     policy_only: bool = False,
-) -> np.ndarray:
+) -> ArenaMoveResult:
     if policy_only:
         if model_type == "fnn":
             return choose_fnn_policy_moves(
                 orch,
                 states,
+                active_mask=active_mask,
                 move_numbers=move_numbers,
                 stochastic=stochastic,
                 gumbel_noise_scale=gumbel_noise_scale,
@@ -673,6 +721,7 @@ def choose_moves(
         return choose_prs_policy_moves(
             orch,
             states,
+            active_mask=active_mask,
             move_numbers=move_numbers,
             stochastic=stochastic,
             gumbel_noise_scale=gumbel_noise_scale,
@@ -681,6 +730,8 @@ def choose_moves(
         return choose_fnn_moves(
             orch,
             states,
+            active_mask=active_mask,
+            tree=tree,
             move_numbers=move_numbers,
             stochastic=stochastic,
             gumbel_noise_scale=gumbel_noise_scale,
@@ -688,10 +739,59 @@ def choose_moves(
     return choose_prs_moves(
         orch,
         states,
+        active_mask=active_mask,
+        tree=tree,
         move_numbers=move_numbers,
         stochastic=stochastic,
         gumbel_noise_scale=gumbel_noise_scale,
     )
+
+
+def _tree_child_nodes_from_slots(
+    tree: dict[str, torch.Tensor],
+    chosen_slots: np.ndarray,
+) -> list[int]:
+    B = int(chosen_slots.shape[0])
+    fc = tree["first_child"][
+        torch.arange(B, device="cuda", dtype=torch.long),
+        tree["root_node"],
+    ].cpu().numpy()
+    nc = tree["num_children"][
+        torch.arange(B, device="cuda", dtype=torch.long),
+        tree["root_node"],
+    ].cpu().numpy()
+    out = [-1] * B
+    for i in range(B):
+        slot = int(chosen_slots[i])
+        fci = int(fc[i])
+        nci = int(nc[i])
+        if fci < 0 or slot < 0 or slot >= nci:
+            continue
+        out[i] = fci + slot
+    return out
+
+
+def _reset_tree_rows(
+    tree: dict[str, torch.Tensor],
+    rows: np.ndarray,
+) -> None:
+    if rows.size == 0:
+        return
+    row_t = torch.from_numpy(rows.astype(np.int64, copy=False)).to("cuda")
+    tree["visit_count"][row_t] = 0
+    tree["total_value"][row_t] = 0
+    tree["prior"][row_t] = 0
+    tree["virtual_q_penalty"][row_t] = 0
+    tree["parent_idx"][row_t] = -1
+    tree["move_bytes"][row_t] = 0
+    tree["action_idx"][row_t] = -1
+    tree["first_child"][row_t] = -1
+    tree["num_children"][row_t] = 0
+    tree["is_terminal"][row_t] = 0
+    tree["terminal_value"][row_t] = 0
+    tree["node_count"][row_t] = 1
+    tree["root_node"][row_t] = 0
+    tree["child_init_q"][row_t] = 0
 
 
 def main() -> None:
@@ -815,6 +915,10 @@ def main() -> None:
 
     B = args.games
     states = ext.create_initial_states(B, args.expansion_mask)
+    white_tree = white_orch._alloc_tree(B)
+    white_orch._reset_tree(white_tree)
+    black_tree = black_orch._alloc_tree(B)
+    black_orch._reset_tree(black_tree)
     active = np.ones(B, dtype=bool)
     move_numbers = np.zeros(B, dtype=np.int32)
     if args.alternate_colors:
@@ -837,35 +941,42 @@ def main() -> None:
         white_turn = active & (white_to_move == white_is_model_a)
         black_turn = active & ~white_turn
 
+        white_result = choose_moves(
+            args.white_model,
+            white_orch,
+            states,
+            active_mask=white_turn,
+            tree=white_tree,
+            move_numbers=move_numbers,
+            stochastic=args.stochastic,
+            gumbel_noise_scale=args.gumbel_noise_scale,
+            policy_only=args.white_policy_only,
+        )
+        black_result = choose_moves(
+            args.black_model,
+            black_orch,
+            states,
+            active_mask=black_turn,
+            tree=black_tree,
+            move_numbers=move_numbers,
+            stochastic=args.stochastic,
+            gumbel_noise_scale=args.gumbel_noise_scale,
+            policy_only=args.black_policy_only,
+        )
+
         move_bytes = np.zeros((B, ext.SIZEOF_GPU_MOVE), dtype=np.uint8)
-        for mask, model_type, orch in (
-            (white_turn, args.white_model, white_orch),
-            (black_turn, args.black_model, black_orch),
-        ):
-            idx = np.flatnonzero(mask)
-            if idx.size == 0:
-                continue
-            sub_states = states[idx].clone()
-            chosen = choose_moves(
-                model_type,
-                orch,
-                sub_states,
-                move_numbers=move_numbers[idx],
-                stochastic=args.stochastic,
-                gumbel_noise_scale=args.gumbel_noise_scale,
-                policy_only=args.white_policy_only if model_type == args.white_model and orch is white_orch else args.black_policy_only,
-            )
-            legal_t, nlegal_t = orch.ext.generate_legal_moves_batch(sub_states, idx.size)
-            legal_np = legal_t.cpu().numpy()
-            nlegal_np = nlegal_t.cpu().numpy()
-            for j, game_idx in enumerate(idx):
-                n_i = int(nlegal_np[j])
-                if n_i <= 0:
-                    continue
-                k = int(chosen[j])
-                if k >= n_i:
-                    k = 0
-                move_bytes[game_idx] = legal_np[j, k]
+        if white_turn.any():
+            move_bytes[white_turn] = white_result.move_bytes[white_turn]
+        if black_turn.any():
+            move_bytes[black_turn] = black_result.move_bytes[black_turn]
+
+        moved_mask = white_turn | black_turn
+        chosen_slots_all = np.full(B, -1, dtype=np.int64)
+        chosen_slots_all[white_turn] = white_result.chosen_slots[white_turn]
+        chosen_slots_all[black_turn] = black_result.chosen_slots[black_turn]
+
+        white_child_nodes = _tree_child_nodes_from_slots(white_tree, chosen_slots_all)
+        black_child_nodes = _tree_child_nodes_from_slots(black_tree, chosen_slots_all)
 
         active_idx = np.flatnonzero(active)
         if active_idx.size == 0:
@@ -875,6 +986,13 @@ def main() -> None:
         ext.apply_moves_batch(sub_states, sub_moves, int(active_idx.size))
         states[active_idx] = sub_states
         move_numbers[active_idx] += 1
+
+        stale_white = moved_mask & (np.array(white_child_nodes, dtype=np.int64) < 0)
+        stale_black = moved_mask & (np.array(black_child_nodes, dtype=np.int64) < 0)
+        _reset_tree_rows(white_tree, np.flatnonzero(stale_white))
+        _reset_tree_rows(black_tree, np.flatnonzero(stale_black))
+        white_orch._reroot_tree(white_tree, B, moved_mask.tolist(), white_child_nodes)
+        black_orch._reroot_tree(black_tree, B, moved_mask.tolist(), black_child_nodes)
 
         final_results = ext.check_results_batch(states, B).cpu().numpy()
         active = active & (final_results == 0) & (move_numbers < args.max_game_length)
