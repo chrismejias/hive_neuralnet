@@ -145,7 +145,12 @@ class FNNTrainer:
         self.device = get_device(self.config.device)
         self.ext = hive_gpu.load_extension()
         self.best_net = HiveFNN(self.net_config).to(self.device)
-        self.buffer = FNNReplayBuffer(self.config.buffer_max_size)
+        self.buffer = FNNReplayBuffer(
+            self.config.buffer_max_size,
+            device=self.device,
+            cache_root_features=self.device.type == "cuda",
+            gpu_sampling=self.device.type == "cuda",
+        )
         self.elo_tracker = EloTracker()
         self._start_iter = 1
         self.use_amp = (
@@ -269,7 +274,12 @@ class FNNTrainer:
         return flat, stats
 
     def _build_forward_batch(
-        self, state_bytes: torch.Tensor, batch_size: int,
+        self,
+        state_bytes: torch.Tensor,
+        batch_size: int,
+        num_actions: torch.Tensor | None = None,
+        cached_root_features: torch.Tensor | None = None,
+        cached_legal_moves: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode root + all successors for training.
 
@@ -279,12 +289,19 @@ class FNNTrainer:
             action_to_root: (N_total,) int64
             num_actions: (B,) int64
         """
-        legal_moves, num_legal, root_features = (
-            self.ext.generate_legal_moves_and_fnn_features_batch(
-                state_bytes, batch_size,
+        if cached_root_features is not None and cached_legal_moves is not None:
+            root_features = cached_root_features.float()
+            legal_moves = cached_legal_moves
+            if num_actions is None:
+                raise ValueError("Cached legal moves require cached action counts")
+            num_actions = num_actions.to(torch.int64)
+        else:
+            legal_moves, num_legal, root_features = (
+                self.ext.generate_legal_moves_and_fnn_features_batch(
+                    state_bytes, batch_size,
+                )
             )
-        )
-        num_actions = num_legal.to(torch.int64)
+            num_actions = num_legal.to(torch.int64)
 
         max_legal = legal_moves.shape[1]
         device = state_bytes.device
@@ -321,17 +338,37 @@ class FNNTrainer:
         comp_sums: dict[str, float] = {}
         n_batches = 0
         self.best_net.train()
+        prefetch_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+
+        def fetch_next_batch() -> FNNTrainingBatch:
+            if prefetch_stream is None:
+                return self.buffer.sample_batch(cfg.batch_size, device=self.device)
+            with torch.cuda.stream(prefetch_stream):
+                return self.buffer.sample_batch(
+                    cfg.batch_size, device=self.device, non_blocking=True,
+                )
 
         for _epoch in range(cfg.num_epochs):
             batches_per_epoch = max(1, len(self.buffer) // cfg.batch_size)
+            next_batch = fetch_next_batch()
             for _ in range(batches_per_epoch):
-                batch: FNNTrainingBatch = self.buffer.sample_batch(
-                    cfg.batch_size,
-                ).to(self.device, non_blocking=True)
+                if prefetch_stream is not None:
+                    torch.cuda.current_stream(self.device).wait_stream(prefetch_stream)
+                batch = next_batch
+                if n_batches + 1 < batches_per_epoch * cfg.num_epochs:
+                    next_batch = fetch_next_batch()
 
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)
                 root_feat, succ_feat, a2r, n_act = self._build_forward_batch(
-                    batch.state_bytes, batch.state_bytes.shape[0],
+                    batch.state_bytes,
+                    batch.state_bytes.shape[0],
+                    batch.num_actions,
+                    batch.root_features,
+                    batch.legal_moves,
                 )
 
                 if self.use_amp and self.scaler is not None:

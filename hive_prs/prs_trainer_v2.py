@@ -288,11 +288,10 @@ class PRSTrainerV2:
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Full v2 forward from a training batch (trunk + CUDA bridge + heads)."""
         ext = hive_gpu.load_extension()
-        B = batch.state_bytes.shape[0]
-        # Upload state_bytes once and regenerate legal moves on GPU so the
-        # CUDA prs_v2_classify kernel can produce all bridge inputs.
-        states_gpu = torch.from_numpy(batch.state_bytes).cuda()
-        legal_t, nlegal_t = ext.generate_legal_moves_batch(states_gpu, B)
+        B = int(batch.state_bytes.shape[0])
+        states_gpu = batch.state_bytes
+        legal_t = batch.legal_moves_raw
+        nlegal_t = batch.nlegal_raw
         kernel_out = ext.prs_v2_classify_batch(
             states_gpu, legal_t, nlegal_t, B, int(legal_t.shape[1]),
         )
@@ -315,16 +314,33 @@ class PRSTrainerV2:
         total_loss_sum = 0.0
         comp_sums: dict[str, float] = {}
         n_batches = 0
+        total_batches = cfg.num_epochs * max(1, len(self.buffer) // cfg.batch_size)
+        prefetch_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+
+        def fetch_next_batch() -> PRSTrainingBatchV2:
+            batch = self.buffer.sample_batch(
+                cfg.batch_size, augment_prob=cfg.augment_prob,
+            )
+            if prefetch_stream is None:
+                return batch.to(self.device, non_blocking=True)
+            with torch.cuda.stream(prefetch_stream):
+                return batch.to(self.device, non_blocking=True)
 
         for _ in range(cfg.num_epochs):
             batches_per_epoch = max(1, len(self.buffer) // cfg.batch_size)
+            next_batch = fetch_next_batch()
             for _ in range(batches_per_epoch):
-                batch = self.buffer.sample_batch(
-                    cfg.batch_size, augment_prob=cfg.augment_prob,
-                )
-                batch = batch.to(self.device, non_blocking=True)
+                if prefetch_stream is not None:
+                    torch.cuda.current_stream(self.device).wait_stream(prefetch_stream)
+                batch = next_batch
+                if n_batches + 1 < total_batches:
+                    next_batch = fetch_next_batch()
 
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)
                 if self.use_amp and self._scaler is not None:
                     with torch.amp.autocast("cuda"):
                         logits, value, aux = self._forward_train(batch)

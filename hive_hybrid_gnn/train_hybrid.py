@@ -45,6 +45,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional comma-separated per-iteration simulation schedule.",
     )
     p.add_argument("--gumbel-considered", type=int, default=16)
+    p.add_argument("--queen-surround-reserve-slots", type=int, default=10)
+    p.add_argument(
+        "--queen-surround-reserve-immobile-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Restrict reserved surround slots to moves that leave the opponent "
+            "queen with no legal move of any kind, including pillbug or mosquito throws."
+        ),
+    )
     p.add_argument("--max-game-length", type=int, default=300)
     p.add_argument(
         "--gumbel-wave-parallel",
@@ -104,6 +114,8 @@ def main() -> None:
         mcts_simulations=args.simulations,
         simulation_schedule=sim_schedule,
         max_num_considered=args.gumbel_considered,
+        queen_surround_reserve_slots=args.queen_surround_reserve_slots,
+        queen_surround_reserve_immobile_only=args.queen_surround_reserve_immobile_only,
         max_game_length=args.max_game_length,
         batch_size=args.batch_size,
         num_epochs=args.epochs,
@@ -121,13 +133,28 @@ def main() -> None:
     net = HiveHybridGNN(net_config)
     print(f"Hybrid GNN: {net.count_parameters():,} parameters")
     print(
-        f"  FNN policy: {net_config.fnn_config.feat_dim} -> "
+        f"  FNN feature encoder: {net_config.fnn_config.feat_dim} -> "
         f"{net_config.fnn_config.hidden_dim} -> {net_config.fnn_config.embed_dim}"
     )
+    policy_in = net_config.fnn_config.embed_dim * 2 + net.graph_trunk.out_dim
     print(
-        f"  Graph value: hidden={net_config.graph_hidden_dim}, "
+        f"  Graph-aware policy: {policy_in} -> "
+        f"{net_config.fnn_config.action_hidden} -> 1"
+    )
+    print(
+        f"  Graph trunk/value: hidden={net_config.graph_hidden_dim}, "
         f"layers={net_config.graph_layers}, radius={net_config.graph_radius}"
     )
+    print(
+        "  Search: Gumbel-root MCTS with non-root PUCT MCTS "
+        f"(wave_parallel={train_config.gumbel_wave_parallel})"
+    )
+    if train_config.queen_surround_reserve_slots > 0:
+        print(
+            "  Root reserve: "
+            f"{train_config.queen_surround_reserve_slots} surround slots "
+            f"(immobile_only={train_config.queen_surround_reserve_immobile_only})"
+        )
     del net
 
     trainer = HybridTrainer(train_config, net_config)

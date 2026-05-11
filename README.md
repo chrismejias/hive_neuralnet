@@ -121,7 +121,6 @@ nohup python3.11 -u -m hive_fnn.train_fnn \
   --checkpoint-dir checkpoints_fnn \
   --checkpoint-keep-every 50 \
   --gumbel-wave-parallel \
-  --gumbel-deterministic-non-root \
   >> checkpoints_fnn/training.log 2>&1 < /dev/null &
 
 echo $!
@@ -187,7 +186,7 @@ Based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). 
 
 Each round gets an equal fraction of the total simulation budget. For example, with `256` simulations total, each round gets `64` simulations, so each of the first `16` candidates receives `4` simulations in round 1, each of the remaining `8` receives `8` in round 2, and so on.
 
-In the original paper, non-root search is deterministic and tries to preserve the root policy improvement semantics as closely as possible. In this codebase, the active PRS and FNN paths instead use non-root **PUCT MCTS** because it produced stronger play empirically. The inner-node exploration score is:
+In the original paper, non-root search is deterministic and tries to preserve the root policy improvement semantics as closely as possible. In this codebase, the active FNN, Hybrid GNN, and PRS paths instead use non-root **PUCT MCTS** because it produced stronger play empirically. The inner-node exploration score is:
 
 `Q + c_puct * P * sqrt(N_parent) / (1 + N_child)`
 
@@ -207,10 +206,10 @@ Finally, the training policy target is derived from these improved logits rather
 
 #### Project Deviations From The Original Algorithm
 
-The current project makes three deliberate changes relative to the original paper:
+The current project makes four deliberate changes relative to the original paper:
 
 1. **Non-root nodes use PUCT MCTS instead of pure policy-preserving sampling.**
-   The paper's non-root rule is closer to direct policy improvement. In this codebase, the active PRS and FNN search paths use non-root PUCT MCTS because it was empirically stronger than pure policy sampling.
+   The paper's non-root rule is closer to direct policy improvement. In this codebase, the active FNN, Hybrid GNN, and PRS search paths use non-root PUCT MCTS because it was empirically stronger than pure policy sampling.
 
 2. **The active PRS and FNN trainers use a visited-only Gumbel policy target.**
    For PRS and FNN self-play, legal moves outside the searched Gumbel candidate set receive zero target mass instead of keeping their raw prior. This outperformed the prior-preserving variant empirically.
@@ -227,6 +226,9 @@ So the active PRS/FNN target is:
   ```
 3. **Non-root nodes are explored in an escalating wave-parallel fashion.**
    The paper's serial schedule shrinks the amount of parallel work as halving proceeds. On GPU, that leaves batch efficiency on the table. In this project, each later round increases the number of parallel sims per surviving root move so the total batch stays roughly constant. For example, PRS uses `1,2,4,8` waves per round and FNN uses `2,4,8,16`.
+
+4. **FNN and Hybrid GNN root search reserve tactical queen-surround slots.**
+   The current FNN and Hybrid GNN training/self-play defaults reserve up to `10` root candidate slots for legal moves that increase opponent queen surround and leave that queen with no legal escape, including pillbug or mosquito throws. Those reserved moves are still ranked by policy within the tactical subset, and the remaining root slots are filled by the normal Gumbel-policy candidate selection.
    
 ## FNN (HiveGo-style Feedforward Network)
 
@@ -240,6 +242,7 @@ This is the **recommended engine** for current use. It is inspired by HiveGo's A
 - **Small** (~1.0K params): hidden=8, embed=8, action\_hidden=8
 - **Medium** (~6.3K params): hidden=32, embed=32, action\_hidden=32
 - **Large** (~18.8K params, current default): hidden=64, embed=64, action\_hidden=64
+- **Current search default**: Gumbel-root MCTS with non-root PUCT, visited-only policy targets, wave-parallel halving, and the queen-surround reserve described above
 
 ### 110-dim Feature Vector (per state, extracted by CUDA kernel)
 
