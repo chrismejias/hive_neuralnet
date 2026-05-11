@@ -737,6 +737,85 @@ __device__ inline int gen_pillbug_throws(const HiveState& s, int pb_cell,
     return count;
 }
 
+__device__ inline bool has_pillbug_throw_for_target(
+    const HiveState& s,
+    int pb_cell,
+    int target_cell,
+    const MovegenStateCache& cache
+) {
+    if (target_cell < 0 || !s.occupied.get(target_cell)) return false;
+    if (is_pinned(cache, target_cell)) return false;
+
+    int pb_height = s.height[pb_cell];
+    int lift_h = max(s.height[target_cell] - 1, pb_height);
+    int opp_dt = find_direction(target_cell, pb_cell);
+    if (opp_dt < 0) return false;
+    if (elevated_gate_blocked(s, target_cell, opp_dt, lift_h)) return false;
+
+    for (int dd = 0; dd < NUM_DIRS; dd++) {
+        int16_t dest_cell = NEIGHBORS[pb_cell][dd];
+        if (dest_cell < 0 || dest_cell == target_cell) continue;
+        if (s.occupied.get(dest_cell)) continue;
+        int drop_h = max(pb_height, 0);
+        if (!elevated_gate_blocked(s, pb_cell, dd, drop_h)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+__device__ inline bool has_queen_escape_move(const HiveState& s) {
+    Color color = current_player(s);
+    if (!is_queen_placed(s, color)) return false;
+    int qcell = s.queen_cell[(int)color];
+    if (qcell < 0 || qcell >= NUM_CELLS || !s.occupied.get(qcell)) return false;
+
+    MovegenStateCache cache;
+    init_movegen_state_cache(s, cache);
+
+    if (top_piece_type_at(s, qcell) == PT_QUEEN
+        && top_piece_color_at(s, qcell) == color
+        && !is_pinned(cache, qcell)
+        && has_queen_move(s, qcell)) {
+        return true;
+    }
+
+    const Bitboard& my_pieces = (color == WHITE) ? s.white_top : s.black_top;
+    for (int wi = 0; wi < BB_WORDS; wi++) {
+        uint64_t bits = my_pieces.w[wi];
+        while (bits) {
+            int bit = __ffsll(bits) - 1;
+            int cell = wi * 64 + bit;
+            bits &= bits - 1;
+            if (cell >= NUM_CELLS) continue;
+
+            PieceType pt = top_piece_type_at(s, cell);
+            if (pt == PT_PILLBUG) {
+                if (find_direction(cell, qcell) >= 0
+                    && has_pillbug_throw_for_target(s, cell, qcell, cache)) {
+                    return true;
+                }
+            } else if (pt == PT_MOSQUITO && s.height[cell] == 1) {
+                bool adj_pillbug = false;
+                for (int d = 0; d < NUM_DIRS; d++) {
+                    int16_t nb = NEIGHBORS[cell][d];
+                    if (nb >= 0 && s.occupied.get(nb)
+                        && top_piece_type_at(s, nb) == PT_PILLBUG) {
+                        adj_pillbug = true;
+                        break;
+                    }
+                }
+                if (adj_pillbug && find_direction(cell, qcell) >= 0
+                    && has_pillbug_throw_for_target(s, cell, qcell, cache)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 // ── Mosquito moves ──────────────────────────────────────────────────
 
 /**

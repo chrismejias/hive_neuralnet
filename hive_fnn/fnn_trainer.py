@@ -57,6 +57,8 @@ class FNNTrainConfig:
     gumbel_wave_parallel: bool = True
     gumbel_wave_size: int = 4
     puct_wave_size: int = 16
+    queen_surround_reserve_slots: int = 10
+    queen_surround_reserve_immobile_only: bool = True
 
 
 def _simulations_for_iteration(
@@ -238,6 +240,8 @@ class FNNTrainer:
                     expansion_mask=cfg.expansion_mask,
                     wave_parallel=cfg.gumbel_wave_parallel,
                     wave_size=cfg.gumbel_wave_size,
+                    queen_surround_reserve_slots=cfg.queen_surround_reserve_slots,
+                    queen_surround_reserve_immobile_only=cfg.queen_surround_reserve_immobile_only,
                 ),
             )
         raw = orch.self_play_batch()

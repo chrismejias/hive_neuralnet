@@ -90,6 +90,17 @@ __global__ void generate_legal_moves_and_fnn_features_kernel(
     }
 }
 
+__global__ void queen_escape_flags_kernel(
+    const HiveState* states,
+    uint8_t* flags_out,
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        flags_out[idx] = has_queen_escape_move(states[idx]) ? 1 : 0;
+    }
+}
+
 __global__ void fnn_successor_features_kernel(
     const HiveState* states,
     const GPUMove* legal_moves,       // [B, MAX_LEGAL_MOVES]
@@ -1130,6 +1141,24 @@ generate_legal_moves_and_fnn_features_batch(
         states_ptr, moves_ptr, num_legal_ptr, features_ptr, batch_size);
 
     return std::make_tuple(moves_tensor, num_legal, features);
+}
+
+at::Tensor queen_escape_flags_batch(
+    at::Tensor states_tensor,
+    int batch_size
+) {
+    auto opts_u8 = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+    auto flags = at::zeros({batch_size}, opts_u8);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(states_tensor.data_ptr());
+    uint8_t* flags_ptr = static_cast<uint8_t*>(flags.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    queen_escape_flags_kernel<<<blocks, threads>>>(
+        states_ptr, flags_ptr, batch_size);
+
+    return flags;
 }
 
 /**
