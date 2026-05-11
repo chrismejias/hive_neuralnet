@@ -26,6 +26,7 @@ import math
 import struct
 import sys
 import threading
+from dataclasses import dataclass
 from enum import Enum, auto
 
 import numpy as np
@@ -72,15 +73,19 @@ except ImportError:
 
 # ── Layout constants ────────────────────────────────────────────────
 
-WIN_W, WIN_H = 1120, 820
+WIN_W, WIN_H = 1460, 820
 STATUS_H = 58      # top status bar
 PANEL_W  = 190     # each side hand panel
+ANALYSIS_W = 300
 BOARD_X  = PANEL_W
 BOARD_Y  = STATUS_H
-BOARD_W  = WIN_W - 2 * PANEL_W
+BOARD_W  = WIN_W - 2 * PANEL_W - ANALYSIS_W
 BOARD_H  = WIN_H - STATUS_H
 BOARD_CX = BOARD_X + BOARD_W // 2
 BOARD_CY = BOARD_Y + BOARD_H // 2
+ANALYSIS_X = BOARD_X + BOARD_W
+ANALYSIS_Y = STATUS_H
+ANALYSIS_H = BOARD_H
 
 HEX_SIZE = 40  # flat-top hex, pixels from center to corner
 
@@ -111,6 +116,13 @@ C_DIM        = ( 95, 108, 130)
 C_ROW_NORMAL = ( 40,  44,  58)
 C_ROW_HOVER  = ( 48,  54,  70)
 C_ROW_SEL    = ( 48, 118,  64)
+C_ANALYSIS_BG = (24, 27, 35)
+C_ANALYSIS_CARD = (32, 36, 46)
+C_GRAPH_GRID = (58, 65, 80)
+C_GRAPH_WHITE = (228, 222, 206)
+C_GRAPH_BLACK = (74, 82, 108)
+C_GRAPH_AXIS = (118, 130, 160)
+C_PENDING = (145, 152, 170)
 
 # ── Piece metadata ──────────────────────────────────────────────────
 
@@ -372,20 +384,96 @@ class GpuAI:
         self.expansion_mask = expansion_mask
         self.gpu_state      = self.ext.create_initial_states(1, expansion_mask)
 
+    def set_expansion_mask(self, expansion_mask: int) -> None:
+        """Retarget the GPU state to the requested ruleset and reset search state."""
+        self.expansion_mask = expansion_mask
+        if hasattr(self.orch, "config"):
+            self.orch.config.expansion_mask = expansion_mask
+        self.reset()
+
     def apply_cpu_move(self, move: Move) -> None:
         """Mirror a CPU move onto the GPU state."""
         mb = _cpu_move_to_gpu_bytes(move)
         t  = torch.tensor(list(mb), dtype=torch.uint8, device="cuda").unsqueeze(0)
         self.ext.apply_moves_batch(self.gpu_state, t, 1)
 
+    def _analyze_state_tensor(self, state: torch.Tensor) -> MoveEval:
+        if hasattr(self.orch, "analyze_state_gpu"):
+            info = self.orch.analyze_state_gpu(state)
+            return MoveEval(
+                q_value=float(info.get("chosen_q", 0.0)),
+                root_value=float(info.get("root_value", 0.0)),
+                source="search",
+                simulations=int(getattr(self.orch.config, "num_simulations", 0)),
+            )
+        return MoveEval()
+
+    def analyze_current_state(self) -> MoveEval:
+        """Analyze the current GPU state without mutating it."""
+        return self._analyze_state_tensor(self.gpu_state)
+
+    def analyze_prefix(self, moves: list[Move]) -> MoveEval:
+        """Analyze a historical prefix by replaying moves on a temporary GPU state."""
+        temp_state = self.ext.create_initial_states(1, self.expansion_mask)
+        for move in moves:
+            mb = _cpu_move_to_gpu_bytes(move)
+            t = torch.tensor(list(mb), dtype=torch.uint8, device="cuda").unsqueeze(0)
+            self.ext.apply_moves_batch(temp_state, t, 1)
+        return self._analyze_state_tensor(temp_state)
+
     def select_move(self, game: GameState) -> Move:
         """Run GPU Gumbel MCTS and return the chosen CPU Move."""
+        legal = game.legal_moves()
+        if not legal:
+            return Move(MoveType.PASS, None, HexCoord(0, 0))
+
+        legal_by_bytes = {_cpu_move_to_gpu_bytes(mv): mv for mv in legal}
         move_bytes = self.orch.select_move_gpu(self.gpu_state)   # (6,) uint8 CPU
+        raw_bytes = bytes(move_bytes.cpu().tolist())
+
+        move = legal_by_bytes.get(raw_bytes)
+        if move is not None:
+            return move
+
+        # Defensive fallback: decode by structure, then verify it is truly legal
+        # under the CPU ruleset before accepting it.
         move = _gpu_bytes_to_cpu_move(move_bytes.numpy(), game)
-        if move is None:
-            legal = game.legal_moves()
-            move  = legal[0] if legal else Move(MoveType.PASS, None, HexCoord(0, 0))
-        return move
+        if move is not None:
+            legal_move = legal_by_bytes.get(_cpu_move_to_gpu_bytes(move))
+            if legal_move is not None:
+                return legal_move
+
+        print("WARNING: GPU search returned a move illegal under the CPU ruleset; falling back to first legal move.")
+        return legal[0]
+
+    def select_move_with_eval(self, game: GameState) -> tuple[Move, MoveEval]:
+        """Run GPU search and return both the move and root evaluation."""
+        legal = game.legal_moves()
+        if not legal:
+            return Move(MoveType.PASS, None, HexCoord(0, 0)), MoveEval(q_value=0.0, source="empty")
+
+        if hasattr(self.orch, "analyze_state_gpu"):
+            info = self.orch.analyze_state_gpu(self.gpu_state)
+            move_bytes = info["move_bytes"]
+            raw_bytes = bytes(move_bytes.cpu().tolist())
+            legal_by_bytes = {_cpu_move_to_gpu_bytes(mv): mv for mv in legal}
+            move = legal_by_bytes.get(raw_bytes)
+            if move is None:
+                move = _gpu_bytes_to_cpu_move(move_bytes.numpy(), game)
+                if move is not None:
+                    move = legal_by_bytes.get(_cpu_move_to_gpu_bytes(move))
+            if move is None:
+                print("WARNING: GPU analysis returned a move illegal under the CPU ruleset; falling back to first legal move.")
+                move = legal[0]
+            move_eval = MoveEval(
+                q_value=float(info.get("chosen_q", 0.0)),
+                root_value=float(info.get("root_value", 0.0)),
+                source="search",
+                simulations=int(getattr(self.orch.config, "num_simulations", 0)),
+            )
+            return move, move_eval
+
+        return self.select_move(game), MoveEval()
 
     def reset(self) -> None:
         """Reinitialize the GPU state to the starting position."""
@@ -398,6 +486,21 @@ class SelectMode(Enum):
     IDLE        = auto()
     HAND_PIECE  = auto()   # piece type chosen from hand → show placements
     BOARD_PIECE = auto()   # board piece chosen → show movements
+
+
+@dataclass
+class MoveEval:
+    q_value: float | None = None
+    root_value: float | None = None
+    source: str = ""
+    simulations: int = 0
+
+
+@dataclass
+class MoveRecord:
+    move: Move
+    mover: Color
+    eval: MoveEval
 
 
 # ── GPU validator ──────────────────────────────────────────────────
@@ -501,6 +604,13 @@ class HiveGUI:
         self.game = GameState(expansions=self.expansions)
         self.move_number = 0
         self.last_move: Move | None = None
+        self.move_records: list[MoveRecord] = []
+        self.history_states: list[GameState] = [self.game.copy()]
+        self.view_ply = 0
+        self.analysis_enabled = False
+        self.analysis_running = False
+        self._analysis_lock = threading.Lock()
+        self._analysis_pending: list[tuple[int, MoveEval]] = []
 
         # Selection
         self.mode = SelectMode.IDLE
@@ -511,7 +621,7 @@ class HiveGUI:
         # AI thread
         self._game_gen = 0          # incremented on restart to discard stale results
         self.ai_thinking = False
-        self._ai_result: tuple[Move, int] | None = None   # (move, game_gen)
+        self._ai_result: tuple[Move, MoveEval, int] | None = None   # (move, eval, game_gen)
         self._ai_lock = threading.Lock()
 
         # Camera (pan offset in pixels)
@@ -528,6 +638,16 @@ class HiveGUI:
         self.f_med:    pygame.font.Font
         self.f_small:  pygame.font.Font
         self.f_status: pygame.font.Font
+
+    def _shown_game(self) -> GameState:
+        idx = max(0, min(self.view_ply, len(self.history_states) - 1))
+        return self.history_states[idx]
+
+    def _latest_ply(self) -> int:
+        return len(self.move_records)
+
+    def _is_live_view(self) -> bool:
+        return self.view_ply == self._latest_ply()
 
     @property
     def _human(self) -> Color:
@@ -551,13 +671,13 @@ class HiveGUI:
                 immediate = find_immediate_win(game_snapshot)
                 if immediate is not None:
                     with self._ai_lock:
-                        self._ai_result = (immediate, gen)
+                        self._ai_result = (immediate, MoveEval(q_value=1.0, source="forced"), gen)
                     self.ai_thinking = False
                     return
 
-                move = gpu_ai.select_move(game_snapshot)
+                move, move_eval = gpu_ai.select_move_with_eval(game_snapshot)
                 with self._ai_lock:
-                    self._ai_result = (move, gen)
+                    self._ai_result = (move, move_eval, gen)
                 self.ai_thinking = False
 
             threading.Thread(target=gpu_worker, daemon=True).start()
@@ -567,7 +687,7 @@ class HiveGUI:
                 immediate = find_immediate_win(game_snapshot)
                 if immediate is not None:
                     with self._ai_lock:
-                        self._ai_result = (immediate, gen)
+                        self._ai_result = (immediate, MoveEval(q_value=1.0, source="forced"), gen)
                     self.ai_thinking = False
                     return
 
@@ -585,7 +705,7 @@ class HiveGUI:
                         best = legal[np.argmax(policy[legal])]
                         move = self.encoder.decode_action(int(best), game_snapshot)
                 with self._ai_lock:
-                    self._ai_result = (move, gen)
+                    self._ai_result = (move, MoveEval(), gen)
                 self.ai_thinking = False
 
             threading.Thread(target=worker, daemon=True).start()
@@ -660,11 +780,12 @@ class HiveGUI:
     # ── Board rendering ────────────────────────────────────────────
 
     def _draw_board(self, surf: pygame.Surface) -> None:
+        game = self._shown_game()
         # Draw board background and set clip rect to prevent drawing over panels
         pygame.draw.rect(surf, C_BOARD_BG, (BOARD_X, BOARD_Y, BOARD_W, BOARD_H))
         surf.set_clip(pygame.Rect(BOARD_X, BOARD_Y, BOARD_W, BOARD_H))
 
-        grid = self.game.board.grid
+        grid = game.board.grid
 
         # All hexes to consider: occupied + their neighbors + legal destinations
         context: set[HexCoord] = set(grid.keys())
@@ -688,6 +809,11 @@ class HiveGUI:
             self._poly_hex(surf, pos.q, pos.r, fill, C_HEX_BORDER)
 
         # Pieces
+        shown_last_move = (
+            self.move_records[self.view_ply - 1].move
+            if self.view_ply > 0 and self.view_ply <= len(self.move_records)
+            else None
+        )
         for pos, stack in grid.items():
             if not stack:
                 continue
@@ -700,13 +826,13 @@ class HiveGUI:
             )
             legal_dest = pos in self.legal_destinations
             last_move_dest = (
-                self.last_move is not None
-                and self.last_move.move_type in (MoveType.PLACE, MoveType.MOVE)
-                and self.last_move.to == pos
+                shown_last_move is not None
+                and shown_last_move.move_type in (MoveType.PLACE, MoveType.MOVE)
+                and shown_last_move.to == pos
             )
             queen_warn = (
                 top.piece_type == PieceType.QUEEN
-                and self.game.board.num_occupied_neighbors(pos) >= 5
+                and game.board.num_occupied_neighbors(pos) >= 5
             )
 
             fill = None
@@ -743,6 +869,7 @@ class HiveGUI:
         return rows
 
     def _draw_hand_panel(self, surf: pygame.Surface, color: Color) -> None:
+        game = self._shown_game()
         x = self._panel_x(color)
         pygame.draw.rect(surf, C_PANEL_BG, (x, STATUS_H, PANEL_W, BOARD_H))
         # Divider line
@@ -757,13 +884,13 @@ class HiveGUI:
         surf.blit(h_surf, (x + (PANEL_W - h_surf.get_width()) // 2, STATUS_H + 14))
 
         # Count pieces in hand
-        hand = self.game.hand(color)
+        hand = game.hand(color)
         counts: dict[PieceType, int] = {}
         for p in hand:
             counts[p.piece_type] = counts.get(p.piece_type, 0) + 1
 
         is_human = self.self_play or color == self.human_color
-        is_active = self.game.current_player == color
+        is_active = game.current_player == color
 
         for rect, pt in self._hand_row_rects(color):
             count = counts.get(pt, 0)
@@ -825,19 +952,22 @@ class HiveGUI:
     # ── Status bar ─────────────────────────────────────────────────
 
     def _draw_status(self, surf: pygame.Surface) -> None:
+        game = self._shown_game()
         pygame.draw.rect(surf, C_STATUS_BG, (0, 0, WIN_W, STATUS_H))
         pygame.draw.line(surf, C_HEX_BORDER, (0, STATUS_H - 1), (WIN_W, STATUS_H - 1), 1)
 
-        result = self.game.result
+        result = game.result
         if result == GameResult.IN_PROGRESS:
-            player = self.game.current_player
+            player = game.current_player
             pname = "WHITE" if player == Color.WHITE else "BLACK"
-            you = " (You)" if player == self.human_color else " (AI)"
+            you = ""
+            if not self.self_play:
+                you = " (You)" if player == self.human_color else " (AI)"
             if self.ai_thinking:
-                msg = f"Turn {self.game.turn + 1}  ·  {pname} is thinking..."
+                msg = f"Turn {game.turn + 1}  ·  {pname} is thinking..."
                 col = C_THINKING
             else:
-                msg = f"Turn {self.game.turn + 1}  ·  {pname}'s move{you}"
+                msg = f"Turn {game.turn + 1}  ·  {pname}'s move{you}"
                 col = C_TITLE
         elif result == GameResult.WHITE_WINS:
             msg = "WHITE WINS!   Press R to restart"
@@ -860,7 +990,14 @@ class HiveGUI:
             surf.blit(gs, (WIN_W - gs.get_width() - 12, 6))
 
         # Hint line
-        if result == GameResult.IN_PROGRESS and not self.ai_thinking:
+        if not self._is_live_view():
+            hint = (
+                f"Viewing move {self.view_ply}/{self._latest_ply()}  ·  "
+                "Left/Right navigate  ·  End returns live"
+            )
+            hs = self.f_small.render(hint, True, C_DIM)
+            surf.blit(hs, (WIN_W // 2 - hs.get_width() // 2, 38))
+        elif result == GameResult.IN_PROGRESS and not self.ai_thinking:
             if self.game.current_player == self.human_color:
                 if self.mode == SelectMode.IDLE:
                     hint = "Select a piece from your hand or click a piece on the board"
@@ -871,18 +1008,163 @@ class HiveGUI:
             hs = self.f_small.render(hint, True, C_DIM)
             surf.blit(hs, (WIN_W // 2 - hs.get_width() // 2, 38))
 
+    def _move_summary(self, move: Move) -> str:
+        if move.move_type == MoveType.PASS:
+            return "PASS"
+        piece = PIECE_SYM.get(move.piece.piece_type, "?") if move.piece else "?"
+        if move.move_type == MoveType.PLACE:
+            return f"{piece} -> ({move.to.q},{move.to.r})"
+        return f"{piece} ({move.from_pos.q},{move.from_pos.r}) -> ({move.to.q},{move.to.r})"
+
+    def _analysis_button_rects(self) -> dict[str, pygame.Rect]:
+        y = ANALYSIS_Y + ANALYSIS_H - 48
+        w = 64
+        gap = 8
+        x0 = ANALYSIS_X + 18
+        return {
+            "first": pygame.Rect(x0, y, w, 30),
+            "prev": pygame.Rect(x0 + (w + gap), y, w, 30),
+            "next": pygame.Rect(x0 + 2 * (w + gap), y, w, 30),
+            "last": pygame.Rect(x0 + 3 * (w + gap), y, w, 30),
+        }
+
+    def _draw_analysis_panel(self, surf: pygame.Surface) -> None:
+        pygame.draw.rect(surf, C_ANALYSIS_BG, (ANALYSIS_X, ANALYSIS_Y, ANALYSIS_W, ANALYSIS_H))
+        pygame.draw.line(surf, C_HEX_BORDER, (ANALYSIS_X, ANALYSIS_Y), (ANALYSIS_X, WIN_H), 1)
+
+        title = "Analyzer On" if self.analysis_enabled else "Analyzer Off"
+        title_s = self.f_med.render(title, True, C_TITLE)
+        surf.blit(title_s, (ANALYSIS_X + 18, ANALYSIS_Y + 12))
+        hint_s = self.f_small.render("A toggles analyzer", True, C_DIM)
+        surf.blit(hint_s, (ANALYSIS_X + 18, ANALYSIS_Y + 34))
+
+        if not self.analysis_enabled:
+            body = self.f_small.render(
+                "Toggle on to track move values, browse plies, and show the game graph.",
+                True,
+                C_PANEL_TEXT,
+            )
+            surf.blit(body, (ANALYSIS_X + 18, ANALYSIS_Y + 74))
+            return
+
+        latest = self._latest_ply()
+        selected_idx = self.view_ply - 1
+        card = pygame.Rect(ANALYSIS_X + 14, ANALYSIS_Y + 64, ANALYSIS_W - 28, 108)
+        pygame.draw.rect(surf, C_ANALYSIS_CARD, card, border_radius=8)
+
+        if 0 <= selected_idx < len(self.move_records):
+            rec = self.move_records[selected_idx]
+            mover = "White" if rec.mover == Color.WHITE else "Black"
+            move_s = self.f_med.render(
+                f"Move {selected_idx + 1}  ·  {mover}",
+                True,
+                C_TITLE,
+            )
+            surf.blit(move_s, (card.x + 12, card.y + 10))
+            desc_s = self.f_small.render(self._move_summary(rec.move), True, C_PANEL_TEXT)
+            surf.blit(desc_s, (card.x + 12, card.y + 38))
+            if rec.eval.q_value is None:
+                eval_text = "Q: pending"
+                eval_col = C_PENDING
+            else:
+                eval_text = f"Q: {rec.eval.q_value:+.3f}"
+                eval_col = C_WIN_W if rec.eval.q_value > 0 else (C_WIN_B if rec.eval.q_value < 0 else C_TITLE)
+            eval_s = self.f_large.render(eval_text, True, eval_col)
+            surf.blit(eval_s, (card.x + 12, card.y + 58))
+            if rec.eval.root_value is None:
+                root_text = "V: pending"
+                root_col = C_PENDING
+            else:
+                root_text = f"V: {rec.eval.root_value:+.3f}"
+                root_col = C_PANEL_TEXT
+            root_s = self.f_small.render(root_text, True, root_col)
+            surf.blit(root_s, (card.x + 14, card.y + 86))
+            meta = rec.eval.source or "unavailable"
+            meta_s = self.f_small.render(
+                f"{meta}  ·  sims {rec.eval.simulations}",
+                True,
+                C_DIM,
+            )
+            surf.blit(meta_s, (card.x + 132, card.y + 70))
+        else:
+            move_s = self.f_med.render("Initial position", True, C_TITLE)
+            surf.blit(move_s, (card.x + 12, card.y + 10))
+            desc_s = self.f_small.render("No move selected yet.", True, C_PANEL_TEXT)
+            surf.blit(desc_s, (card.x + 12, card.y + 38))
+
+        graph = pygame.Rect(ANALYSIS_X + 14, ANALYSIS_Y + 190, ANALYSIS_W - 28, 180)
+        pygame.draw.rect(surf, C_ANALYSIS_CARD, graph, border_radius=8)
+        gtitle = self.f_small.render("Game graph (white advantage)", True, C_TITLE)
+        surf.blit(gtitle, (graph.x + 12, graph.y + 8))
+
+        plot = pygame.Rect(graph.x + 12, graph.y + 30, graph.w - 24, graph.h - 54)
+        pygame.draw.rect(surf, (26, 28, 36), plot, border_radius=4)
+        mid_y = plot.y + plot.h // 2
+        pygame.draw.line(surf, C_GRAPH_AXIS, (plot.x, mid_y), (plot.right, mid_y), 1)
+        for i in range(1, 4):
+            y = plot.y + i * plot.h // 4
+            pygame.draw.line(surf, C_GRAPH_GRID, (plot.x, y), (plot.right, y), 1)
+
+        values: list[float | None] = []
+        for rec in self.move_records:
+            if rec.eval.q_value is None:
+                values.append(None)
+            elif rec.mover == Color.WHITE:
+                values.append(rec.eval.q_value)
+            else:
+                values.append(-rec.eval.q_value)
+
+        if values:
+            pts: list[tuple[int, int]] = []
+            denom = max(1, len(values) - 1)
+            for idx, val in enumerate(values):
+                if val is None:
+                    continue
+                x = plot.x + int(idx * plot.w / denom)
+                clipped = max(-1.0, min(1.0, float(val)))
+                y = plot.y + int((1.0 - (clipped + 1.0) * 0.5) * plot.h)
+                pts.append((x, y))
+            if len(pts) >= 2:
+                pygame.draw.lines(surf, C_TITLE, False, pts, 2)
+            for idx, val in enumerate(values):
+                if val is None:
+                    continue
+                x = plot.x + int(idx * plot.w / denom)
+                clipped = max(-1.0, min(1.0, float(val)))
+                y = plot.y + int((1.0 - (clipped + 1.0) * 0.5) * plot.h)
+                radius = 4 if idx == selected_idx else 3
+                color = C_W_PIECE if clipped >= 0 else C_B_PIECE
+                pygame.draw.circle(surf, color, (x, y), radius)
+                pygame.draw.circle(surf, C_HEX_BORDER, (x, y), radius, 1)
+
+        status = "Backfilling opponent moves..." if self.analysis_running else "Live"
+        status_s = self.f_small.render(status, True, C_DIM)
+        surf.blit(status_s, (graph.x + 12, graph.bottom - 20))
+
+        for name, rect in self._analysis_button_rects().items():
+            pygame.draw.rect(surf, C_ROW_NORMAL, rect, border_radius=6)
+            pygame.draw.rect(surf, C_HEX_BORDER, rect, 1, border_radius=6)
+            label = {"first": "|<", "prev": "<", "next": ">", "last": ">|"}[name]
+            txt = self.f_med.render(label, True, C_TITLE)
+            surf.blit(txt, txt.get_rect(center=rect.center))
+
     # ── Full draw ──────────────────────────────────────────────────
 
     def draw(self, surf: pygame.Surface) -> None:
         surf.fill(C_BG)
         self._draw_status(surf)
         self._draw_board(surf)
+        self._draw_analysis_panel(surf)
         self._draw_hand_panel(surf, Color.WHITE)
         self._draw_hand_panel(surf, Color.BLACK)
 
     # ── Input handling ─────────────────────────────────────────────
 
     def handle_click(self, px: int, py: int) -> None:
+        if self._handle_analysis_click(px, py):
+            return
+        if not self._is_live_view():
+            return
         if self.game.result != GameResult.IN_PROGRESS:
             return
         if self.ai_thinking:
@@ -963,6 +1245,7 @@ class HiveGUI:
         self.legal_destinations = set()
 
     def _apply_human(self, move: Move) -> None:
+        self._record_move(move, MoveEval())
         if self.gpu_validator:
             self.gpu_validator.apply_move(move)
         if self.gpu_ai:
@@ -970,11 +1253,14 @@ class HiveGUI:
         self.game.apply_move(move)
         self.last_move = move
         self.move_number += 1
+        self.history_states.append(self.game.copy())
+        self.view_ply = self._latest_ply()
         self._clear_selection()
         if self.gpu_validator:
             self.gpu_validator.validate(self.game)
 
-    def _apply_ai(self, move: Move) -> None:
+    def _apply_ai(self, move: Move, move_eval: MoveEval) -> None:
+        self._record_move(move, move_eval)
         if self.gpu_validator:
             self.gpu_validator.apply_move(move)
         # For GPU AI path the move was already chosen from the GPU state;
@@ -984,6 +1270,8 @@ class HiveGUI:
         self.game.apply_move(move)
         self.last_move = move
         self.move_number += 1
+        self.history_states.append(self.game.copy())
+        self.view_ply = self._latest_ply()
         if self.gpu_validator:
             self.gpu_validator.validate(self.game)
 
@@ -1024,6 +1312,53 @@ class HiveGUI:
         self.cam_x = 0.0
         self.cam_y = 0.0
 
+    def _set_view_ply(self, ply: int) -> None:
+        self.view_ply = max(0, min(ply, self._latest_ply()))
+        if not self._is_live_view():
+            self._clear_selection()
+
+    def _handle_analysis_click(self, px: int, py: int) -> bool:
+        if not self.analysis_enabled:
+            return False
+        for name, rect in self._analysis_button_rects().items():
+            if not rect.collidepoint(px, py):
+                continue
+            if name == "first":
+                self._set_view_ply(0)
+            elif name == "prev":
+                self._set_view_ply(self.view_ply - 1)
+            elif name == "next":
+                self._set_view_ply(self.view_ply + 1)
+            else:
+                self._set_view_ply(self._latest_ply())
+            return True
+        return False
+
+    def _record_move(self, move: Move, move_eval: MoveEval) -> None:
+        mover = self.game.current_player
+        self.move_records.append(MoveRecord(move=move, mover=mover, eval=move_eval))
+
+    def _queue_postgame_analysis(self) -> None:
+        if not self.analysis_enabled or self.gpu_ai is None or self.analysis_running:
+            return
+        pending = [i for i, rec in enumerate(self.move_records) if rec.eval.q_value is None]
+        if not pending:
+            return
+        self.analysis_running = True
+        moves_prefix = [rec.move for rec in self.move_records]
+        gpu_ai = self.gpu_ai
+
+        def worker() -> None:
+            updates: list[tuple[int, MoveEval]] = []
+            for idx in pending:
+                move_eval = gpu_ai.analyze_prefix(moves_prefix[:idx])
+                updates.append((idx, move_eval))
+            with self._analysis_lock:
+                self._analysis_pending.extend(updates)
+            self.analysis_running = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
     # ── Restart ────────────────────────────────────────────────────
 
     def _restart(self) -> None:
@@ -1031,12 +1366,18 @@ class HiveGUI:
         self.game = GameState(expansions=self.expansions)
         self.move_number = 0
         self.last_move = None
+        self.move_records = []
+        self.history_states = [self.game.copy()]
+        self.view_ply = 0
         self._clear_selection()
         self.hover_hex = None
         self.cam_x = 0.0
         self.cam_y = 0.0
         with self._ai_lock:
             self._ai_result = None
+        with self._analysis_lock:
+            self._analysis_pending = []
+        self.analysis_running = False
         if self.gpu_validator:
             self.gpu_validator.reset()
             self.gpu_validator.validate(self.game)
@@ -1073,8 +1414,18 @@ class HiveGUI:
                         running = False
                     elif event.key == pygame.K_r:
                         self._restart()
+                    elif event.key == pygame.K_a:
+                        self.analysis_enabled = not self.analysis_enabled
                     elif event.key == pygame.K_c:
                         self.center_camera()
+                    elif event.key == pygame.K_LEFT:
+                        self._set_view_ply(self.view_ply - 1)
+                    elif event.key == pygame.K_RIGHT:
+                        self._set_view_ply(self.view_ply + 1)
+                    elif event.key == pygame.K_HOME:
+                        self._set_view_ply(0)
+                    elif event.key == pygame.K_END:
+                        self._set_view_ply(self._latest_ply())
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self.handle_click(*event.pos)
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (2, 3):
@@ -1094,12 +1445,21 @@ class HiveGUI:
                     self._ai_result = None
 
             if pending is not None:
-                move, gen = pending
+                move, move_eval, gen = pending
                 if gen == self._game_gen:
-                    self._apply_ai(move)
+                    self._apply_ai(move, move_eval)
+
+            with self._analysis_lock:
+                analysis_updates = self._analysis_pending
+                self._analysis_pending = []
+            for idx, move_eval in analysis_updates:
+                if 0 <= idx < len(self.move_records):
+                    self.move_records[idx].eval = move_eval
 
             # Auto-pass if current player has no choice
             if (
+                self._is_live_view()
+                and
                 self.game.result == GameResult.IN_PROGRESS
                 and (self.self_play or self.game.current_player == self.human_color)
                 and not self.ai_thinking
@@ -1108,12 +1468,17 @@ class HiveGUI:
 
             # Start AI thinking when it's the AI's turn (not in self-play)
             if (
+                self._is_live_view()
+                and
                 not self.self_play
                 and self.game.result == GameResult.IN_PROGRESS
                 and self.game.current_player != self.human_color
                 and not self.ai_thinking
             ):
                 self._start_ai_think()
+
+            if self.game.result != GameResult.IN_PROGRESS:
+                self._queue_postgame_analysis()
 
             self.draw(screen)
             pygame.display.flip()
@@ -1238,6 +1603,17 @@ def load_checkpoint(
 
     print(f"  ELO rating:   {elo:.0f}")
     return net, encoder, model_name
+
+
+def _expansion_mask_from_config(expansions: ExpansionConfig | None) -> int:
+    """Convert CPU expansion config to the GPU expansion bitmask."""
+    if expansions is None:
+        return 0
+    return (
+        (1 if expansions.mosquito else 0)
+        | (2 if expansions.ladybug else 0)
+        | (4 if expansions.pillbug else 0)
+    )
 
 
 # ── Entry point ─────────────────────────────────────────────────────
@@ -1431,6 +1807,9 @@ def main() -> None:
             )
     elif args.engine == "fnn-cpu" and not exp_str and not args.base_game:
         expansion_config = ExpansionConfig(mosquito=True, ladybug=True, pillbug=True)
+
+    if gpu_ai is not None:
+        gpu_ai.set_expansion_mask(_expansion_mask_from_config(expansion_config))
 
     gui = HiveGUI(
         net, encoder, mcts_config, human_color,
