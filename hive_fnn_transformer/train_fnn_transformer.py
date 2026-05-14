@@ -1,4 +1,4 @@
-"""CLI entry point for hybrid GNN training."""
+"""CLI entry point for hybrid FNN transformer training."""
 
 from __future__ import annotations
 
@@ -6,31 +6,36 @@ import argparse
 import textwrap
 
 from hive_fnn.fnn_network import FNNConfig
-from hive_hybrid_gnn.hybrid_gnn_net import HybridGNNConfig, HiveHybridGNN
-from hive_hybrid_gnn.hybrid_trainer import HybridTrainConfig, HybridTrainer
+from hive_fnn_transformer.fnn_transformer_net import HybridGNNConfig, HiveHybridGNN
+from hive_fnn_transformer.fnn_transformer_trainer import HybridTrainConfig, HybridTrainer
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Train the hybrid FNN-policy + GNN-value model",
+        description="Train the hybrid FNN-policy + transformer-value model",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Example:
               cd /workspace/hive_neuralnet
-              python3.11 -u -m hive_hybrid_gnn.train_hybrid \\
+              python3.11 -u -m hive_fnn_transformer.train_fnn_transformer \\
                 --preset large \\
                 --iterations 1 \\
                 --games 32 \\
                 --simulations 64 \\
                 --gumbel-considered 16 \\
-                --checkpoint-dir checkpoints_hybrid_gnn
+                --checkpoint-dir checkpoints_fnn_transformer
         """),
     )
 
     p.add_argument("--preset", choices=["small", "large"], default="large")
     p.add_argument("--graph-hidden-dim", type=int, default=None)
     p.add_argument("--graph-layers", type=int, default=None)
-    p.add_argument("--graph-radius", type=int, default=2)
+    p.add_argument(
+        "--graph-radius",
+        type=int,
+        default=2,
+        help="Deprecated for the transformer trunk; retained for CLI compatibility.",
+    )
     p.add_argument("--graph-mlp-hidden", type=int, default=None)
     p.add_argument("--value-hidden", type=int, default=None)
     p.add_argument("--fnn-preset", choices=["small", "medium", "large"], default=None)
@@ -55,6 +60,26 @@ def parse_args() -> argparse.Namespace:
             "queen with no legal move of any kind, including pillbug or mosquito throws."
         ),
     )
+    p.add_argument(
+        "--short-forced-win-probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    p.add_argument(
+        "--probe-win-in-one",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument(
+        "--probe-check-opponent-wins",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument(
+        "--probe-win-in-two",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     p.add_argument("--max-game-length", type=int, default=300)
     p.add_argument(
         "--gumbel-wave-parallel",
@@ -67,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--buffer-size", type=int, default=100_000)
-    p.add_argument("--checkpoint-dir", type=str, default="checkpoints_hybrid_gnn")
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints_fnn_transformer")
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
     p.add_argument("--resume", type=str, default=None)
     p.add_argument(
@@ -128,22 +153,27 @@ def main() -> None:
         draw_keep_rate=args.draw_keep_rate,
         graph_radius=args.graph_radius,
         gumbel_wave_parallel=args.gumbel_wave_parallel,
+        short_forced_win_probe=args.short_forced_win_probe,
+        probe_win_in_one=args.probe_win_in_one,
+        probe_check_opponent_wins=args.probe_check_opponent_wins,
+        probe_win_in_two=args.probe_win_in_two,
     )
 
     net = HiveHybridGNN(net_config)
-    print(f"Hybrid GNN: {net.count_parameters():,} parameters")
+    print(f"FNN Transformer: {net.count_parameters():,} parameters")
     print(
         f"  FNN feature encoder: {net_config.fnn_config.feat_dim} -> "
         f"{net_config.fnn_config.hidden_dim} -> {net_config.fnn_config.embed_dim}"
     )
     policy_in = net_config.fnn_config.embed_dim * 2 + net.graph_trunk.out_dim
     print(
-        f"  Graph-aware policy: {policy_in} -> "
+        f"  Transformer-aware policy: {policy_in} -> "
         f"{net_config.fnn_config.action_hidden} -> 1"
     )
     print(
-        f"  Graph trunk/value: hidden={net_config.graph_hidden_dim}, "
-        f"layers={net_config.graph_layers}, radius={net_config.graph_radius}"
+        f"  Relative transformer/value: hidden={net_config.graph_hidden_dim}, "
+        f"layers={net_config.graph_layers}, heads={net_config.num_heads}, "
+        f"max_tokens={net_config.max_piece_tokens}"
     )
     print(
         "  Search: Gumbel-root MCTS with non-root PUCT MCTS "
@@ -154,6 +184,13 @@ def main() -> None:
             "  Root reserve: "
             f"{train_config.queen_surround_reserve_slots} surround slots "
             f"(immobile_only={train_config.queen_surround_reserve_immobile_only})"
+        )
+    if train_config.short_forced_win_probe:
+        print(
+            "  Tactical probe:"
+            f" win1={train_config.probe_win_in_one}"
+            f" oppwin={train_config.probe_check_opponent_wins}"
+            f" win2={train_config.probe_win_in_two}"
         )
     del net
 

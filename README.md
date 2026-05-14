@@ -18,7 +18,7 @@ That makes PRS interesting architecturally, but it currently needs much more wal
 | Model | Package | Params | Self-play |
 |-------|---------|--------|-----------|
 | FNN (recommended default) | `hive_fnn` | 1.0K – 18.8K | Gumbel-root MCTS / PUCT MCTS |
-| Hybrid GNN (experimental) | `hive_hybrid_gnn` | 125K+ | FNN successor features + graph-aware policy/value |
+| FNN Transformer (experimental) | `hive_fnn_transformer` | 166K+ | FNN successor features + piece-only relative-transformer policy/value |
 | PRS Transformer (research path) | `hive_prs` | 1.7M / 9.8M | Gumbel-root MCTS (v3 default trunk) |
 
 All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels for move generation, state encoding, and legal move lookup.
@@ -115,8 +115,8 @@ mkdir -p checkpoints_fnn
 nohup python3.11 -u -m hive_fnn.train_fnn \
   --preset large \
   --iterations 1000 \
-  --games 256 \
-  --simulations 2048 \
+  --games 512 \
+  --simulations 4096 \
   --gumbel-considered 16 \
   --checkpoint-dir checkpoints_fnn \
   --checkpoint-keep-every 50 \
@@ -338,56 +338,49 @@ The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 
 ---
 
-## Hybrid GNN (experimental FNN successor features + graph policy/value)
+## FNN Transformer (experimental FNN successor features + relative transformer policy/value)
 
-The hybrid GNN research direction lives in `hive_hybrid_gnn`.
+The experimental FNN transformer direction lives in `hive_fnn_transformer`.
 
 The hybrid model keeps the part of FNN that has worked best:
 
 - root and successor states are encoded as `110`-dim FNN feature vectors
-- policy logits compare the root FNN embedding, root graph embedding, and successor FNN embedding
-- a trained FNN checkpoint can initialize the shared FNN feature encoder, but the graph-aware policy tower is not weight-compatible with the FNN action tower
+- policy logits compare the root FNN embedding, root transformer summary, and successor FNN embedding
+- a trained FNN checkpoint can initialize the shared FNN feature encoder, but the transformer-aware policy tower is not weight-compatible with the FNN action tower
 
 It changes both policy and value:
 
 - the value head receives the FNN root embedding
-- it also receives a pooled graph embedding over the full board state
-- graph nodes include all board pieces, including buried stack pieces, plus grouped hand nodes
-- graph edges connect vertical stack neighbors and nearby top pieces
-
-The default graph radius is `2`, so a top piece connects to occupied cells
-within the 18 hexes at distance 1 or 2. Radius 1 is still available and gives
-the classic 6-neighbor local graph. Radius 2 increases the edge count, but it
-should improve message passing because two-step tactical motifs are available
-in a single layer rather than requiring an additional round of propagation.
-The default small preset now uses `5` graph layers with global-pool bias
-enabled; the large preset remains `5` layers at a wider hidden size.
+- it also receives a pooled piece-transformer summary over the current board state
+- the transformer sees one token per board piece, including buried stack pieces
+- attention uses relative `(q, r, z)` offsets only, with no absolute board-position embedding
+- the default trunk uses `8` heads and up to `28` piece tokens, matching the full Hive piece count
 
 Current status:
 
 - model scaffold is implemented
-- CPU `GameState` graph encoding is implemented for prototyping
-- CUDA `HiveState` graph encoding is implemented as a padded batched tensor path for training/search integration
-- GPU-native self-play and training are implemented through `hive_hybrid_gnn.train_hybrid`
-- the trainer reuses the FNN raw-state replay format and rebuilds FNN features, successor features, and graph tensors on GPU
-- this is intended as a lighter alternative to giving the value head a full PRS transformer trunk
+- CPU `GameState` graph encoding is still kept for archived diagnostics
+- CUDA `HiveState` piece-token encoding is implemented as a padded batched tensor path for training/search integration
+- GPU-native self-play and training are implemented through `hive_fnn_transformer.train_fnn_transformer`
+- the trainer reuses the FNN raw-state replay format and rebuilds FNN features, successor features, and piece-token tensors on GPU
+- this is intended as a lighter alternative to giving both policy and value a full PRS transformer trunk
 
 Quick smoke test:
 
 ```bash
-python3.11 -m hive_hybrid_gnn.train_hybrid \
+python3.11 -m hive_fnn_transformer.train_fnn_transformer \
   --preset small \
   --iterations 1 \
   --games 32 \
   --simulations 64 \
   --gumbel-considered 16 \
-  --checkpoint-dir checkpoints_hybrid_gnn_smoke
+  --checkpoint-dir checkpoints_fnn_transformer_smoke
 ```
 
 Quick parameter summary:
 
 ```bash
-python3.11 -m hive_hybrid_gnn
+python3.11 -m hive_fnn_transformer
 ```
 
 ---
@@ -654,8 +647,8 @@ hive_fnn/          # HiveGo-style FNN with multiple search paths
   fnn_puct_orchestrator.py  # Plain PUCT MCTS tree search
   fnn_trainer.py       # FNNTrainer training loop
   train_fnn.py         # CLI entry point
-hive_hybrid_gnn/   # Experimental FNN policy + graph value model
-  hybrid_gnn_net.py    # HiveHybridGNN
+hive_fnn_transformer/   # Experimental FNN policy + relative-transformer value model
+  fnn_transformer_net.py    # HiveHybridGNN / HiveFNNTransformer
   graph_encoder.py     # CPU GameState -> radius-1/radius-2 graph encoder
 tests/             # Test suite (250+ tests)
 archive/           # Archived legacy models, diagnostics, and old CPU training code

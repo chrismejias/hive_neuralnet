@@ -1,4 +1,4 @@
-"""Training loop for the hybrid FNN-policy + GNN-value model."""
+"""Training loop for the hybrid FNN-policy + transformer-value model."""
 
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ from hive_engine.device import get_device
 from hive_engine.elo import EloTracker
 from hive_fnn.fnn_replay_buffer import FNNReplayBuffer, FNNTrainingBatch
 from hive_fnn.fnn_trainer import compute_fnn_loss
-from hive_hybrid_gnn.gpu_encoder import HybridGraphGPUEncoder
-from hive_hybrid_gnn.hybrid_gnn_net import HybridGNNConfig, HiveHybridGNN
-from hive_hybrid_gnn.hybrid_mcts_orchestrator import (
+from hive_fnn_transformer.gpu_encoder import HybridTransformerGPUEncoder
+from hive_fnn_transformer.fnn_transformer_net import HybridGNNConfig, HiveHybridGNN
+from hive_fnn_transformer.fnn_transformer_mcts_orchestrator import (
     HybridMCTSConfig,
     HybridMCTSOrchestrator,
 )
@@ -49,7 +49,7 @@ class HybridTrainConfig:
     lr_min: float = 1e-5
 
     buffer_max_size: int = 100_000
-    checkpoint_dir: str = "checkpoints_hybrid_gnn"
+    checkpoint_dir: str = "checkpoints_fnn_transformer"
     checkpoint_keep_every: int = 0
 
     draw_keep_rate: float = 1.0
@@ -58,6 +58,10 @@ class HybridTrainConfig:
     device: str | None = None
     use_amp: bool | None = None
     gumbel_wave_parallel: bool = True
+    short_forced_win_probe: bool = False
+    probe_win_in_one: bool = True
+    probe_check_opponent_wins: bool = True
+    probe_win_in_two: bool = True
 
 
 def _simulations_for_iteration(
@@ -81,7 +85,7 @@ class HybridTrainer:
         self.device = get_device(self.config.device)
         self.ext = hive_gpu.load_extension()
         self.best_net = HiveHybridGNN(self.net_config).to(self.device)
-        self.graph_encoder = HybridGraphGPUEncoder(radius=self.config.graph_radius)
+        self.graph_encoder = HybridTransformerGPUEncoder()
         self.buffer = FNNReplayBuffer(
             self.config.buffer_max_size,
             device=self.device,
@@ -125,7 +129,7 @@ class HybridTrainer:
                 iteration,
             )
             print(f"\n{'=' * 60}")
-            print(f"Hybrid GNN Iteration {iteration}/{self.config.num_iterations}")
+            print(f"FNN Transformer Iteration {iteration}/{self.config.num_iterations}")
             print(f"  Simulations: {sims_this_iter}")
             print(f"{'=' * 60}")
 
@@ -167,6 +171,10 @@ class HybridTrainer:
                 expansion_mask=cfg.expansion_mask,
                 wave_parallel=cfg.gumbel_wave_parallel,
                 graph_radius=cfg.graph_radius,
+                short_forced_win_probe=cfg.short_forced_win_probe,
+                probe_win_in_one=cfg.probe_win_in_one,
+                probe_check_opponent_wins=cfg.probe_check_opponent_wins,
+                probe_win_in_two=cfg.probe_win_in_two,
             ),
         )
         raw = orch.self_play_batch()
@@ -217,6 +225,12 @@ class HybridTrainer:
             legal_moves=legal_moves,
             num_legal=num_legal,
         )
+        move_features_per_legal = self.ext.hybrid_transformer_move_features_batch(
+            state_bytes,
+            legal_moves,
+            num_legal,
+            batch_size,
+        )
         num_actions = num_legal.to(torch.int64)
 
         max_legal = legal_moves.shape[1]
@@ -230,7 +244,14 @@ class HybridTrainer:
         total_actions = int(action_to_root.shape[0])
 
         if total_actions == 0:
-            return root_features, root_features[:0], action_to_root, num_actions, graph_batch
+            return (
+                root_features,
+                root_features[:0],
+                action_to_root,
+                num_actions,
+                graph_batch,
+                move_features_per_legal.new_zeros((0, move_features_per_legal.shape[-1])),
+            )
 
         succ_features = self.ext.fnn_successor_features_batch(
             state_bytes,
@@ -239,7 +260,8 @@ class HybridTrainer:
             move_indices,
             total_actions,
         )
-        return root_features, succ_features, action_to_root, num_actions, graph_batch
+        move_features = move_features_per_legal[valid]
+        return root_features, succ_features, action_to_root, num_actions, graph_batch, move_features
 
     def _train(self, iteration: int) -> tuple[float, dict[str, float]]:
         cfg = self.config
@@ -280,7 +302,7 @@ class HybridTrainer:
                     next_batch = fetch_next_batch()
 
                 opt.zero_grad(set_to_none=True)
-                root_feat, succ_feat, a2r, n_act, graph_batch = self._build_forward_batch(
+                root_feat, succ_feat, a2r, n_act, graph_batch, move_features = self._build_forward_batch(
                     batch.state_bytes,
                     batch.state_bytes.shape[0],
                     batch.num_actions,
@@ -291,7 +313,7 @@ class HybridTrainer:
                 if self.use_amp and self.scaler is not None:
                     with torch.amp.autocast("cuda"):
                         action_logits, root_values = self.best_net(
-                            root_feat, succ_feat, a2r, n_act, graph_batch,
+                            root_feat, succ_feat, a2r, n_act, graph_batch, move_features,
                         )
                         loss, ld = compute_fnn_loss(
                             action_logits,
@@ -310,7 +332,7 @@ class HybridTrainer:
                     self.scaler.update()
                 else:
                     action_logits, root_values = self.best_net(
-                        root_feat, succ_feat, a2r, n_act, graph_batch,
+                        root_feat, succ_feat, a2r, n_act, graph_batch, move_features,
                     )
                     loss, ld = compute_fnn_loss(
                         action_logits,

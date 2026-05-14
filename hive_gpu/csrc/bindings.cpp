@@ -42,6 +42,13 @@ hybrid_gnn_encode_with_moves_batch(
     torch::Tensor num_legal_tensor,
     int batch_size,
     int radius);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor>
+hybrid_transformer_encode_with_moves_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    int batch_size);
 std::tuple<torch::Tensor, torch::Tensor> generate_legal_mask_batch(
     torch::Tensor states_tensor, int batch_size);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> generate_legal_moves_and_mask_batch(
@@ -67,12 +74,33 @@ generate_legal_moves_and_fnn_features_batch(
 torch::Tensor queen_escape_flags_batch(
     torch::Tensor states_tensor,
     int batch_size);
+torch::Tensor endgame_hit_mask_batch(
+    torch::Tensor states_tensor,
+    int batch_size,
+    int min_surround,
+    int max_surround,
+    bool require_mixed_pair);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+root_tactical_probe_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    torch::Tensor priors_tensor,
+    int batch_size,
+    bool enable_win_in_one,
+    bool enable_check_opponent_wins,
+    bool enable_win_in_two);
 torch::Tensor fnn_successor_features_batch(
     torch::Tensor states_tensor,
     torch::Tensor legal_moves_tensor,
     torch::Tensor action_to_root_tensor,
     torch::Tensor move_indices_tensor,
     int num_actions);
+torch::Tensor hybrid_transformer_move_features_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    int batch_size);
 
 // GPU-native FNN self-play
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -276,6 +304,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &hive_gpu::queen_escape_flags_batch,
           "Return whether the side to move's queen has any legal escape, including pillbug or mosquito throws",
           py::arg("states"), py::arg("batch_size"));
+    m.def("endgame_hit_mask_batch",
+          &hive_gpu::endgame_hit_mask_batch,
+          "Return a per-state mask for in-progress positions where both queens are placed and both queen surrounds lie within [min_surround, max_surround]",
+          py::arg("states"), py::arg("batch_size"),
+          py::arg("min_surround"), py::arg("max_surround"),
+          py::arg("require_mixed_pair") = false);
+    m.def("root_tactical_probe_batch",
+          &hive_gpu::root_tactical_probe_batch,
+          "Root tactical probe: immediate wins, opponent immediate-win pruning, and short forced-win checks",
+          py::arg("states"), py::arg("legal_moves"),
+          py::arg("num_legal"), py::arg("priors"),
+          py::arg("batch_size"),
+          py::arg("enable_win_in_one") = true,
+          py::arg("enable_check_opponent_wins") = true,
+          py::arg("enable_win_in_two") = true);
 
     m.def("fnn_successor_features_batch",
           &hive_gpu::fnn_successor_features_batch,
@@ -283,6 +326,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("states"), py::arg("legal_moves"),
           py::arg("action_to_root"), py::arg("move_indices"),
           py::arg("num_actions"));
+    m.def("hybrid_transformer_move_features_batch",
+          &hive_gpu::hybrid_transformer_move_features_batch,
+          "Extract per-legal-move descriptors for the FNN transformer policy head",
+          py::arg("states"), py::arg("legal_moves"),
+          py::arg("num_legal"), py::arg("batch_size"));
+    m.def("hybrid_transformer_encode_with_moves_batch",
+          &hive_gpu::hybrid_transformer_encode_with_moves_batch,
+          "Encode current-state piece tokens for the hybrid relative transformer",
+          py::arg("states"), py::arg("legal_moves"),
+          py::arg("num_legal"), py::arg("batch_size"));
 
     // ── GPU-native FNN self-play ────────────────────────────────────
     m.def("fnn_selfplay_batch", &hive_gpu::fnn_selfplay_batch,
@@ -342,7 +395,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("GLOBAL_FEAT_DIM") = hive_gpu::GLOBAL_FEAT_DIM;
     m.attr("HYBRID_MAX_NODES") = hive_gpu::HYBRID_MAX_NODES;
     m.attr("HYBRID_MAX_EDGES") = hive_gpu::HYBRID_MAX_EDGES;
+    m.attr("HYBRID_MAX_PIECE_TOKENS") = hive_gpu::HYBRID_MAX_PIECE_TOKENS;
     m.attr("HYBRID_NODE_FEAT_DIM") = hive_gpu::HYBRID_NODE_FEAT_DIM;
+    m.attr("HYBRID_MOVE_FEAT_DIM") = hive_gpu::HYBRID_MOVE_FEAT_DIM;
     m.attr("HYBRID_EDGE_FEAT_DIM") = hive_gpu::HYBRID_EDGE_FEAT_DIM;
     m.attr("HYBRID_GLOBAL_FEAT_DIM") = hive_gpu::HYBRID_GLOBAL_FEAT_DIM;
     m.attr("ENC_GRID") = hive_gpu::ENC_GRID;

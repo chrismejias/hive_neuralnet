@@ -1,4 +1,4 @@
-"""Graph data structures for the hybrid GNN value trunk."""
+"""Piece-token data structures for the hybrid FNN transformer trunk."""
 
 from __future__ import annotations
 
@@ -7,31 +7,59 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-NODE_FEAT_DIM = 27
+NODE_FEAT_DIM = 25
 GLOBAL_FEAT_DIM = 6
+MAX_PIECE_TOKENS = 28
+
+
+@dataclass
+class HybridPieceTensorBatch:
+    """Padded piece-token tensors produced by the CUDA encoder."""
+
+    token_features: torch.Tensor
+    token_q: torch.Tensor
+    token_r: torch.Tensor
+    token_z: torch.Tensor
+    token_mask: torch.Tensor
+    global_features: torch.Tensor
+    num_tokens: torch.Tensor
+
+    def to(self, device: torch.device | str) -> "HybridPieceTensorBatch":
+        return HybridPieceTensorBatch(
+            token_features=self.token_features.to(device),
+            token_q=self.token_q.to(device),
+            token_r=self.token_r.to(device),
+            token_z=self.token_z.to(device),
+            token_mask=self.token_mask.to(device),
+            global_features=self.global_features.to(device),
+            num_tokens=self.num_tokens.to(device),
+        )
 
 
 def edge_feat_dim_for_radius(radius: int) -> int:
-    """Return edge feature dimension for a hex neighborhood radius."""
+    """Legacy helper retained for archived graph diagnostics."""
     if radius < 1:
         raise ValueError("radius must be >= 1")
-    # [dq, dr] + one-hot offset bucket + is_stacked
-    return 2 + (3 * radius * (radius + 1)) + 1
+    return 3
 
 
 @dataclass
 class HybridGraph:
-    node_features: np.ndarray       # (N, 27) float32
-    edge_index: np.ndarray          # (2, E) int64
-    edge_features: np.ndarray       # (E, edge_feat_dim) float32
-    global_features: np.ndarray     # (6,) float32
+    """Legacy sparse-graph structure retained for archived diagnostics."""
+
+    node_features: np.ndarray
+    edge_index: np.ndarray
+    edge_features: np.ndarray
+    global_features: np.ndarray
     num_piece_nodes: int
-    node_positions: np.ndarray      # (num_piece_nodes, 2) int32
-    node_piece_types: np.ndarray    # (num_piece_nodes,) int32
+    node_positions: np.ndarray
+    node_piece_types: np.ndarray
 
 
 @dataclass
 class HybridGraphBatch:
+    """Legacy collated sparse-graph batch retained for archived diagnostics."""
+
     node_features: torch.Tensor
     edge_index: torch.Tensor
     edge_features: torch.Tensor
@@ -122,32 +150,4 @@ class HybridGraphBatch:
             node_piece_types=self.node_piece_types.to(device),
             batch=self.batch.to(device),
             piece_node_batch=self.piece_node_batch.to(device),
-        )
-
-
-@dataclass
-class HybridGraphTensorBatch:
-    """Padded batched graph tensors produced by the CUDA encoder."""
-
-    node_features: torch.Tensor
-    edge_src: torch.Tensor
-    edge_dst: torch.Tensor
-    edge_features: torch.Tensor
-    node_mask: torch.Tensor
-    edge_mask: torch.Tensor
-    global_features: torch.Tensor
-    num_nodes: torch.Tensor
-    num_edges: torch.Tensor
-
-    def to(self, device: torch.device | str) -> "HybridGraphTensorBatch":
-        return HybridGraphTensorBatch(
-            node_features=self.node_features.to(device),
-            edge_src=self.edge_src.to(device),
-            edge_dst=self.edge_dst.to(device),
-            edge_features=self.edge_features.to(device),
-            node_mask=self.node_mask.to(device),
-            edge_mask=self.edge_mask.to(device),
-            global_features=self.global_features.to(device),
-            num_nodes=self.num_nodes.to(device),
-            num_edges=self.num_edges.to(device),
         )

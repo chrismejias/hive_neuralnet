@@ -31,10 +31,12 @@ constexpr int ENC_HALF = 8;
 // padded edge slots than the PRS/FNN graph encoder above.
 constexpr int HYBRID_MAX_NODES = 48;
 constexpr int HYBRID_MAX_EDGES = 640;
-constexpr int HYBRID_NODE_FEAT_DIM = 27;
+constexpr int HYBRID_MAX_PIECE_TOKENS = 28;
+constexpr int HYBRID_NODE_FEAT_DIM = 25;
 constexpr int HYBRID_GLOBAL_FEAT_DIM = 6;
+constexpr int HYBRID_MOVE_FEAT_DIM = 25;
 constexpr int HYBRID_MAX_RADIUS = 2;
-constexpr int HYBRID_EDGE_FEAT_DIM = 2 + (3 * HYBRID_MAX_RADIUS * (HYBRID_MAX_RADIUS + 1)) + 1;
+constexpr int HYBRID_EDGE_FEAT_DIM = 3;
 
 // ── Action space constants (matches hive_engine/encoder.py) ──────────
 constexpr int NUM_ENC_GRID_CELLS = ENC_GRID * ENC_GRID;           // 169
@@ -85,24 +87,6 @@ __device__ __forceinline__ int hex_distance_delta(int dq, int dr) {
     return m > ads ? m : ads;
 }
 
-__device__ __forceinline__ int hybrid_offset_bucket(int dq, int dr, int radius) {
-    int target_dist = hex_distance_delta(dq, dr);
-    int idx = 0;
-    for (int dist = 1; dist <= radius; ++dist) {
-        for (int cand_dq = -radius; cand_dq <= radius; ++cand_dq) {
-            for (int cand_dr = -radius; cand_dr <= radius; ++cand_dr) {
-                if (cand_dq == 0 && cand_dr == 0) continue;
-                if (hex_distance_delta(cand_dq, cand_dr) != dist) continue;
-                if (dist == target_dist && cand_dq == dq && cand_dr == dr) {
-                    return idx;
-                }
-                idx++;
-            }
-        }
-    }
-    return -1;
-}
-
 __global__ void hybrid_gnn_encode_states_kernel(
     const HiveState* states,
     const GPUMove* legal_moves,     // [B, MAX_LEGAL_MOVES] or nullptr
@@ -146,20 +130,6 @@ __global__ void hybrid_gnn_encode_states_kernel(
     for (int i = 0; i < HYBRID_GLOBAL_FEAT_DIM; ++i) gf[i] = 0.0f;
 
     float queen_surround[2] = {0.0f, 0.0f};
-    Bitboard ap_mask = find_articulation_points(s);
-    uint8_t can_move_top[NUM_CELLS];
-    for (int cell = 0; cell < NUM_CELLS; ++cell) can_move_top[cell] = 0;
-    if (use_move_flags && legal_moves != nullptr && num_legal != nullptr) {
-        const GPUMove* my_moves = legal_moves + idx * MAX_LEGAL_MOVES;
-        int n_legal = num_legal[idx];
-        for (int m = 0; m < n_legal; ++m) {
-            const GPUMove& mv = my_moves[m];
-            if (mv.type == MOVE_MOVE && mv.from_cell < NUM_CELLS && s.height[mv.from_cell] > 0) {
-                can_move_top[mv.from_cell] = 1;
-            }
-        }
-    }
-
     for (int c = 0; c < 2; ++c) {
         uint16_t qc = s.queen_cell[c];
         if (qc != 0xFFFF) {
@@ -213,10 +183,6 @@ __global__ void hybrid_gnn_encode_states_kernel(
                 for (int d = 0; d < NUM_DIRS; ++d) {
                     if (!occ_flags[d]) f[16 + d] = 1.0f;
                 }
-                f[25] = can_move_top[cell] ? 1.0f : 0.0f;
-                if (h == 1 && ap_mask.get(cell)) {
-                    f[26] = 1.0f;
-                }
                 top_node_at[cell] = (int16_t)node_count;
             }
             f[24] = level * 0.25f;
@@ -262,13 +228,11 @@ __global__ void hybrid_gnn_encode_states_kernel(
                     if (dst_node < 0) continue;
                     if (edge_count >= HYBRID_MAX_EDGES) break;
 
-                    int bucket = hybrid_offset_bucket(dq, dr, radius);
                     es[edge_count] = src_node;
                     ed[edge_count] = dst_node;
                     float* e = ef + edge_count * HYBRID_EDGE_FEAT_DIM;
                     e[0] = (float)dq / (float)radius;
                     e[1] = (float)dr / (float)radius;
-                    if (bucket >= 0) e[2 + bucket] = 1.0f;
                     em[edge_count] = true;
                     edge_count++;
                 }
@@ -279,7 +243,6 @@ __global__ void hybrid_gnn_encode_states_kernel(
         if (edge_count >= HYBRID_MAX_EDGES) break;
     }
 
-    int stacked_bucket = 2 + 3 * radius * (radius + 1);
     for (int cell = 0; cell < NUM_CELLS; ++cell) {
         int h = s.height[cell];
         if (h < 2) continue;
@@ -292,14 +255,14 @@ __global__ void hybrid_gnn_encode_states_kernel(
             if (edge_count < HYBRID_MAX_EDGES) {
                 es[edge_count] = lower;
                 ed[edge_count] = upper;
-                ef[edge_count * HYBRID_EDGE_FEAT_DIM + stacked_bucket] = 1.0f;
+                ef[edge_count * HYBRID_EDGE_FEAT_DIM + 2] = 1.0f;
                 em[edge_count] = true;
                 edge_count++;
             }
             if (edge_count < HYBRID_MAX_EDGES) {
                 es[edge_count] = upper;
                 ed[edge_count] = lower;
-                ef[edge_count * HYBRID_EDGE_FEAT_DIM + stacked_bucket] = 1.0f;
+                ef[edge_count * HYBRID_EDGE_FEAT_DIM + 2] = 1.0f;
                 em[edge_count] = true;
                 edge_count++;
             }
@@ -322,6 +285,192 @@ __global__ void hybrid_gnn_encode_states_kernel(
 
     num_nodes_out[idx] = node_count;
     num_edges_out[idx] = edge_count;
+}
+
+__global__ void hybrid_transformer_encode_states_kernel(
+    const HiveState* states,
+    const GPUMove* legal_moves,
+    const int* num_legal,
+    float* token_features,     // [B, HYBRID_MAX_PIECE_TOKENS, HYBRID_NODE_FEAT_DIM]
+    int* token_q,              // [B, HYBRID_MAX_PIECE_TOKENS]
+    int* token_r,              // [B, HYBRID_MAX_PIECE_TOKENS]
+    int* token_z,              // [B, HYBRID_MAX_PIECE_TOKENS]
+    bool* token_mask,          // [B, HYBRID_MAX_PIECE_TOKENS]
+    float* global_features,    // [B, HYBRID_GLOBAL_FEAT_DIM]
+    int* num_tokens_out,       // [B]
+    int batch_size,
+    bool use_move_flags
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    const HiveState& s = states[idx];
+    float* tf = token_features + idx * HYBRID_MAX_PIECE_TOKENS * HYBRID_NODE_FEAT_DIM;
+    int* tq = token_q + idx * HYBRID_MAX_PIECE_TOKENS;
+    int* tr = token_r + idx * HYBRID_MAX_PIECE_TOKENS;
+    int* tz = token_z + idx * HYBRID_MAX_PIECE_TOKENS;
+    bool* tm = token_mask + idx * HYBRID_MAX_PIECE_TOKENS;
+    float* gf = global_features + idx * HYBRID_GLOBAL_FEAT_DIM;
+
+    for (int i = 0; i < HYBRID_MAX_PIECE_TOKENS * HYBRID_NODE_FEAT_DIM; ++i) tf[i] = 0.0f;
+    for (int i = 0; i < HYBRID_MAX_PIECE_TOKENS; ++i) {
+        tq[i] = 0;
+        tr[i] = 0;
+        tz[i] = 0;
+        tm[i] = false;
+    }
+    for (int i = 0; i < HYBRID_GLOBAL_FEAT_DIM; ++i) gf[i] = 0.0f;
+
+    float queen_surround[2] = {0.0f, 0.0f};
+    for (int c = 0; c < 2; ++c) {
+        uint16_t qc = s.queen_cell[c];
+        if (qc != 0xFFFF) {
+            int cnt = 0;
+            for (int d = 0; d < NUM_DIRS; ++d) {
+                int16_t nb = NEIGHBORS[qc][d];
+                if (nb >= 0 && s.height[nb] > 0) cnt++;
+            }
+            queen_surround[c] = cnt / 6.0f;
+        }
+    }
+
+    int token_count = 0;
+    for (int cell = 0; cell < NUM_CELLS; ++cell) {
+        int h = s.height[cell];
+        if (h == 0) continue;
+
+        int occ_flags[NUM_DIRS];
+        int occ_count = 0;
+        for (int d = 0; d < NUM_DIRS; ++d) {
+            int16_t nb = NEIGHBORS[cell][d];
+            occ_flags[d] = (nb >= 0 && s.height[nb] > 0) ? 1 : 0;
+            occ_count += occ_flags[d];
+        }
+
+        int col = cell % BOARD_SIZE;
+        int row = cell / BOARD_SIZE;
+        for (int level = 0; level < h; ++level) {
+            if (token_count >= HYBRID_MAX_PIECE_TOKENS) break;
+            uint8_t packed = s.pieces[level][cell];
+            PieceType pt = cell_piece_type(packed);
+            Color pc = cell_color(packed);
+            bool is_top = (level == h - 1);
+
+            float* f = tf + token_count * HYBRID_NODE_FEAT_DIM;
+            f[pt - 1] = 1.0f;
+            f[8 + pc] = 1.0f;
+            f[10] = (level == 0) ? 1.0f : 0.0f;
+            f[11] = is_top ? 1.0f : 0.0f;
+            f[12] = h / 4.0f;
+            f[13] = (pt == PT_QUEEN) ? 1.0f : 0.0f;
+            f[14] = queen_surround[pc];
+            f[15] = occ_count / 6.0f;
+            if (is_top) {
+                for (int d = 0; d < NUM_DIRS; ++d) {
+                    if (!occ_flags[d]) f[16 + d] = 1.0f;
+                }
+            }
+            f[24] = level * 0.25f;
+
+            tq[token_count] = col;
+            tr[token_count] = row;
+            tz[token_count] = level;
+            tm[token_count] = true;
+            token_count++;
+        }
+    }
+
+    Color cur = current_player(s);
+    gf[0] = (cur == WHITE) ? 1.0f : 0.0f;
+    gf[1] = (s.turn / 100.0f < 1.0f) ? s.turn / 100.0f : 1.0f;
+    gf[2] = is_queen_placed(s, WHITE) ? 1.0f : 0.0f;
+    gf[3] = is_queen_placed(s, BLACK) ? 1.0f : 0.0f;
+    int white_hand = 0;
+    int black_hand = 0;
+    for (int p = 0; p < NUM_PIECE_TYPES; ++p) {
+        white_hand += s.hands[0][p];
+        black_hand += s.hands[1][p];
+    }
+    gf[4] = white_hand / 14.0f;
+    gf[5] = black_hand / 14.0f;
+
+    num_tokens_out[idx] = token_count;
+}
+
+__global__ void hybrid_transformer_move_features_kernel(
+    const HiveState* states,
+    const GPUMove* legal_moves,
+    const int* num_legal,
+    float* move_features,   // [B, MAX_LEGAL_MOVES, HYBRID_MOVE_FEAT_DIM]
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    const HiveState& s = states[idx];
+    const GPUMove* my_moves = legal_moves + (int64_t)idx * MAX_LEGAL_MOVES;
+    float* out = move_features + (int64_t)idx * MAX_LEGAL_MOVES * HYBRID_MOVE_FEAT_DIM;
+    int nlegal = num_legal[idx];
+    for (int i = 0; i < MAX_LEGAL_MOVES * HYBRID_MOVE_FEAT_DIM; ++i) out[i] = 0.0f;
+
+    Color mover = current_player(s);
+    Color opp = (mover == WHITE) ? BLACK : WHITE;
+    int own_q = (int)s.queen_cell[mover];
+    int opp_q = (int)s.queen_cell[opp];
+    int own_q_col = (own_q >= 0 && own_q != 0xFFFF) ? (own_q % BOARD_SIZE - HALF_BOARD) : 0;
+    int own_q_row = (own_q >= 0 && own_q != 0xFFFF) ? (own_q / BOARD_SIZE - HALF_BOARD) : 0;
+    int opp_q_col = (opp_q >= 0 && opp_q != 0xFFFF) ? (opp_q % BOARD_SIZE - HALF_BOARD) : 0;
+    int opp_q_row = (opp_q >= 0 && opp_q != 0xFFFF) ? (opp_q / BOARD_SIZE - HALF_BOARD) : 0;
+
+    for (int m = 0; m < nlegal; ++m) {
+        const GPUMove& mv = my_moves[m];
+        float* f = out + (int64_t)m * HYBRID_MOVE_FEAT_DIM;
+
+        f[(int)mv.type] = 1.0f;  // 0: place, 1: move, 2: pass
+        if (mv.piece_type >= PT_QUEEN && mv.piece_type <= PT_PILLBUG) {
+            f[3 + ((int)mv.piece_type - 1)] = 1.0f;
+        }
+
+        bool has_source = (mv.type == MOVE_MOVE);
+        f[11] = has_source ? 1.0f : 0.0f;
+
+        int src_q = 0;
+        int src_r = 0;
+        int dst_q = 0;
+        int dst_r = 0;
+        int src_stack = 0;
+        int dst_stack = 0;
+        int dst_occ = 0;
+
+        if (mv.to_cell < NUM_CELLS) {
+            dst_q = (int)mv.to_cell % BOARD_SIZE - HALF_BOARD;
+            dst_r = (int)mv.to_cell / BOARD_SIZE - HALF_BOARD;
+            dst_stack = s.height[mv.to_cell];
+            dst_occ = dst_stack > 0 ? 1 : 0;
+        }
+        if (has_source && mv.from_cell < NUM_CELLS) {
+            src_q = (int)mv.from_cell % BOARD_SIZE - HALF_BOARD;
+            src_r = (int)mv.from_cell / BOARD_SIZE - HALF_BOARD;
+            src_stack = s.height[mv.from_cell];
+        }
+
+        f[12] = has_source ? (float)(dst_q - src_q) / (float)HALF_BOARD : 0.0f;
+        f[13] = has_source ? (float)(dst_r - src_r) / (float)HALF_BOARD : 0.0f;
+
+        f[14] = (float)(dst_q - own_q_col) / (float)HALF_BOARD;
+        f[15] = (float)(dst_r - own_q_row) / (float)HALF_BOARD;
+        f[16] = (float)(dst_q - opp_q_col) / (float)HALF_BOARD;
+        f[17] = (float)(dst_r - opp_q_row) / (float)HALF_BOARD;
+
+        f[18] = has_source ? (float)(src_q - own_q_col) / (float)HALF_BOARD : 0.0f;
+        f[19] = has_source ? (float)(src_r - own_q_row) / (float)HALF_BOARD : 0.0f;
+        f[20] = has_source ? (float)(src_q - opp_q_col) / (float)HALF_BOARD : 0.0f;
+        f[21] = has_source ? (float)(src_r - opp_q_row) / (float)HALF_BOARD : 0.0f;
+
+        f[22] = (float)src_stack / (float)MAX_STACK;
+        f[23] = (float)dst_stack / (float)MAX_STACK;
+        f[24] = (float)dst_occ;
+    }
 }
 
 // ── Encode kernel ────────────────────────────────────────────────────

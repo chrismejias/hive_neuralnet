@@ -12,7 +12,7 @@ from hive_engine.game_state import GameState
 from hive_engine.game_state import MoveType
 from hive_engine.hex_coord import _OFFSET_LIST
 from hive_engine.pieces import Color, PieceType
-from hive_hybrid_gnn.graph_types import HybridGraph, edge_feat_dim_for_radius
+from hive_fnn_transformer.graph_types import HybridGraph, edge_feat_dim_for_radius
 
 
 def _hex_distance(dq: int, dr: int) -> int:
