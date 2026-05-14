@@ -144,6 +144,7 @@ def build_orchestrator(
     compile_forward: bool,
     use_puct: bool = False,
     c_puct: float | None = None,
+    root_q_min_visits: int | None = None,
     eval_mode: bool = True,
 ) -> tuple[object, object]:
     if model_type == "fnn":
@@ -167,6 +168,11 @@ def build_orchestrator(
                 num_simulations=sims,
                 max_num_considered_actions=k,
                 c_puct=c_puct if c_puct is not None else FNNMCTSConfig.c_puct,
+                root_q_min_visits=(
+                    int(root_q_min_visits)
+                    if root_q_min_visits is not None
+                    else FNNMCTSConfig.root_q_min_visits
+                ),
                 temperature=temperature,
                 temperature_drop_move=temperature_drop_move,
                 batch_size=games,
@@ -843,6 +849,8 @@ def main() -> None:
     ap.add_argument("--black-policy-only", action="store_true", default=False)
     ap.add_argument("--white-c-puct", type=float, default=None)
     ap.add_argument("--black-c-puct", type=float, default=None)
+    ap.add_argument("--white-root-q-min-visits", type=int, default=None)
+    ap.add_argument("--black-root-q-min-visits", type=int, default=None)
     ap.add_argument("--wave-parallel", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--temperature-drop-move", type=int, default=20)
@@ -897,6 +905,7 @@ def main() -> None:
         args.temperature_drop_move, args.compile_forward,
         use_puct=args.white_puct,
         c_puct=args.white_c_puct,
+        root_q_min_visits=args.white_root_q_min_visits,
         eval_mode=eval_mode,
     )
     black_orch, black_cfg = build_orchestrator(
@@ -905,6 +914,7 @@ def main() -> None:
         args.temperature_drop_move, args.compile_forward,
         use_puct=args.black_puct,
         c_puct=args.black_c_puct,
+        root_q_min_visits=args.black_root_q_min_visits,
         eval_mode=eval_mode,
     )
     if args.white_model == "fnn":
@@ -1062,6 +1072,8 @@ def main() -> None:
         f"black_policy_only={args.black_policy_only}, "
         f"white_c_puct={getattr(white_cfg, 'c_puct', 'n/a')}, "
         f"black_c_puct={getattr(black_cfg, 'c_puct', 'n/a')}, "
+        f"white_root_q_min_visits={getattr(white_cfg, 'root_q_min_visits', 'n/a')}, "
+        f"black_root_q_min_visits={getattr(black_cfg, 'root_q_min_visits', 'n/a')}, "
         f"white_wave_size={white_cfg.wave_size if hasattr(white_cfg, 'wave_size') else 'n/a'}, "
         f"black_wave_size={black_cfg.wave_size if hasattr(black_cfg, 'wave_size') else 'n/a'}, "
         f"expansion_mask={args.expansion_mask}, max_game_length={args.max_game_length}, "

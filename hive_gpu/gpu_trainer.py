@@ -6,7 +6,7 @@ train → arena → promote pipeline as hive_engine/trainer.py.
 
 Usage:
     from hive_gpu.gpu_trainer import GPUTrainer, GPUTrainConfig
-    from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
+    from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig, HiveTransformer
 
     trainer = GPUTrainer(GPUTrainConfig(), TransformerConfig.small(), HiveTransformer)
     trainer.run()
@@ -746,7 +746,7 @@ class GPUTrainer:
         self.best_net.eval()
 
         if self.config.encoder_type == "transformer":
-            from hive_transformer.transformer_encoder import TransformerEncoder
+            from archive.legacy_transformer.hive_transformer.transformer_encoder import TransformerEncoder
             encoder = TransformerEncoder()
         else:
             encoder = GNNEncoder()

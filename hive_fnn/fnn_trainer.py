@@ -50,15 +50,24 @@ class FNNTrainConfig:
 
     draw_keep_rate: float = 1.0
     expansion_mask: int = 0
+    endgame_frac: float = 0.0
+    endgame_surround: int = 5
+    endgame_mixed_pair: bool = False
     device: str | None = None
     use_amp: bool | None = None
 
     use_puct: bool = False
+    c_puct: float = 1.25
+    c_scale: float = 1.0
     gumbel_wave_parallel: bool = True
     gumbel_wave_size: int = 4
     puct_wave_size: int = 16
     queen_surround_reserve_slots: int = 10
     queen_surround_reserve_immobile_only: bool = True
+    short_forced_win_probe: bool = False
+    probe_win_in_one: bool = True
+    probe_check_opponent_wins: bool = True
+    probe_win_in_two: bool = True
 
 
 def _simulations_for_iteration(
@@ -223,7 +232,7 @@ class FNNTrainer:
                 self.best_net,
                 FNNPUCTConfig(
                     num_simulations=sims_this_iter,
-                    c_puct=1.25,
+                    c_puct=cfg.c_puct,
                     temperature=cfg.temperature,
                     temperature_drop_move=cfg.temperature_drop_move,
                     batch_size=cfg.games_per_batch,
@@ -238,6 +247,8 @@ class FNNTrainer:
                 FNNMCTSConfig(
                     num_simulations=sims_this_iter,
                     max_num_considered_actions=cfg.max_num_considered,
+                    c_puct=cfg.c_puct,
+                    c_scale=cfg.c_scale,
                     temperature=cfg.temperature,
                     temperature_drop_move=cfg.temperature_drop_move,
                     batch_size=cfg.games_per_batch,
@@ -247,11 +258,46 @@ class FNNTrainer:
                     wave_size=cfg.gumbel_wave_size,
                     queen_surround_reserve_slots=cfg.queen_surround_reserve_slots,
                     queen_surround_reserve_immobile_only=cfg.queen_surround_reserve_immobile_only,
+                    short_forced_win_probe=cfg.short_forced_win_probe,
+                    probe_win_in_one=cfg.probe_win_in_one,
+                    probe_check_opponent_wins=cfg.probe_check_opponent_wins,
+                    probe_win_in_two=cfg.probe_win_in_two,
                 ),
             )
-        raw = orch.self_play_batch()
+        start_states_t = None
+        endgame_games = 0
+        if cfg.endgame_frac > 0.0:
+            from hive_gpu.endgame_generator import generate_endgame_positions, positions_to_tensor
+
+            n_endgame = max(1, int(cfg.games_per_batch * cfg.endgame_frac))
+            endgame_pool = generate_endgame_positions(
+                n_positions=n_endgame,
+                expansion_mask=cfg.expansion_mask,
+                min_surround=max(0, cfg.endgame_surround - 1)
+                if cfg.endgame_mixed_pair else cfg.endgame_surround,
+                max_surround=cfg.endgame_surround,
+                gpu_batch=min(cfg.games_per_batch, 256),
+                mixed_pair=cfg.endgame_mixed_pair,
+            )
+            endgame_games = len(endgame_pool)
+            tensors = []
+            if endgame_pool:
+                tensors.append(positions_to_tensor(endgame_pool, device="cuda"))
+            n_fresh = cfg.games_per_batch - len(endgame_pool)
+            if n_fresh > 0:
+                tensors.append(orch.ext.create_initial_states(n_fresh, cfg.expansion_mask))
+            if tensors:
+                start_states_t = torch.cat(tensors, dim=0)
+
+        raw = orch.self_play_batch(start_states=start_states_t)
         flat = []
-        stats = {"num_games": 0, "white_wins": 0, "black_wins": 0, "draws": 0}
+        stats = {
+            "num_games": 0,
+            "white_wins": 0,
+            "black_wins": 0,
+            "draws": 0,
+            "endgame_games": endgame_games,
+        }
         for game in raw:
             if not game:
                 stats["num_games"] += 1

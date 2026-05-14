@@ -1,8 +1,8 @@
 import torch
 
-from hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
-from hive_mc.mc_utils import MoveConditionedBatch, flat_to_padded, padded_to_flat
-from hive_transformer.token_types import HiveTokenBatch
+from archive.legacy_mc.hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
+from archive.legacy_mc.hive_mc.mc_utils import MoveConditionedBatch, flat_to_padded, padded_to_flat
+from hive_common.token_types import HiveTokenBatch
 
 
 def _dummy_token_batch(batch_size: int, seq_len: int, d_feat: int = 25) -> HiveTokenBatch:

@@ -16,7 +16,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
-from hive_transformer.token_types import (
+from hive_common.token_types import (
     HiveTokenSequence,
     HiveTokenBatch,
     TOKEN_TYPE_BOARD,

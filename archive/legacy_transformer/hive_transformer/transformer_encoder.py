@@ -1,10 +1,10 @@
-"""
-Transformer encoder wrapper providing the same interface as HiveEncoder.
+"""Compatibility wrapper for the archived legacy transformer encoder."""
 
-Allows MCTS and the trainer to use the transformer transparently
-via duck typing. Action encoding/decoding is delegated to HiveEncoder.
-"""
+from archive.legacy_transformer.hive_transformer.transformer_encoder import TransformerEncoder
 
+<<<<<<<< HEAD:hive_transformer/transformer_encoder.py
+__all__ = ["TransformerEncoder"]
+========
 from __future__ import annotations
 
 import numpy as np
@@ -12,8 +12,8 @@ import numpy as np
 from hive_engine.encoder import HiveEncoder
 from hive_engine.game_state import GameState, Move
 
-from hive_transformer.token_encoder import TokenEncoder
-from hive_transformer.token_types import HiveTokenSequence
+from archive.legacy_transformer.hive_transformer.token_encoder import TokenEncoder
+from hive_common.token_types import HiveTokenSequence
 
 
 class TransformerEncoder:
@@ -56,3 +56,4 @@ class TransformerEncoder:
         return self._hive_encoder.get_legal_action_mask(
             game_state, legal_moves
         )
+>>>>>>>> 7c7d146 (Refactor legacy transformer and MC packages):archive/legacy_transformer/hive_transformer/transformer_encoder.py

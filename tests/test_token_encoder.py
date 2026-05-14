@@ -1,4 +1,4 @@
-"""Tests for hive_transformer.token_encoder — GameState → HiveTokenSequence."""
+"""Tests for archived transformer token encoding."""
 
 import numpy as np
 import pytest
@@ -7,8 +7,8 @@ from hive_engine.game_state import GameState, Move, MoveType
 from hive_engine.hex_coord import ORIGIN, ALL_DIRECTIONS
 from hive_engine.pieces import Color, PieceType
 
-from hive_transformer.token_encoder import TokenEncoder
-from hive_transformer.token_types import (
+from archive.legacy_transformer.hive_transformer.token_encoder import TokenEncoder
+from hive_common.token_types import (
     TOKEN_FEAT_DIM,
     GLOBAL_FEAT_DIM,
     TOKEN_TYPE_CLS,

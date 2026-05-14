@@ -190,7 +190,13 @@ def run_prs(preset: str = "small"):
         wrap_method(self_orch, "_classify_kernel",       sp_timer, "ext.prs_v2_classify(wrap)")
         wrap_method(self_orch, "_build_legal_priors_v2", sp_timer, "build_legal_priors_v2")
         wrap_method(self_orch, "_run_simulations",       sp_timer, "mcts._run_simulations")
+        wrap_method(self_orch, "_run_simulations_for_root_slots", sp_timer, "mcts._run_simulations_for_root_slots")
         wrap_method(self_orch, "_expand_root_if_needed", sp_timer, "mcts._expand_root")
+        wrap_method(self_orch, "_apply_root_dirichlet",  sp_timer, "mcts._apply_root_dirichlet")
+        wrap_method(self_orch, "_gather_root_candidate_stats", sp_timer, "mcts._gather_candidate_stats")
+        wrap_method(self_orch, "_gather_root_child_stats", sp_timer, "mcts._gather_child_stats")
+        wrap_method(self_orch, "_reroot_tree",           sp_timer, "mcts._reroot_tree")
+        wrap_method(self_orch, "_build_examples",        sp_timer, "build_examples")
         wrap_method(self_orch, "_check_immediate_wins_v2", sp_timer, "check_immediate_wins")
 
     _pv2mod.PRSMCTSOrchestratorV2.__init__ = _patched_init

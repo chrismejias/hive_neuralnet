@@ -18,7 +18,7 @@ import torch
 
 import hive_gpu
 from hive_gpu.gumbel_mcts import GumbelAlphaZeroOrchestrator, GumbelConfig
-from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
+from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig, HiveTransformer
 
 
 def load_net(path: str, device: torch.device):

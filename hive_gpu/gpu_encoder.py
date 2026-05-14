@@ -15,7 +15,7 @@ try:
 except ImportError:
     HiveGraph = None       # type: ignore[assignment,misc]
     HiveGraphBatch = None  # type: ignore[assignment,misc]
-from hive_transformer.token_types import (
+from hive_common.token_types import (
     HiveTokenBatch,
     HiveTokenSequence,
     OFF_BOARD_POSITION,

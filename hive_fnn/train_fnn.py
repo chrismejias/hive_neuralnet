@@ -87,7 +87,58 @@ def parse_args() -> argparse.Namespace:
             "queen with no legal move of any kind, including pillbug or mosquito throws."
         ),
     )
+    p.add_argument(
+        "--short-forced-win-probe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable root-only tactical probes: gated win-in-1, surround-4 forced "
+            "wins in 2, and surround-5 threat conversions."
+        ),
+    )
+    p.add_argument(
+        "--probe-win-in-one",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When the tactical probe is enabled, allow the gated immediate win-in-1 check.",
+    )
+    p.add_argument(
+        "--probe-check-opponent-wins",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When the tactical probe is enabled, allow pruning moves that give the opponent an immediate win.",
+    )
+    p.add_argument(
+        "--probe-win-in-two",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When the tactical probe is enabled, allow the surround-4/5 short forced-win check.",
+    )
     p.add_argument("--max-game-length", type=int, default=300)
+    p.add_argument(
+        "--endgame-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of self-play games to start from random endgame positions "
+            "where both queens have the specified surround count."
+        ),
+    )
+    p.add_argument(
+        "--endgame-surround",
+        type=int,
+        default=5,
+        help="Exact queen surround target for endgame seed positions.",
+    )
+    p.add_argument(
+        "--endgame-mixed-pair",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use an asymmetric exact pair for endgame seeds: one queen at "
+            "endgame-surround-1 and the other at endgame-surround, in either order."
+        ),
+    )
     p.add_argument(
         "--gumbel-wave-parallel",
         action=argparse.BooleanOptionalAction,
@@ -99,6 +150,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--gumbel-wave-size", type=int, default=4)
     p.add_argument("--puct-wave-size", type=int, default=16)
+    p.add_argument("--c-puct", type=float, default=1.25)
+    p.add_argument("--c-scale", type=float, default=1.0)
 
     # Training
     p.add_argument("--batch-size", type=int, default=128)
@@ -158,11 +211,20 @@ def main() -> None:
         expansion_mask=args.expansion_mask,
         draw_keep_rate=args.draw_keep_rate,
         use_puct=args.puct,
+        c_puct=args.c_puct,
+        c_scale=args.c_scale,
         gumbel_wave_parallel=args.gumbel_wave_parallel,
         gumbel_wave_size=args.gumbel_wave_size,
         puct_wave_size=args.puct_wave_size,
         queen_surround_reserve_slots=args.queen_surround_reserve_slots,
         queen_surround_reserve_immobile_only=args.queen_surround_reserve_immobile_only,
+        short_forced_win_probe=args.short_forced_win_probe,
+        probe_win_in_one=args.probe_win_in_one,
+        probe_check_opponent_wins=args.probe_check_opponent_wins,
+        probe_win_in_two=args.probe_win_in_two,
+        endgame_frac=args.endgame_frac,
+        endgame_surround=args.endgame_surround,
+        endgame_mixed_pair=args.endgame_mixed_pair,
     )
 
     net = HiveFNN(net_config)
@@ -184,6 +246,24 @@ def main() -> None:
                 f"{train_config.queen_surround_reserve_slots} surround slots "
                 f"(immobile_only={train_config.queen_surround_reserve_immobile_only})"
             )
+        if train_config.short_forced_win_probe:
+            print(
+                "  Tactical probe:"
+                f" win1={train_config.probe_win_in_one}"
+                f" oppwin={train_config.probe_check_opponent_wins}"
+                f" win2={train_config.probe_win_in_two}"
+            )
+    if train_config.endgame_frac > 0.0:
+        surround_desc = (
+            f"{max(0, train_config.endgame_surround - 1)}/{train_config.endgame_surround} mixed"
+            if train_config.endgame_mixed_pair
+            else f"{train_config.endgame_surround}"
+        )
+        print(
+            "  Endgame seeds: "
+            f"{train_config.endgame_frac:.0%} games from surround "
+            f"{surround_desc}"
+        )
     if train_config.simulation_schedule:
         print(f"  Simulation schedule: {list(train_config.simulation_schedule)}")
     del net

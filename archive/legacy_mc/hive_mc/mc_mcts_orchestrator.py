@@ -1,6 +1,8 @@
-"""
-Gumbel AlphaZero + MCTS self-play orchestrator for the MC (move-conditioned) model.
+"""Compatibility wrapper for the archived move-conditioned orchestrator."""
 
+<<<<<<<< HEAD:hive_mc/mc_mcts_orchestrator.py
+from archive.legacy_mc.hive_mc.mc_mcts_orchestrator import *
+========
 Tree priors come from the screening head (cheap, move-feature-conditioned).
 Leaf values come from the value head applied to root_cls.  The tree uses
 per-legal-move dense priors — no ACTION_SPACE indirection.
@@ -20,9 +22,9 @@ import torch
 
 import hive_gpu
 from hive_gpu.gpu_encoder import GPUTransformerEncoder
-from hive_mc.mc_replay_buffer import MCTrainingExample
-from hive_mc.mc_transformer import HiveMoveTransformer
-from hive_mc.mc_utils import parse_move_features, flat_to_padded
+from archive.legacy_mc.hive_mc.mc_replay_buffer import MCTrainingExample
+from archive.legacy_mc.hive_mc.mc_transformer import HiveMoveTransformer
+from archive.legacy_mc.hive_mc.mc_utils import parse_move_features, flat_to_padded
 
 _OFF_TURN = 3412
 
@@ -532,3 +534,4 @@ class MCMCTSOrchestrator:
         is_white = (turn % 2 == 0)
         root_won = (result == 1 and is_white) or (result == 2 and not is_white)
         return 1.0 if root_won else -1.0
+>>>>>>>> 7c7d146 (Refactor legacy transformer and MC packages):archive/legacy_mc/hive_mc/mc_mcts_orchestrator.py

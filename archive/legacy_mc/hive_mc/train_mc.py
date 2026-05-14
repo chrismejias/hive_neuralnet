@@ -1,10 +1,12 @@
-from __future__ import annotations
+"""Compatibility wrapper for the archived move-conditioned trainer CLI."""
 
-import argparse
-import textwrap
+from archive.legacy_mc.hive_mc.train_mc import main
 
-from hive_mc.mc_trainer import MCTrainConfig, MCTrainer
-from hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
+<<<<<<<< HEAD:hive_mc/train_mc.py
+__all__ = ["main"]
+========
+from archive.legacy_mc.hive_mc.mc_trainer import MCTrainConfig, MCTrainer
+from archive.legacy_mc.hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,3 +103,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+>>>>>>>> 7c7d146 (Refactor legacy transformer and MC packages):archive/legacy_mc/hive_mc/train_mc.py

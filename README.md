@@ -627,7 +627,7 @@ Test coverage includes the game engine, PRS/FNN paths, and GPU move generation v
 
 ```
 hive_engine/       # Core game rules (board, pieces, game state, hex grid)
-hive_transformer/  # Shared token batch types + archived transformer compatibility wrappers
+hive_common/       # Shared token batch types used by PRS + archived legacy models
 hive_gpu/          # CUDA extension, GPU-native MCTS/Gumbel, shared kernels
   csrc/            # CUDA C++ source
     game_logic.cu      # Move gen, state apply, feature extraction, tree/search kernels
@@ -647,10 +647,13 @@ hive_fnn/          # HiveGo-style FNN with multiple search paths
   fnn_puct_orchestrator.py  # Plain PUCT MCTS tree search
   fnn_trainer.py       # FNNTrainer training loop
   train_fnn.py         # CLI entry point
-hive_fnn_transformer/   # Experimental FNN policy + relative-transformer value model
-  fnn_transformer_net.py    # HiveHybridGNN / HiveFNNTransformer
-  graph_encoder.py     # CPU GameState -> radius-1/radius-2 graph encoder
+hive_fnn_transformer/  # Experimental FNN policy + relative-transformer value model
+  fnn_transformer_net.py          # FNN + relative piece-transformer trunk
+  fnn_transformer_trainer.py      # Training loop
+  fnn_transformer_mcts_orchestrator.py  # Search orchestration
 tests/             # Test suite (250+ tests)
 archive/           # Archived legacy models, diagnostics, and old CPU training code
+  legacy_transformer/  # Old transformer implementation kept for reference/tests
+  legacy_mc/           # Old move-conditioned model kept for reference/tests
 Dockerfile         # Container for cloud/RunPod deployment
 ```

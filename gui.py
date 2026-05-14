@@ -50,8 +50,8 @@ try:
 except ImportError:
     NNUEEncoder = HiveNNUE = NNUEConfig = None  # type: ignore
 
-from hive_transformer.transformer_encoder import TransformerEncoder
-from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
+from archive.legacy_transformer.hive_transformer.transformer_encoder import TransformerEncoder
+from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig, HiveTransformer
 
 try:
     from hive_prs.prs_transformer import PRSConfig

@@ -816,6 +816,83 @@ __device__ inline bool has_queen_escape_move(const HiveState& s) {
     return false;
 }
 
+__device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out);
+
+__device__ __forceinline__ int queen_surround_count_for_color_device(
+    const HiveState& s,
+    Color c
+) {
+    if (!is_queen_placed(s, c)) return 0;
+    return num_occupied_neighbors(s, s.queen_cell[(int)c]);
+}
+
+__device__ inline int lone_empty_neighbor_of_queen(
+    const HiveState& s,
+    Color target
+) {
+    if (!is_queen_placed(s, target)) return -1;
+    int qcell = s.queen_cell[(int)target];
+    if (qcell < 0 || qcell >= NUM_CELLS) return -1;
+    if (num_occupied_neighbors(s, qcell) != 5) return -1;
+
+    int empty_nb = -1;
+    for (int d = 0; d < NUM_DIRS; ++d) {
+        int16_t nb = NEIGHBORS[qcell][d];
+        if (nb < 0) continue;
+        if (!s.occupied.get(nb)) {
+            if (empty_nb >= 0) return -1;
+            empty_nb = nb;
+        }
+    }
+    return empty_nb;
+}
+
+__device__ inline bool has_immediate_surround_win_for_current_player(
+    const HiveState& s
+) {
+    Color player = current_player(s);
+    Color target = (player == WHITE) ? BLACK : WHITE;
+    int winning_cell = lone_empty_neighbor_of_queen(s, target);
+    if (winning_cell < 0) return false;
+
+    GPUMove moves[MAX_LEGAL_MOVES];
+    int nlegal = generate_legal_moves(s, moves);
+    for (int i = 0; i < nlegal; ++i) {
+        if ((int)moves[i].to_cell != winning_cell) continue;
+        HiveState child = s;
+        apply_move(child, moves[i]);
+        if ((player == WHITE && child.result == WHITE_WINS) ||
+            (player == BLACK && child.result == BLACK_WINS)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+__device__ inline int generate_non_decreasing_surround_replies(
+    const HiveState& s,
+    Color target,
+    int baseline_surround,
+    GPUMove* out,
+    bool& all_non_decreasing
+) {
+    all_non_decreasing = true;
+    GPUMove all_moves[MAX_LEGAL_MOVES];
+    int nlegal = generate_legal_moves(s, all_moves);
+    int count = 0;
+    for (int i = 0; i < nlegal; ++i) {
+        HiveState child = s;
+        apply_move(child, all_moves[i]);
+        int next_surround = queen_surround_count_for_color_device(child, target);
+        if (next_surround < baseline_surround) {
+            all_non_decreasing = false;
+            return 0;
+        }
+        out[count++] = all_moves[i];
+    }
+    return count;
+}
+
 // ── Mosquito moves ──────────────────────────────────────────────────
 
 /**

@@ -1,5 +1,8 @@
-from __future__ import annotations
+"""Compatibility wrapper for the archived move-conditioned trainer."""
 
+<<<<<<<< HEAD:hive_mc/mc_trainer.py
+from archive.legacy_mc.hive_mc.mc_trainer import *
+========
 import gc
 import math
 import os
@@ -14,10 +17,10 @@ import torch.optim as optim
 from hive_engine.device import get_device
 from hive_engine.elo import EloTracker
 from hive_gpu.gpu_encoder import GPUTransformerEncoder
-from hive_mc.mc_mcts_orchestrator import MCMCTSConfig, MCMCTSOrchestrator
-from hive_mc.mc_replay_buffer import MCReplayBuffer, MCTrainingBatch
-from hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
-from hive_mc.mc_utils import build_move_conditioned_batch, flat_to_padded
+from archive.legacy_mc.hive_mc.mc_mcts_orchestrator import MCMCTSConfig, MCMCTSOrchestrator
+from archive.legacy_mc.hive_mc.mc_replay_buffer import MCReplayBuffer, MCTrainingBatch
+from archive.legacy_mc.hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
+from archive.legacy_mc.hive_mc.mc_utils import build_move_conditioned_batch, flat_to_padded
 
 
 @dataclass
@@ -272,3 +275,4 @@ class MCTrainer:
             },
             path,
         )
+>>>>>>>> 7c7d146 (Refactor legacy transformer and MC packages):archive/legacy_mc/hive_mc/mc_trainer.py

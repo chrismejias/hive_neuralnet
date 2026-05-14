@@ -1,11 +1,10 @@
-"""
-Token encoder for converting Hive game states to transformer-ready sequences.
+"""Compatibility wrapper for the archived legacy transformer token encoder."""
 
-Converts a GameState into a HiveTokenSequence. Each piece on the board
-becomes one token (including pieces sandwiched under beetles), each
-(color, piece_type) in hand becomes one hand token, and a CLS token is
-prepended for the value head.
+from archive.legacy_transformer.hive_transformer.token_encoder import TokenEncoder
 
+<<<<<<<< HEAD:hive_transformer/token_encoder.py
+__all__ = ["TokenEncoder"]
+========
 Token features are identical to GNN node features (25 dims).
 Position encoding uses grid index: row * 13 + col for board pieces
 (stacked pieces share the same position index), 169 for CLS and hand tokens.
@@ -23,7 +22,7 @@ from hive_engine.game_state import GameState
 from hive_engine.hex_coord import HexCoord, _OFFSET_LIST
 from hive_engine.pieces import Color, PieceType
 
-from hive_transformer.token_types import (
+from hive_common.token_types import (
     TOKEN_FEAT_DIM,
     GLOBAL_FEAT_DIM,
     TOKEN_TYPE_CLS,
@@ -234,3 +233,4 @@ class TokenEncoder:
             num_board_tokens=num_board_tokens,
             global_features=global_features,
         )
+>>>>>>>> 7c7d146 (Refactor legacy transformer and MC packages):archive/legacy_transformer/hive_transformer/token_encoder.py

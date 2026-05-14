@@ -216,15 +216,21 @@ def generate_endgame_positions(
     verbose: bool = False,
     min_surround: Optional[int] = None,  # inclusive lower bound (default = surround)
     max_surround: Optional[int] = None,  # inclusive upper bound (overrides surround)
+    gpu_filter: bool = True,
+    mixed_pair: bool = False,
     **_kwargs,
 ) -> list[bytes]:
     """
     Generate *n_positions* endgame positions using GPU-parallel random rollouts.
 
-    Runs *gpu_batch* games simultaneously on GPU with random moves.  After
-    each step the queen-surround counts are checked from CPU; any game where
-    both queens have between *min_surround* and *max_surround* occupied
-    neighbours is saved and that slot is immediately reset with a fresh game.
+    Runs *gpu_batch* games simultaneously on GPU with random moves. After
+    each step the queen-surround counts are checked; any game where both
+    queens satisfy the requested surround criterion is saved and that slot is
+    immediately reset with a fresh game.
+
+    When mixed_pair=True, the hit criterion is asymmetric exact matching:
+    one queen must have exactly min_surround neighbours and the other exactly
+    max_surround neighbours (in either order).
 
     ~100-200x faster than pure-Python random play for surround=5.
     """
@@ -235,24 +241,19 @@ def generate_endgame_positions(
     import hive_gpu
     ext = hive_gpu.load_extension()
 
-    # Precompute queen-cell → surround-count lookup using height array.
-    # heights_np: [B, 529], queen_cells: [B]  → counts: [B]
     nb_table = _NEIGHBOR_TABLE  # [529, 6]
 
     def _surround_counts(states_np: np.ndarray, qcells: np.ndarray) -> np.ndarray:
         """Vectorised surround count for a batch of queen cell indices."""
         heights = states_np[:, _OFF_HEIGHT: _OFF_HEIGHT + NUM_CELLS]  # [B, 529]
-        valid_queen = qcells < NUM_CELLS  # queens that are actually placed
-
-        # Clamp invalid cells to 0 so indexing doesn't crash; mask them out later
+        valid_queen = qcells < NUM_CELLS
         qcells_safe = np.where(valid_queen, qcells, 0).astype(np.int32)
-        nb_cells = nb_table[qcells_safe]           # [B, 6]  neighbour indices
-        on_grid  = nb_cells >= 0                   # [B, 6]  valid neighbours
-        nb_safe  = np.where(on_grid, nb_cells, 0)  # [B, 6]  clamped for indexing
-
-        bi = np.arange(len(heights))[:, None]      # [B, 1]
-        nb_occ = (heights[bi, nb_safe] > 0) & on_grid  # [B, 6]
-        counts = nb_occ.sum(axis=1).astype(np.int32)    # [B]
+        nb_cells = nb_table[qcells_safe]
+        on_grid = nb_cells >= 0
+        nb_safe = np.where(on_grid, nb_cells, 0)
+        bi = np.arange(len(heights))[:, None]
+        nb_occ = (heights[bi, nb_safe] > 0) & on_grid
+        counts = nb_occ.sum(axis=1).astype(np.int32)
         counts[~valid_queen] = 0
         return counts
 
@@ -266,6 +267,7 @@ def generate_endgame_positions(
     mask = _pick_mask()
 
     states = ext.create_initial_states(gpu_batch, mask)
+    row_idx = torch.arange(gpu_batch, device="cuda", dtype=torch.int64)
     # track how many steps each game has taken (reset when > max_steps)
     game_steps = np.zeros(gpu_batch, dtype=np.int32)
     step_num   = 0
@@ -273,13 +275,12 @@ def generate_endgame_positions(
     while len(positions) < n_positions:
         # ── Random move selection (GPU-side) ─────────────────────
         moves_t, nlegal_t = ext.generate_legal_moves_batch(states, gpu_batch)
-        nlegal = nlegal_t.cpu().numpy().astype(np.int32)  # [B]
-
-        # Sample a random legal move index per game (clamp to ≥ 1 to avoid mod-0)
-        rand_idx = (np.random.random(gpu_batch) * np.maximum(nlegal, 1)).astype(np.int32)
-        rand_idx = np.clip(rand_idx, 0, moves_t.shape[1] - 1)
-        chosen = moves_t[np.arange(gpu_batch), rand_idx]   # [B, MOVE_SIZE]
-        ext.apply_moves_batch(states, chosen.cuda(), gpu_batch)
+        nlegal_safe = nlegal_t.clamp(min=1).to(torch.float32)
+        rand_idx = (
+            torch.rand(gpu_batch, device="cuda") * nlegal_safe
+        ).to(torch.int64).clamp(max=moves_t.shape[1] - 1)
+        chosen = moves_t[row_idx, rand_idx]   # [B, MOVE_SIZE]
+        ext.apply_moves_batch(states, chosen, gpu_batch)
         game_steps += 1
         steps_total += gpu_batch
         step_num    += 1
@@ -288,28 +289,50 @@ def generate_endgame_positions(
         if step_num % 3 != 0:
             continue
 
-        results  = ext.check_results_batch(states, gpu_batch).cpu().numpy()
-        states_np = states.cpu().numpy()   # [B, SIZEOF_HIVE_STATE]
-
-        # Queen-placed flag and queen cells
-        both_placed = (states_np[:, _OFF_QUEEN_PLACED] & 3) == 3  # both bits set
-        qc_raw      = states_np[:, _OFF_QUEEN_CELL: _OFF_QUEEN_CELL + 4].copy()
-        queen_cells = qc_raw.view(np.uint16).reshape(gpu_batch, 2)  # [B, 2]
-
-        # Only check games where both queens are placed and game is in progress
-        candidates = both_placed & (results == 0)
-        w_surr = np.zeros(gpu_batch, dtype=np.int32)
-        b_surr = np.zeros(gpu_batch, dtype=np.int32)
-        if candidates.any():
-            ci = np.where(candidates)[0]
-            w_surr[ci] = _surround_counts(states_np[ci], queen_cells[ci, 0])
-            b_surr[ci] = _surround_counts(states_np[ci], queen_cells[ci, 1])
-
-        hit = candidates & (w_surr >= lo) & (w_surr <= surround) & (b_surr >= lo) & (b_surr <= surround)
+        results_t = ext.check_results_batch(states, gpu_batch)
+        results = results_t.cpu().numpy()
+        hit = np.zeros(gpu_batch, dtype=bool)
+        if gpu_filter:
+            hit_t = ext.endgame_hit_mask_batch(
+                states, gpu_batch, lo, surround, mixed_pair,
+            )
+            hit_idx = torch.nonzero(hit_t, as_tuple=False).squeeze(1)
+            if hit_idx.numel() > 0:
+                hit_rows = hit_idx.cpu().numpy()
+                hit[hit_rows] = True
+                hit_states = states.index_select(0, hit_idx).cpu().numpy()
+            else:
+                hit_rows = np.empty((0,), dtype=np.int64)
+                hit_states = np.empty((0, SIZEOF_HIVE_STATE), dtype=np.uint8)
+        else:
+            states_np = states.cpu().numpy()
+            both_placed = (states_np[:, _OFF_QUEEN_PLACED] & 3) == 3
+            qc_raw = states_np[:, _OFF_QUEEN_CELL: _OFF_QUEEN_CELL + 4].copy()
+            queen_cells = qc_raw.view(np.uint16).reshape(gpu_batch, 2)
+            candidates = both_placed & (results == 0)
+            w_surr = np.zeros(gpu_batch, dtype=np.int32)
+            b_surr = np.zeros(gpu_batch, dtype=np.int32)
+            if candidates.any():
+                ci = np.where(candidates)[0]
+                w_surr[ci] = _surround_counts(states_np[ci], queen_cells[ci, 0])
+                b_surr[ci] = _surround_counts(states_np[ci], queen_cells[ci, 1])
+            if mixed_pair:
+                hit = candidates & (
+                    ((w_surr == lo) & (b_surr == surround)) |
+                    ((w_surr == surround) & (b_surr == lo))
+                )
+            else:
+                hit = (
+                    candidates &
+                    (w_surr >= lo) & (w_surr <= surround) &
+                    (b_surr >= lo) & (b_surr <= surround)
+                )
+            hit_rows = np.where(hit)[0]
+            hit_states = states_np[hit_rows]
 
         # Save hits
-        for i in np.where(hit)[0]:
-            positions.append(bytes(states_np[i]))
+        for row in hit_states:
+            positions.append(bytes(row))
             if len(positions) >= n_positions:
                 break
 
@@ -327,6 +350,6 @@ def generate_endgame_positions(
     if verbose:
         print(f"[endgame] Generated {len(positions)} positions  "
               f"steps={steps_total}  resets={resets_total}  "
-              f"surround={lo}-{surround}")
+              f"surround={lo}-{surround} mixed_pair={mixed_pair}")
 
     return positions[:n_positions]

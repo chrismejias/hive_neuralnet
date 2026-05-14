@@ -1,12 +1,15 @@
-from __future__ import annotations
+"""Compatibility wrapper for the archived move-conditioned utilities."""
 
+<<<<<<<< HEAD:hive_mc/mc_utils.py
+from archive.legacy_mc.hive_mc.mc_utils import *
+========
 from dataclasses import dataclass
 
 import torch
 
 import hive_gpu
 from hive_gpu.gpu_encoder import GPUTransformerEncoder
-from hive_transformer.token_types import HiveTokenBatch
+from hive_common.token_types import HiveTokenBatch
 
 # Engine coordinate system (23x23 board)
 ENGINE_BOARD_SIZE = 23
@@ -216,3 +219,4 @@ def padded_to_flat(
     col_idx = torch.arange(max_count, device=counts.device, dtype=torch.int64).unsqueeze(0)
     mask = col_idx < counts.unsqueeze(1)
     return padded_values[mask]
+>>>>>>>> 7c7d146 (Refactor legacy transformer and MC packages):archive/legacy_mc/hive_mc/mc_utils.py

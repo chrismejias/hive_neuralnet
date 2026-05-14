@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 import hive_gpu
-from hive_transformer.token_types import (
+from hive_common.token_types import (
     HiveTokenBatch,
     TOKEN_TYPE_CLS,
     TOKEN_TYPE_BOARD,

@@ -1,6 +1,8 @@
-"""
-Move-conditioned transformer for Hive.
+"""Compatibility wrapper for the archived move-conditioned transformer."""
 
+<<<<<<<< HEAD:hive_mc/mc_transformer.py
+from archive.legacy_mc.hive_mc.mc_transformer import *
+========
 Two-stage architecture:
 1. Screening head: lightweight scoring of all legal moves from compact features
 2. Action head: precise scoring of selected candidates via full successor encoding
@@ -18,8 +20,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from hive_engine.encoder import HiveEncoder
-from hive_mc.mc_utils import MoveConditionedBatch, MoveFeatures, ENGINE_MAX_POSITIONS
-from hive_transformer.token_types import HiveTokenBatch, GLOBAL_FEAT_DIM, TOKEN_FEAT_DIM
+from archive.legacy_mc.hive_mc.mc_utils import (
+    MoveConditionedBatch,
+    MoveFeatures,
+    ENGINE_MAX_POSITIONS,
+)
+from hive_common.token_types import HiveTokenBatch, GLOBAL_FEAT_DIM, TOKEN_FEAT_DIM
 
 NUM_PIECE_TYPES = 8
 
@@ -231,3 +237,4 @@ class HiveMoveTransformer(nn.Module):
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+>>>>>>>> 7c7d146 (Refactor legacy transformer and MC packages):archive/legacy_mc/hive_mc/mc_transformer.py
