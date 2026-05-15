@@ -106,6 +106,7 @@ def _policy_cross_entropy(
     flat_logits: torch.Tensor,
     policy_targets: torch.Tensor,
     num_actions: torch.Tensor,
+    policy_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-entropy policy loss over ragged legal moves."""
     padded_logits = _flat_to_padded(flat_logits, num_actions, pad_value=float("-inf"))
@@ -116,7 +117,13 @@ def _policy_cross_entropy(
     masked_logits = padded_logits.masked_fill(~legal_mask, float("-inf"))
     log_probs = F.log_softmax(masked_logits, dim=1)
     log_probs = torch.nan_to_num(log_probs, nan=-1000.0, neginf=-1000.0)
-    return -(policy_targets[:, :max_actions] * log_probs).sum(dim=1).mean()
+    per_example = -(policy_targets[:, :max_actions] * log_probs).sum(dim=1)
+    if policy_mask is not None:
+        mask_1d = policy_mask.squeeze(-1)
+        if mask_1d.sum() > 0:
+            return (per_example * mask_1d).sum() / mask_1d.sum()
+        return torch.tensor(0.0, device=flat_logits.device)
+    return per_example.mean()
 
 
 def compute_fnn_loss(
@@ -125,10 +132,13 @@ def compute_fnn_loss(
     policy_targets: torch.Tensor,
     value_targets: torch.Tensor,
     num_actions: torch.Tensor,
+    policy_mask: torch.Tensor,
     value_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Combined loss: policy cross-entropy + value MSE."""
-    policy_loss = _policy_cross_entropy(action_logits, policy_targets, num_actions)
+    policy_loss = _policy_cross_entropy(
+        action_logits, policy_targets, num_actions, policy_mask,
+    )
     value_diff = (root_values.squeeze(-1) - value_targets.squeeze(-1)) ** 2
     mask_1d = value_mask.squeeze(-1)
     if mask_1d.sum() > 0:
@@ -428,6 +438,7 @@ class FNNTrainer:
                             batch.policy_targets,
                             batch.value_targets,
                             batch.num_actions,
+                            batch.policy_mask,
                             batch.value_mask,
                         )
                     self.scaler.scale(loss).backward()
@@ -447,6 +458,7 @@ class FNNTrainer:
                         batch.policy_targets,
                         batch.value_targets,
                         batch.num_actions,
+                        batch.policy_mask,
                         batch.value_mask,
                     )
                     loss.backward()

@@ -520,7 +520,7 @@ class FNNMCTSOrchestrator:
 
         active_mask = torch.ones((B,), dtype=torch.bool, device=dev)
         move_numbers = torch.zeros((B,), dtype=torch.int64, device=dev)
-        histories: list[list[tuple[np.ndarray, np.ndarray]]] = [[] for _ in range(B)]
+        histories: list[list[tuple[np.ndarray, np.ndarray, bool]]] = [[] for _ in range(B)]
 
         while bool(active_mask.any().item()):
             legal_moves, num_legal, root_features = (
@@ -720,6 +720,16 @@ class FNNMCTSOrchestrator:
                 histories[i].append((
                     states_cpu[i].copy(),
                     probs_cpu[i, :n].astype(np.float32, copy=True),
+                    True,
+                ))
+            for i in range(B):
+                if not bool(has_actions_cpu[i]) or not bool(forced_random_cpu[i]):
+                    continue
+                n = int(nlegal_np[i])
+                histories[i].append((
+                    states_cpu[i].copy(),
+                    np.zeros((n,), dtype=np.float32),
+                    False,
                 ))
 
             # ── Apply chosen moves + re-root ──────────────────────────
@@ -759,7 +769,7 @@ class FNNMCTSOrchestrator:
         for i in range(B):
             winner = final_results[i]
             use_for_value = (winner != 0)
-            for state_bytes, target_pi in histories[i]:
+            for state_bytes, target_pi, use_for_policy in histories[i]:
                 turn = int(state_bytes[_OFF_TURN]) | (
                     int(state_bytes[_OFF_TURN + 1]) << 8
                 )
@@ -768,6 +778,7 @@ class FNNMCTSOrchestrator:
                     state_bytes=state_bytes,
                     policy_target=target_pi.astype(np.float32),
                     value_target=float(value),
+                    use_for_policy=bool(use_for_policy),
                     use_for_value=use_for_value,
                 ))
         return examples
