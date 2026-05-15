@@ -321,6 +321,7 @@ class HybridTrainer:
                             batch.policy_targets,
                             batch.value_targets,
                             batch.num_actions,
+                            batch.policy_mask,
                             batch.value_mask,
                         )
                     self.scaler.scale(loss).backward()
@@ -340,6 +341,7 @@ class HybridTrainer:
                         batch.policy_targets,
                         batch.value_targets,
                         batch.num_actions,
+                        batch.policy_mask,
                         batch.value_mask,
                     )
                     loss.backward()
