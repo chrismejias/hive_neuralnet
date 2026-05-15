@@ -26,6 +26,8 @@ import math
 import struct
 import sys
 import threading
+import time
+import traceback
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -50,9 +52,6 @@ try:
 except ImportError:
     NNUEEncoder = HiveNNUE = NNUEConfig = None  # type: ignore
 
-from archive.legacy_transformer.hive_transformer.transformer_encoder import TransformerEncoder
-from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig, HiveTransformer
-
 try:
     from hive_prs.prs_transformer import PRSConfig
     from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
@@ -64,10 +63,17 @@ except ImportError:
 
 try:
     from hive_fnn.fnn_network import FNNConfig, HiveFNN
-    from hive_fnn.fnn_mcts_orchestrator import FNNMCTSConfig, FNNMCTSOrchestrator
+    from hive_fnn.fnn_mcts_orchestrator import (
+        FNNMCTSConfig,
+        FNNMCTSOrchestrator,
+        _GUMBEL_ROUNDS,
+        _GUMBEL_WAVE_SCHEDULE,
+    )
     _HAS_FNN = True
 except ImportError:
     FNNConfig = HiveFNN = FNNMCTSConfig = FNNMCTSOrchestrator = None  # type: ignore
+    _GUMBEL_ROUNDS = 0  # type: ignore
+    _GUMBEL_WAVE_SCHEDULE = []  # type: ignore
     _HAS_FNN = False
 
 
@@ -397,7 +403,453 @@ class GpuAI:
         t  = torch.tensor(list(mb), dtype=torch.uint8, device="cuda").unsqueeze(0)
         self.ext.apply_moves_batch(self.gpu_state, t, 1)
 
+    def _normalized_root_confidence(
+        self,
+        visits: torch.Tensor,
+        n_legal: int,
+    ) -> float:
+        """Convert root visit concentration into a [0, 1] confidence score."""
+        if n_legal <= 0:
+            return 0.0
+        root_visits = visits[0, :n_legal].to(torch.float32)
+        total = float(root_visits.sum().item())
+        if total <= 0.0:
+            return 0.0
+        top = float(root_visits.max().item())
+        visited_children = int((root_visits > 0).sum().item())
+        if visited_children <= 1:
+            return 1.0
+        share = top / total
+        baseline = 1.0 / float(visited_children)
+        conf = (share - baseline) / max(1e-6, 1.0 - baseline)
+        return max(0.0, min(1.0, conf))
+
+    def _gather_plain_tree_args(
+        self,
+        tree: dict[str, torch.Tensor],
+    ) -> list[torch.Tensor]:
+        return [
+            tree["visit_count"],
+            tree["total_value"],
+            tree["prior"],
+            tree["parent_idx"],
+            tree["move_bytes"],
+            tree["action_idx"],
+            tree["first_child"],
+            tree["num_children"],
+            tree["is_terminal"],
+            tree["terminal_value"],
+            tree["node_count"],
+        ]
+
+    def _evaluate_fnn_state_puct(self, state: torch.Tensor) -> dict[str, float]:
+        """Run a separate plain-PUCT root search for GUI evaluation only."""
+        orch = self.orch
+        cfg = orch.config
+        tree = orch._alloc_tree(1)
+        orch._reset_tree(tree)
+        tree_args = self._gather_plain_tree_args(tree)
+
+        states = state.clone()
+        legal_moves, num_legal, root_features = (
+            self.ext.generate_legal_moves_and_fnn_features_batch(states, 1)
+        )
+        n = int(num_legal[0].item())
+        if n <= 0:
+            return {
+                "eval_value": 0.0,
+                "eval_confidence": 0.0,
+                "eval_top_q": 0.0,
+            }
+
+        priors, root_values, _ = orch._eval_states(
+            states, legal_moves, num_legal, 1, root_features,
+        )
+        results = self.ext.check_results_batch(states, 1)
+        leaf_indices = tree["root_node"].to(torch.int32).clone()
+        self.ext.mcts_expand_dense_priors_batch(
+            *tree_args,
+            leaf_indices,
+            states,
+            legal_moves,
+            num_legal,
+            priors,
+            results,
+            1,
+            1,
+            orch._max_nodes,
+        )
+
+        alive_mask = (
+            torch.arange(orch._max_legal, device="cuda").unsqueeze(0)
+            < num_legal.to(torch.int64).unsqueeze(1)
+        ).to(torch.int8)
+        game_active_t = torch.ones((1,), dtype=torch.int8, device="cuda")
+
+        sims = max(1, int(cfg.num_simulations))
+        wave_size = max(1, int(getattr(cfg, "wave_size", 1)))
+        num_waves = math.ceil(sims / wave_size)
+        state_size = states.shape[1]
+        leaf_states = torch.zeros(
+            wave_size, state_size, dtype=torch.uint8, device="cuda",
+        )
+
+        for wave in range(num_waves):
+            actual_w = min(wave_size, sims - wave * wave_size)
+            total = actual_w
+            (
+                leaf_idx,
+                move_paths,
+                path_lens,
+                vl_paths,
+                vl_lens,
+            ) = self.ext.mcts_select_with_root_mask_batch(
+                *tree_args,
+                game_active_t,
+                tree["root_node"],
+                alive_mask,
+                orch._max_legal,
+                cfg.c_puct,
+                1,
+                actual_w,
+                orch._max_nodes,
+            )
+            self.ext.mcts_replay_batch(
+                states,
+                leaf_states[:total],
+                move_paths[:total],
+                path_lens[:total],
+                leaf_idx[:total],
+                1,
+                total,
+            )
+            leaf_results = self.ext.check_results_batch(leaf_states[:total], total)
+            legal_moves_leaf, num_legal_leaf, leaf_features = (
+                self.ext.generate_legal_moves_and_fnn_features_batch(
+                    leaf_states[:total], total,
+                )
+            )
+            priors_leaf, leaf_vals, _ = orch._eval_states(
+                leaf_states[:total], legal_moves_leaf, num_legal_leaf, total, leaf_features,
+            )
+            self.ext.mcts_expand_and_backprop_dense_priors_batch(
+                *tree_args,
+                leaf_idx[:total],
+                leaf_states[:total],
+                legal_moves_leaf,
+                num_legal_leaf,
+                priors_leaf,
+                leaf_results,
+                leaf_vals,
+                vl_paths[:total],
+                vl_lens[:total],
+                1,
+                total,
+                orch._max_nodes,
+            )
+
+        slot_visits, slot_q = orch._gather_root_child_stats(tree, 1)
+        root_visits = slot_visits[0, :n]
+        root_q = slot_q[0, :n]
+        top_idx = int(root_visits.argmax().item()) if n > 0 else 0
+        top_q = float(root_q[top_idx].item()) if n > 0 else 0.0
+        confidence = self._normalized_root_confidence(slot_visits, n)
+        eval_value = (1.0 - confidence) * float(root_values[0].item()) + confidence * top_q
+        return {
+            "eval_value": float(eval_value),
+            "eval_confidence": confidence,
+            "eval_top_q": top_q,
+        }
+
+    def _analyze_fnn_state(self, state: torch.Tensor) -> dict[str, object]:
+        """Run one FNN root search and return move bytes plus GUI eval signals."""
+        orch = self.orch
+        cfg = orch.config
+        tree = orch._alloc_tree(1)
+        orch._reset_tree(tree)
+
+        states = state.clone()
+        legal_moves, num_legal, root_features = (
+            self.ext.generate_legal_moves_and_fnn_features_batch(states, 1)
+        )
+        n = int(num_legal[0].item())
+        if n <= 0:
+            return {
+                "move_bytes": torch.zeros((6,), dtype=torch.uint8, device="cpu"),
+                "top_child_q": 0.0,
+                "root_value": 0.0,
+                "blend_value": 0.0,
+                "confidence": 0.0,
+            }
+
+        priors, root_values, _child_q_init = orch._eval_states(
+            states, legal_moves, num_legal, 1, root_features,
+        )
+        n_per_game = num_legal.to(torch.int64)
+        slot_idx = torch.arange(orch._max_legal, device="cuda").unsqueeze(0)
+        valid_slot = slot_idx < n_per_game.unsqueeze(1)
+        allowed_slot_mask = valid_slot
+
+        if getattr(cfg, "short_forced_win_probe", False):
+            tactical = orch._analyze_short_tactics(
+                states, legal_moves, num_legal, 1, priors,
+            )
+            allowed_slot_mask = tactical.allowed_slots & valid_slot
+
+        safe_prior = priors.clamp(min=1e-20)
+        legal_logits = torch.where(
+            allowed_slot_mask,
+            safe_prior.log(),
+            torch.full_like(priors, -1e30),
+        )
+        u = torch.rand(1, orch._max_legal, device="cuda").clamp(1e-4, 1 - 1e-4)
+        gumbel = -torch.log(-torch.log(u))
+        gumbel = torch.where(
+            allowed_slot_mask,
+            gumbel,
+            torch.full_like(gumbel, -1e30),
+        )
+        if hasattr(self.ext, "queen_escape_flags_batch"):
+            candidate_slots = orch._root_candidate_slots(
+                states,
+                legal_moves,
+                num_legal,
+                priors,
+                legal_logits,
+                1,
+                allowed_slot_mask=allowed_slot_mask,
+            ).to(torch.int32)
+        else:
+            max_considered = max(
+                1,
+                min(
+                    int(getattr(cfg, "max_num_considered_actions", 16)),
+                    n,
+                    orch._max_legal,
+                ),
+            )
+            perturbed = torch.where(
+                allowed_slot_mask,
+                gumbel + legal_logits,
+                torch.full_like(legal_logits, -1e30),
+            )
+            _, candidate_slots = torch.topk(perturbed, max_considered, dim=1)
+            candidate_slots = candidate_slots.to(torch.int32)
+        candidate_valid = torch.gather(
+            valid_slot, 1, candidate_slots.long().clamp(min=0),
+        ) & (candidate_slots >= 0)
+        candidate_slots = torch.where(
+            candidate_valid,
+            candidate_slots,
+            torch.full_like(candidate_slots, -1),
+        )
+
+        game_active_t = torch.ones((1,), dtype=torch.int8, device="cuda")
+        leaf_indices = tree["root_node"].to(torch.int32).clone()
+        results = self.ext.check_results_batch(states, 1)
+        tree_args = self._gather_plain_tree_args(tree)
+        self.ext.mcts_expand_dense_priors_batch(
+            *tree_args,
+            leaf_indices,
+            states,
+            legal_moves,
+            num_legal,
+            priors,
+            results,
+            1,
+            1,
+            orch._max_nodes,
+        )
+        sims_per_round = max(1, int(cfg.num_simulations) // _GUMBEL_ROUNDS)
+        for round_i in range(_GUMBEL_ROUNDS):
+            num_candidates = int(candidate_slots.shape[1])
+            if num_candidates <= 0:
+                break
+            sims_per_candidate = max(1, sims_per_round // num_candidates)
+            wave_size = (
+                _GUMBEL_WAVE_SCHEDULE[min(round_i, len(_GUMBEL_WAVE_SCHEDULE) - 1)]
+                if getattr(cfg, "wave_parallel", False)
+                else 1
+            )
+            C = int(candidate_slots.shape[1])
+            W = max(1, int(wave_size))
+            num_waves = math.ceil(sims_per_candidate / W)
+            use_fused_prefix = hasattr(
+                self.ext, "mcts_select_replay_legal_fnn_root_slots_batch",
+            )
+            leaf_states = None
+            if not use_fused_prefix:
+                state_size = states.shape[1]
+                leaf_states = torch.zeros(
+                    W * C, state_size, dtype=torch.uint8, device="cuda",
+                )
+
+            for wave in range(num_waves):
+                actual_w = min(W, sims_per_candidate - wave * W)
+                total = actual_w * C
+
+                if use_fused_prefix:
+                    (
+                        leaf_idx,
+                        leaf_states_wave,
+                        legal_moves_leaf,
+                        num_legal_leaf,
+                        leaf_features,
+                        results,
+                        vl_paths,
+                        vl_lens,
+                    ) = self.ext.mcts_select_replay_legal_fnn_root_slots_batch(
+                        *tree_args,
+                        states,
+                        game_active_t,
+                        tree["root_node"],
+                        candidate_slots,
+                        C,
+                        orch._max_legal,
+                        cfg.c_puct,
+                        1,
+                        actual_w,
+                        orch._max_nodes,
+                    )
+                else:
+                    (
+                        leaf_idx,
+                        move_paths,
+                        path_lens,
+                        vl_paths,
+                        vl_lens,
+                    ) = self.ext.mcts_select_with_root_slots_batch(
+                        *tree_args,
+                        game_active_t,
+                        tree["root_node"],
+                        candidate_slots,
+                        C,
+                        orch._max_legal,
+                        cfg.c_puct,
+                        1,
+                        actual_w,
+                        orch._max_nodes,
+                    )
+                    self.ext.mcts_replay_batch(
+                        states,
+                        leaf_states[:total],
+                        move_paths[:total],
+                        path_lens[:total],
+                        leaf_idx[:total],
+                        1,
+                        total,
+                    )
+                    leaf_states_wave = leaf_states[:total]
+                    results = self.ext.check_results_batch(leaf_states_wave, total)
+                    legal_moves_leaf, num_legal_leaf, leaf_features = (
+                        self.ext.generate_legal_moves_and_fnn_features_batch(
+                            leaf_states_wave,
+                            total,
+                        )
+                    )
+
+                priors_leaf, leaf_vals, _child_q_leaf = orch._eval_states(
+                    leaf_states_wave,
+                    legal_moves_leaf,
+                    num_legal_leaf,
+                    total,
+                    leaf_features,
+                )
+                self.ext.mcts_expand_and_backprop_dense_priors_batch(
+                    *tree_args,
+                    leaf_idx[:total],
+                    leaf_states_wave,
+                    legal_moves_leaf,
+                    num_legal_leaf,
+                    priors_leaf,
+                    results,
+                    leaf_vals,
+                    vl_paths[:total],
+                    vl_lens[:total],
+                    1,
+                    total,
+                    orch._max_nodes,
+                )
+            if num_candidates <= 1:
+                continue
+
+            candidate_valid = candidate_slots >= 0
+            per_game_keep = (candidate_valid.sum(dim=1) // 2).clamp(min=1)
+            max_keep = num_candidates // 2
+            cand_visits, cand_q = orch._gather_root_candidate_stats(
+                tree, 1, candidate_slots,
+            )
+            sigma_norm = (cfg.c_visit + cand_visits.max()) * cfg.c_scale
+            cand_idx = candidate_slots.long().clamp(min=0)
+            cand_score = (
+                torch.gather(gumbel + legal_logits, 1, cand_idx)
+                + sigma_norm * cand_q
+            ).float()
+            cand_score = torch.where(
+                candidate_valid,
+                cand_score,
+                torch.full_like(cand_score, -1e30),
+            )
+            _, keep_pos = torch.topk(cand_score, max_keep, dim=1)
+            keep_rank = orch._keep_rank(max_keep)
+            keep_valid = keep_rank < per_game_keep.unsqueeze(1)
+            new_slots = torch.gather(candidate_slots, 1, keep_pos)
+            candidate_slots = torch.where(
+                keep_valid,
+                new_slots,
+                torch.full_like(new_slots, -1),
+            )
+
+        candidate_valid = candidate_slots >= 0
+        cand_visits, cand_q = orch._gather_root_candidate_stats(
+            tree, 1, candidate_slots,
+        )
+        sigma_norm = (cfg.c_visit + cand_visits.max()) * cfg.c_scale
+        cand_idx = candidate_slots.long().clamp(min=0)
+        final_score = (
+            torch.gather(gumbel + legal_logits, 1, cand_idx)
+            + sigma_norm * cand_q
+        ).float()
+        final_score = torch.where(
+            candidate_valid,
+            final_score,
+            torch.full_like(final_score, -1e30),
+        )
+        chosen_pos = torch.argmax(final_score, dim=1)
+        chosen_slot = torch.gather(
+            candidate_slots, 1, chosen_pos.unsqueeze(1),
+        ).squeeze(1).clamp(min=0).to(torch.long)
+        move_bytes = legal_moves[0, chosen_slot[0]].detach().cpu()
+
+        slot_visits, slot_q = orch._gather_root_child_stats(tree, 1)
+        top_visits, top_indices = slot_visits[0, :n].max(dim=0)
+        top_child_q = float(slot_q[0, int(top_indices.item())].item()) if n > 0 else 0.0
+        root_value = float(root_values[0].item())
+        confidence = self._normalized_root_confidence(slot_visits, n)
+        blend_value = (1.0 - confidence) * root_value + confidence * top_child_q
+
+        return {
+            "move_bytes": move_bytes,
+            "top_child_q": top_child_q,
+            "root_value": root_value,
+            "blend_value": float(blend_value),
+            "confidence": confidence,
+            "top_visits": int(top_visits.item()) if n > 0 else 0,
+        }
+
     def _analyze_state_tensor(self, state: torch.Tensor) -> MoveEval:
+        if _HAS_FNN and isinstance(self.orch, FNNMCTSOrchestrator):
+            info = self._analyze_fnn_state(state)
+            eval_info = self._evaluate_fnn_state_puct(state)
+            return MoveEval(
+                q_value=float(info.get("top_child_q", 0.0)),
+                root_value=float(info.get("root_value", 0.0)),
+                blend_value=float(info.get("blend_value", 0.0)),
+                eval_value=float(eval_info.get("eval_value", 0.0)),
+                source="search",
+                simulations=int(getattr(self.orch.config, "num_simulations", 0)),
+                confidence=float(eval_info.get("eval_confidence", info.get("confidence", 0.0))),
+            )
         if hasattr(self.orch, "analyze_state_gpu"):
             info = self.orch.analyze_state_gpu(state)
             return MoveEval(
@@ -452,6 +904,31 @@ class GpuAI:
         if not legal:
             return Move(MoveType.PASS, None, HexCoord(0, 0)), MoveEval(q_value=0.0, source="empty")
 
+        if _HAS_FNN and isinstance(self.orch, FNNMCTSOrchestrator):
+            info = self._analyze_fnn_state(self.gpu_state)
+            eval_info = self._evaluate_fnn_state_puct(self.gpu_state)
+            move_bytes = info["move_bytes"]
+            raw_bytes = bytes(move_bytes.tolist())
+            legal_by_bytes = {_cpu_move_to_gpu_bytes(mv): mv for mv in legal}
+            move = legal_by_bytes.get(raw_bytes)
+            if move is None:
+                move = _gpu_bytes_to_cpu_move(move_bytes.numpy(), game)
+                if move is not None:
+                    move = legal_by_bytes.get(_cpu_move_to_gpu_bytes(move))
+            if move is None:
+                print("WARNING: GPU FNN analysis returned a move illegal under the CPU ruleset; falling back to first legal move.")
+                move = legal[0]
+            move_eval = MoveEval(
+                q_value=float(info.get("top_child_q", 0.0)),
+                root_value=float(info.get("root_value", 0.0)),
+                blend_value=float(info.get("blend_value", 0.0)),
+                eval_value=float(eval_info.get("eval_value", 0.0)),
+                source="search",
+                simulations=int(getattr(self.orch.config, "num_simulations", 0)),
+                confidence=float(eval_info.get("eval_confidence", info.get("confidence", 0.0))),
+            )
+            return move, move_eval
+
         if hasattr(self.orch, "analyze_state_gpu"):
             info = self.orch.analyze_state_gpu(self.gpu_state)
             move_bytes = info["move_bytes"]
@@ -492,8 +969,11 @@ class SelectMode(Enum):
 class MoveEval:
     q_value: float | None = None
     root_value: float | None = None
+    blend_value: float | None = None
+    eval_value: float | None = None
     source: str = ""
     simulations: int = 0
+    confidence: float | None = None
 
 
 @dataclass
@@ -667,46 +1147,63 @@ class HiveGUI:
             gpu_ai        = self.gpu_ai
 
             def gpu_worker() -> None:
-                # CPU immediate-win check (fast) before paying full MCTS cost
-                immediate = find_immediate_win(game_snapshot)
-                if immediate is not None:
-                    with self._ai_lock:
-                        self._ai_result = (immediate, MoveEval(q_value=1.0, source="forced"), gen)
-                    self.ai_thinking = False
-                    return
+                try:
+                    t0 = time.perf_counter()
+                    immediate = find_immediate_win(game_snapshot)
+                    t1 = time.perf_counter()
+                    print(f"[GUI] immediate-win check: {t1 - t0:.3f}s")
+                    if immediate is not None:
+                        move_eval = gpu_ai.analyze_current_state()
+                        move_eval.source = "forced"
+                        with self._ai_lock:
+                            self._ai_result = (immediate, move_eval, gen)
+                        return
 
-                move, move_eval = gpu_ai.select_move_with_eval(game_snapshot)
-                with self._ai_lock:
-                    self._ai_result = (move, move_eval, gen)
-                self.ai_thinking = False
+                    move, move_eval = gpu_ai.select_move_with_eval(game_snapshot)
+                    t2 = time.perf_counter()
+                    print(
+                        f"[GUI] GPU search: {t2 - t1:.3f}s "
+                        f"(total {t2 - t0:.3f}s, sims={getattr(gpu_ai.orch.config, 'num_simulations', 0)})"
+                    )
+                    with self._ai_lock:
+                        self._ai_result = (move, move_eval, gen)
+                except Exception:
+                    print("[GUI] GPU worker failed:")
+                    traceback.print_exc()
+                finally:
+                    self.ai_thinking = False
 
             threading.Thread(target=gpu_worker, daemon=True).start()
         else:
             # ── CPU path (FNN fallback or legacy CPU MCTS) ────────────
             def worker() -> None:
-                immediate = find_immediate_win(game_snapshot)
-                if immediate is not None:
-                    with self._ai_lock:
-                        self._ai_result = (immediate, MoveEval(q_value=1.0, source="forced"), gen)
-                    self.ai_thinking = False
-                    return
+                try:
+                    immediate = find_immediate_win(game_snapshot)
+                    if immediate is not None:
+                        with self._ai_lock:
+                            self._ai_result = (immediate, MoveEval(source="forced"), gen)
+                        return
 
-                if self.cpu_player is not None:
-                    move = self.cpu_player.choose_move(game_snapshot)
-                else:
-                    mcts = MCTS(self.net, self.encoder, self.mcts_config)
-                    policy = mcts.search(game_snapshot, move_number=self.move_number)
-                    action = int(np.argmax(policy))
-                    mask = self.encoder.get_legal_action_mask(game_snapshot)
-                    if mask[action] > 0:
-                        move = self.encoder.decode_action(action, game_snapshot)
+                    if self.cpu_player is not None:
+                        move = self.cpu_player.choose_move(game_snapshot)
                     else:
-                        legal = np.where(mask > 0)[0]
-                        best = legal[np.argmax(policy[legal])]
-                        move = self.encoder.decode_action(int(best), game_snapshot)
-                with self._ai_lock:
-                    self._ai_result = (move, MoveEval(), gen)
-                self.ai_thinking = False
+                        mcts = MCTS(self.net, self.encoder, self.mcts_config)
+                        policy = mcts.search(game_snapshot, move_number=self.move_number)
+                        action = int(np.argmax(policy))
+                        mask = self.encoder.get_legal_action_mask(game_snapshot)
+                        if mask[action] > 0:
+                            move = self.encoder.decode_action(action, game_snapshot)
+                        else:
+                            legal = np.where(mask > 0)[0]
+                            best = legal[np.argmax(policy[legal])]
+                            move = self.encoder.decode_action(int(best), game_snapshot)
+                    with self._ai_lock:
+                        self._ai_result = (move, MoveEval(), gen)
+                except Exception:
+                    print("[GUI] CPU worker failed:")
+                    traceback.print_exc()
+                finally:
+                    self.ai_thinking = False
 
             threading.Thread(target=worker, daemon=True).start()
 
@@ -1064,10 +1561,10 @@ class HiveGUI:
             desc_s = self.f_small.render(self._move_summary(rec.move), True, C_PANEL_TEXT)
             surf.blit(desc_s, (card.x + 12, card.y + 38))
             if rec.eval.q_value is None:
-                eval_text = "Q: pending"
+                eval_text = "Top: pending"
                 eval_col = C_PENDING
             else:
-                eval_text = f"Q: {rec.eval.q_value:+.3f}"
+                eval_text = f"Top: {rec.eval.q_value:+.3f}"
                 eval_col = C_WIN_W if rec.eval.q_value > 0 else (C_WIN_B if rec.eval.q_value < 0 else C_TITLE)
             eval_s = self.f_large.render(eval_text, True, eval_col)
             surf.blit(eval_s, (card.x + 12, card.y + 58))
@@ -1079,13 +1576,31 @@ class HiveGUI:
                 root_col = C_PANEL_TEXT
             root_s = self.f_small.render(root_text, True, root_col)
             surf.blit(root_s, (card.x + 14, card.y + 86))
+            if rec.eval.blend_value is None:
+                blend_text = "Blend: pending"
+                blend_col = C_PENDING
+            else:
+                blend_text = f"Blend: {rec.eval.blend_value:+.3f}"
+                blend_col = C_PANEL_TEXT
+            blend_s = self.f_small.render(blend_text, True, blend_col)
+            surf.blit(blend_s, (card.x + 14, card.y + 104))
+            if rec.eval.eval_value is None:
+                eval2_text = "Eval: pending"
+                eval2_col = C_PENDING
+            else:
+                eval2_text = f"Eval: {rec.eval.eval_value:+.3f}"
+                eval2_col = C_PANEL_TEXT
+            eval2_s = self.f_small.render(eval2_text, True, eval2_col)
+            surf.blit(eval2_s, (card.x + 14, card.y + 122))
             meta = rec.eval.source or "unavailable"
+            if rec.eval.confidence is not None:
+                meta = f"{meta}  ·  conf {rec.eval.confidence:.2f}"
             meta_s = self.f_small.render(
                 f"{meta}  ·  sims {rec.eval.simulations}",
                 True,
                 C_DIM,
             )
-            surf.blit(meta_s, (card.x + 132, card.y + 70))
+            surf.blit(meta_s, (card.x + 132, card.y + 106))
         else:
             move_s = self.f_med.render("Initial position", True, C_TITLE)
             surf.blit(move_s, (card.x + 12, card.y + 10))
@@ -1107,12 +1622,15 @@ class HiveGUI:
 
         values: list[float | None] = []
         for rec in self.move_records:
-            if rec.eval.q_value is None:
+            graph_value = rec.eval.eval_value
+            if graph_value is None:
+                graph_value = rec.eval.blend_value
+            if graph_value is None:
                 values.append(None)
             elif rec.mover == Color.WHITE:
-                values.append(rec.eval.q_value)
+                values.append(graph_value)
             else:
-                values.append(-rec.eval.q_value)
+                values.append(-graph_value)
 
         if values:
             pts: list[tuple[int, int]] = []
@@ -1496,7 +2014,7 @@ def load_checkpoint(
 
     For FNN / PRS v2 checkpoints the first element is a GpuAI instance and
     encoder is None — the GUI will use the GPU Gumbel MCTS path.
-    For GNN / NNUE / Transformer the first element is the network and encoder
+    For GNN / NNUE the first element is the network and encoder
     is an encoder object — the GUI uses the CPU MCTS path.
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -1565,23 +2083,6 @@ def load_checkpoint(
         print(f"Loaded NNUE: {path}")
         print(f"  Architecture: hidden_dims={net_config.hidden_dims}")
 
-    # ── Transformer ───────────────────────────────────────────────────
-    elif isinstance(net_config, TransformerConfig):
-        net = HiveTransformer(net_config)
-        net.load_state_dict(ckpt[state_dict_key], strict=False)
-        net = net.to(device)
-        net.eval()
-        encoder = TransformerEncoder()
-        model_name = (
-            f"Transformer (d={net_config.d_model}, "
-            f"h={net_config.num_heads}, layers={net_config.num_layers})"
-        )
-        print(f"Loaded Transformer: {path}")
-        print(
-            f"  Architecture: d_model={net_config.d_model}, "
-            f"num_heads={net_config.num_heads}, num_layers={net_config.num_layers}"
-        )
-
     # ── GNN ───────────────────────────────────────────────────────────
     elif HiveGNN is not None:
         net = HiveGNN(net_config)
@@ -1624,9 +2125,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--engine",
-        choices=["fnn-cpu", "legacy"],
-        default="fnn-cpu",
-        help="AI engine to use. 'fnn-cpu' is the recommended CPU fallback for systems without an NVIDIA GPU.",
+        choices=["auto", "fnn-cpu", "legacy"],
+        default="auto",
+        help=(
+            "AI engine to use. 'auto' prefers the GPU/legacy path when CUDA is "
+            "available and falls back to 'fnn-cpu' otherwise."
+        ),
     )
     parser.add_argument(
         "--checkpoint",
@@ -1652,7 +2156,7 @@ def main() -> None:
         default=None,
         help=(
             "Override MCTS simulations per move. "
-            "Defaults: FNN=1024, PRS v2=256, GNN/NNUE/Transformer=200."
+            "Defaults: FNN=1024, PRS v2=256, GNN/NNUE=200."
         ),
     )
     parser.add_argument(
@@ -1701,6 +2205,9 @@ def main() -> None:
     args = parser.parse_args()
 
     human_color = Color.WHITE if args.color == "white" else Color.BLACK
+    selected_engine = args.engine
+    if selected_engine == "auto":
+        selected_engine = "legacy" if torch.cuda.is_available() else "fnn-cpu"
 
     # Default checkpoint paths per model
     _DEFAULT_CHECKPOINTS = {
@@ -1716,7 +2223,7 @@ def main() -> None:
         mcts_config = MCTSConfig(num_simulations=200, temperature=0.0)
         print("Self-play mode: you control both WHITE and BLACK.")
         print("Controls: click to play · R = restart · Escape = quit\n")
-    elif args.engine == "fnn-cpu":
+    elif selected_engine == "fnn-cpu":
         from hive_fnn.fnn_cpu_player import FNNCPUPlayer, FNNCPUMCTSConfig
 
         checkpoint = (
@@ -1805,7 +2312,7 @@ def main() -> None:
                 ladybug=bool(exp_mask & 2),
                 pillbug=bool(exp_mask & 4),
             )
-    elif args.engine == "fnn-cpu" and not exp_str and not args.base_game:
+    elif selected_engine == "fnn-cpu" and not exp_str and not args.base_game:
         expansion_config = ExpansionConfig(mosquito=True, ladybug=True, pillbug=True)
 
     if gpu_ai is not None:
