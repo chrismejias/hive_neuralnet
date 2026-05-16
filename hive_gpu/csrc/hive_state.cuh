@@ -263,11 +263,9 @@ struct HiveState {
     uint16_t turn;
     uint8_t queen_placed;    // bit 0 = white queen placed, bit 1 = black queen placed
     GameResult result;
+    uint16_t stunned_cell;   // 0xFFFF = none; piece at this cell is pillbug-stunned
     int8_t center_q;
     int8_t center_r;
-
-    // Padding to align to 8 bytes (optional, for perf)
-    uint8_t _pad[2];
 };
 // Total: ~2645 + 529 + 3*72 + 14 + 10 + 8 ≈ ~3422 bytes
 
@@ -285,6 +283,10 @@ __device__ __forceinline__ int player_turn_number(const HiveState& s) {
 
 __device__ __forceinline__ bool is_queen_placed(const HiveState& s, Color c) {
     return (s.queen_placed >> (int)c) & 1;
+}
+
+__device__ __forceinline__ bool is_stunned_cell(const HiveState& s, int cell) {
+    return s.stunned_cell != 0xFFFF && (int)s.stunned_cell == cell;
 }
 
 __device__ __forceinline__ bool is_occupied(const HiveState& s, int cell) {
@@ -484,9 +486,9 @@ __device__ inline void init_state(HiveState& s, uint8_t expansion_mask = 0) {
     s.turn = 0;
     s.queen_placed = 0;
     s.result = IN_PROGRESS;
+    s.stunned_cell = 0xFFFF;
     s.center_q = 0;
     s.center_r = 0;
-    s._pad[0] = s._pad[1] = 0;
 }
 
 /**
@@ -499,13 +501,16 @@ __device__ inline void apply_move(HiveState& s, const GPUMove& m) {
             m.piece_type >= PT_QUEEN && m.piece_type <= PT_PILLBUG) {
             place_piece(s, m.to_cell, m.piece_type, current_player(s));
         }
+        s.stunned_cell = 0xFFFF;
     } else if (m.type == MOVE_MOVE) {
         if (m.from_cell >= 0 && m.from_cell < NUM_CELLS &&
             m.to_cell >= 0 && m.to_cell < NUM_CELLS) {
             move_piece(s, m.from_cell, m.to_cell);
+            s.stunned_cell = m.to_cell;
         }
+    } else {
+        s.stunned_cell = 0xFFFF;
     }
-    // MOVE_PASS: do nothing to the board
 
     s.turn++;
     check_game_over(s);

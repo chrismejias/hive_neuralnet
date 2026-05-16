@@ -877,7 +877,10 @@ class Board:
         return self.generate_slides(piece, max_distance=1)
 
     def generate_pillbug_throws(
-        self, pillbug_pos: HexCoord, articulation_points: set[HexCoord],
+        self,
+        pillbug_pos: HexCoord,
+        articulation_points: set[HexCoord],
+        stunned_pos: HexCoord | None = None,
     ) -> list[tuple[Piece, HexCoord]]:
         """
         Generate pillbug special ability moves (throws).
@@ -888,6 +891,8 @@ class Board:
         Rules:
         - Target piece must be on top of its stack
         - Target position must NOT be an articulation point (unless stack > 1)
+        - Target piece must not be the one moved on the immediately
+          preceding turn (pillbug stun / just-moved restriction)
         - Gate checks apply for both lifting and placing
         - The pillbug itself can be an articulation point and still throw
 
@@ -907,6 +912,10 @@ class Board:
             adj = pillbug_pos.neighbor(d)
             stack = self.grid.get(adj)
             if not stack:
+                continue
+            if len(stack) > 1:
+                continue
+            if stunned_pos is not None and adj == stunned_pos:
                 continue
             target_piece = stack[-1]  # top piece
 

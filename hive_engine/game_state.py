@@ -113,6 +113,9 @@ class GameState:
         self._legal_moves_cache: list[Move] | None = None
         # Incremental move generation cache
         self._move_gen_cache = MoveGenCache()
+        # Cell of the piece moved on the immediately previous turn; pillbugs
+        # may not throw that piece on this turn.
+        self._pillbug_stunned_pos: HexCoord | None = None
 
     @property
     def current_player(self) -> Color:
@@ -139,6 +142,7 @@ class GameState:
         gs._history = []  # Don't copy history for rollouts
         gs._legal_moves_cache = None  # Don't copy cache -- copies diverge
         gs._move_gen_cache = self._move_gen_cache.copy()
+        gs._pillbug_stunned_pos = self._pillbug_stunned_pos
         return gs
 
     # ── Hand Management ─────────────────────────────────────────
@@ -290,6 +294,8 @@ class GameState:
             pos = self.board.position_of(piece)
             if pos is None:
                 continue
+            if self._pillbug_stunned_pos is not None and pos == self._pillbug_stunned_pos:
+                continue
 
             # Piece must be on top of its stack to move
             if not self.board.is_on_top(piece):
@@ -324,7 +330,11 @@ class GameState:
         thrown_set: set[tuple[int, int, int, int]] = set()  # (piece hash, dest q, dest r) dedup
 
         for pb_pos in pillbug_ability_positions:
-            throws = self.board.generate_pillbug_throws(pb_pos, articulation_points)
+            throws = self.board.generate_pillbug_throws(
+                pb_pos,
+                articulation_points,
+                stunned_pos=self._pillbug_stunned_pos,
+            )
             for target_piece, dest in throws:
                 target_pos = self.board.position_of(target_piece)
                 key = (hash(target_piece), dest.q, dest.r, target_pos.q if target_pos else 0)
@@ -360,7 +370,11 @@ class GameState:
             if not has_adjacent_pillbug:
                 continue
             # Generate throws from the mosquito's position
-            throws = self.board.generate_pillbug_throws(pos, articulation_points)
+            throws = self.board.generate_pillbug_throws(
+                pos,
+                articulation_points,
+                stunned_pos=self._pillbug_stunned_pos,
+            )
             for target_piece, dest in throws:
                 target_pos = self.board.position_of(target_piece)
                 key = (hash(target_piece), dest.q, dest.r, target_pos.q if target_pos else 0)
@@ -383,6 +397,7 @@ class GameState:
         to preserve the original state.
         """
         undo_info: dict = {"turn": self.turn, "result": self.result}
+        undo_info["pillbug_stunned_pos"] = self._pillbug_stunned_pos
 
         if move.move_type == MoveType.PLACE:
             assert move.piece is not None and move.to is not None
@@ -401,8 +416,11 @@ class GameState:
             )
             undo_info["placed"] = False
             undo_info["from_pos"] = move.from_pos
+            self._pillbug_stunned_pos = move.to
 
         # MoveType.PASS: do nothing to the board
+        if move.move_type != MoveType.MOVE:
+            self._pillbug_stunned_pos = None
 
         self._history.append((move, undo_info))
         self.turn += 1
@@ -416,6 +434,7 @@ class GameState:
         move, undo_info = self._history.pop()
         self.turn = undo_info["turn"]
         self.result = undo_info["result"]
+        self._pillbug_stunned_pos = undo_info["pillbug_stunned_pos"]
 
         if move.move_type == MoveType.PLACE:
             assert move.piece is not None and move.to is not None
@@ -482,7 +501,11 @@ class GameState:
             (c.value, tuple(sorted((p.piece_type.value, p.piece_id) for p in h)))
             for c, h in sorted(self._hands.items())
         )
-        return hash((board_hash, hand_state, self.turn % 2))
+        stunned = None if self._pillbug_stunned_pos is None else (
+            self._pillbug_stunned_pos.q,
+            self._pillbug_stunned_pos.r,
+        )
+        return hash((board_hash, hand_state, self.turn % 2, stunned))
 
     def to_dict(self) -> dict:
         """Serialize the full game state to a dictionary."""
@@ -494,6 +517,10 @@ class GameState:
             "black_hand": [(p.piece_type.value, p.piece_id) for p in self._hands[Color.BLACK]],
             "white_queen_placed": self._queen_placed[Color.WHITE],
             "black_queen_placed": self._queen_placed[Color.BLACK],
+            "pillbug_stunned_pos": None if self._pillbug_stunned_pos is None else (
+                self._pillbug_stunned_pos.q,
+                self._pillbug_stunned_pos.r,
+            ),
         }
 
     # ── Display ─────────────────────────────────────────────────

@@ -32,7 +32,7 @@ constexpr int ENC_HALF = 8;
 constexpr int HYBRID_MAX_NODES = 48;
 constexpr int HYBRID_MAX_EDGES = 640;
 constexpr int HYBRID_MAX_PIECE_TOKENS = 28;
-constexpr int HYBRID_NODE_FEAT_DIM = 25;
+constexpr int HYBRID_NODE_FEAT_DIM = 26;
 constexpr int HYBRID_GLOBAL_FEAT_DIM = 6;
 constexpr int HYBRID_MOVE_FEAT_DIM = 25;
 constexpr int HYBRID_MAX_RADIUS = 2;
@@ -371,6 +371,7 @@ __global__ void hybrid_transformer_encode_states_kernel(
                 }
             }
             f[24] = level * 0.25f;
+            f[25] = is_stunned_cell(s, cell) ? 1.0f : 0.0f;
 
             tq[token_count] = col;
             tr[token_count] = row;

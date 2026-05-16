@@ -17,7 +17,8 @@
  *   [100:102] num_placement_pos — unique placement destinations from legal moves, per color(2)
  *   [102]    moves_to_draw     — normalized turn count
  *   [103]    move_number       — turn / 100
- *   [104:106] pillbug_capable  — owner has an uncovered pillbug OR ground mosquito adjacent to a pillbug, per color(2)
+ *   [104:106] pillbug_capable  — owner has an uncovered pillbug OR ground mosquito
+ *                                adjacent to a usable pillbug this turn, per color(2)
  *   [106:108] throwable_own    — own-color pieces adjacent to own pillbug-capable cell, per color(2)
  *   [108:110] throwable_opp    — own-color pieces adjacent to opposing pillbug-capable cell (threatened), per color(2)
  *
@@ -158,12 +159,13 @@ __device__ inline void extract_fnn_features_device(
             }
         }
 
-        // pillbug_capable [88:90]
-        bool is_capable = (pt == PT_PILLBUG);
-        if (!is_capable && pt == PT_MOSQUITO && h == 1) {
+        // pillbug_capable [104:106]
+        bool is_capable = (s.stunned_cell != (uint16_t)cell) && (pt == PT_PILLBUG);
+        if (!is_capable && s.stunned_cell != (uint16_t)cell && pt == PT_MOSQUITO && h == 1) {
             for (int d = 0; d < NUM_DIRS; d++) {
                 int16_t nb = NEIGHBORS[cell][d];
                 if (nb < 0 || s.height[nb] == 0) continue;
+                if (s.stunned_cell == (uint16_t)nb) continue;
                 if (top_piece_type_at(s, nb) == PT_PILLBUG) {
                     is_capable = true;
                     break;
@@ -269,9 +271,10 @@ __device__ inline void extract_fnn_features_device(
     //       ability, so such a mosquito inherits the pillbug's throw ability
     //       for its owner's turn.
     //
-    // Gate/pin/stun legality is intentionally NOT enforced here — this is a
+    // Gate/pin legality is intentionally NOT enforced here — this is a
     // structural board feature. The `can_move` block already captures the
-    // turn-specific legality for the current player.
+    // turn-specific legality for the current player. Stunned pillbug cells
+    // are excluded because they are not usable this turn.
     //
     // throwable_own[c] = count of c-color top pieces adjacent to c's own
     //                    pillbug-capable cells (repositioning material).
@@ -286,6 +289,7 @@ __device__ inline void extract_fnn_features_device(
             for (int d = 0; d < NUM_DIRS; d++) {
                 int16_t nb = NEIGHBORS[pbc][d];
                 if (nb < 0 || s.height[nb] == 0) continue;
+                if (s.stunned_cell == (uint16_t)nb) continue;
                 uint8_t ntop = s.pieces[s.height[nb] - 1][nb];
                 Color nc = cell_color(ntop);
                 if ((int)nc == c) {

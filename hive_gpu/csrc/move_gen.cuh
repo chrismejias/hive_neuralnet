@@ -697,6 +697,8 @@ __device__ inline int gen_pillbug_throws(const HiveState& s, int pb_cell,
     for (int dt = 0; dt < NUM_DIRS; dt++) {
         int16_t target_cell = NEIGHBORS[pb_cell][dt];
         if (target_cell < 0 || !s.occupied.get(target_cell)) continue;
+        if (s.height[target_cell] != 1) continue;
+        if (is_stunned_cell(s, target_cell)) continue;
 
         // Target must be on top and not pinned
         if (is_pinned(cache, target_cell)) continue;
@@ -744,6 +746,8 @@ __device__ inline bool has_pillbug_throw_for_target(
     const MovegenStateCache& cache
 ) {
     if (target_cell < 0 || !s.occupied.get(target_cell)) return false;
+    if (s.height[target_cell] != 1) return false;
+    if (is_stunned_cell(s, target_cell)) return false;
     if (is_pinned(cache, target_cell)) return false;
 
     int pb_height = s.height[pb_cell];
@@ -1224,6 +1228,7 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
 
                 // Only top pieces can move
                 // (white_top/black_top already tracks top-piece ownership)
+                if (is_stunned_cell(s, cell)) continue;
 
                 // Check if pinned
                 if (is_pinned(cache, cell)) continue;
@@ -1380,6 +1385,8 @@ __device__ inline void summarize_pillbug_throws_for_fnn(
     for (int dt = 0; dt < NUM_DIRS; dt++) {
         int16_t target_cell = NEIGHBORS[pb_cell][dt];
         if (target_cell < 0 || !s.occupied.get(target_cell)) continue;
+        if (s.height[target_cell] != 1) continue;
+        if (is_stunned_cell(s, target_cell)) continue;
         if (is_pinned(cache, target_cell)) continue;
 
         int lift_h = max(s.height[target_cell] - 1, pb_height);
@@ -1470,6 +1477,7 @@ __device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* ou
             int cell = wi * 64 + bit;
             bits &= bits - 1;
             if (cell >= NUM_CELLS) continue;
+            if (is_stunned_cell(s, cell)) continue;
             if (is_pinned(cache, cell)) continue;
 
             bool has_move = false;
