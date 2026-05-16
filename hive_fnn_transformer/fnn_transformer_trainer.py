@@ -379,7 +379,18 @@ class HybridTrainer:
 
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.best_net.load_state_dict(ckpt["model_state_dict"])
+        state = ckpt["model_state_dict"]
+        cur_state = self.best_net.state_dict()
+        for key in ("graph_trunk.token_proj.weight", "transformer_trunk.token_proj.weight"):
+            if key in state and key in cur_state and state[key].shape != cur_state[key].shape:
+                old = state[key]
+                new = cur_state[key].clone()
+                rows = min(old.shape[0], new.shape[0])
+                cols = min(old.shape[1], new.shape[1])
+                new[:rows, :cols] = old[:rows, :cols]
+                state = dict(state)
+                state[key] = new
+        self.best_net.load_state_dict(state)
         self._start_iter = int(ckpt["iteration"]) + 1
         print(f"Resumed from {path} (iter {ckpt['iteration']})")
 

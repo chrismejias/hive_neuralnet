@@ -18,9 +18,9 @@ GPU HiveState layout (SIZEOF = 3424 bytes):
   [3412..3413]  turn                uint16
   [3414]        queen_placed        uint8 (bit0=white, bit1=black)
   [3415]        result              uint8 (0=in_progress,1=ww,2=bw,3=draw)
-  [3416]        center_q            int8  (recomputed by encoder; set 0)
-  [3417]        center_r            int8
-  [3418..3419]  _pad[2]
+  [3416..3417]  stunned_cell        uint16 (0xFFFF = none)
+  [3418]        center_q            int8  (recomputed by encoder; set 0)
+  [3419]        center_r            int8
   [3420..3423]  trailing compiler padding
 """
 
@@ -56,8 +56,9 @@ _OFF_HANDS       = 3396
 _OFF_TURN        = 3412
 _OFF_QUEEN_PLACED = 3414
 _OFF_RESULT      = 3415
-_OFF_CENTER_Q    = 3416
-_OFF_CENTER_R    = 3417
+_OFF_STUNNED_CELL = 3416
+_OFF_CENTER_Q    = 3418
+_OFF_CENTER_R    = 3419
 
 # Python PieceType (0-based) -> GPU PieceType (1-based)
 _PT_GPU = {
@@ -167,6 +168,11 @@ def gamestate_to_gpu_bytes(state: GameState) -> bytes:
     buf[_OFF_QUEEN_PLACED] = qp
 
     buf[_OFF_RESULT] = _RESULT_GPU.get(state.result, 0)
+    stunned = getattr(state, "_pillbug_stunned_pos", None)
+    if stunned is None:
+        struct.pack_into('<H', buf, _OFF_STUNNED_CELL, 0xFFFF)
+    else:
+        struct.pack_into('<H', buf, _OFF_STUNNED_CELL, _qr_to_cell(stunned.q, stunned.r))
     # center_q / center_r stay 0 (encoder recomputes)
 
     return bytes(buf)

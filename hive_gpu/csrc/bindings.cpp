@@ -11,6 +11,7 @@
  */
 
 #include <torch/extension.h>
+#include <cstddef>
 #include "hive_state.cuh"
 #include "state_encoder.cuh"  // for encoder constants (kernel guarded by __CUDACC__)
 #include "fnn_features.cuh"   // for FNN_FEAT_DIM constant
@@ -90,6 +91,10 @@ root_tactical_probe_batch(
     bool enable_win_in_one,
     bool enable_check_opponent_wins,
     bool enable_win_in_two);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+debug_tactical_state_batch(
+    torch::Tensor states_tensor,
+    int batch_size);
 torch::Tensor fnn_successor_features_batch(
     torch::Tensor states_tensor,
     torch::Tensor legal_moves_tensor,
@@ -319,6 +324,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("enable_win_in_one") = true,
           py::arg("enable_check_opponent_wins") = true,
           py::arg("enable_win_in_two") = true);
+    m.def("debug_tactical_state_batch",
+          &hive_gpu::debug_tactical_state_batch,
+          "Debug tactical state summaries",
+          py::arg("states"), py::arg("batch_size"));
 
     m.def("fnn_successor_features_batch",
           &hive_gpu::fnn_successor_features_batch,
@@ -388,6 +397,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MAX_STACK") = hive_gpu::MAX_STACK;
     m.attr("SIZEOF_HIVE_STATE") = (int)sizeof(hive_gpu::HiveState);
     m.attr("SIZEOF_GPU_MOVE") = (int)sizeof(hive_gpu::GPUMove);
+    m.attr("OFF_TURN") = (int)offsetof(hive_gpu::HiveState, turn);
+    m.attr("OFF_QUEEN_PLACED") = (int)offsetof(hive_gpu::HiveState, queen_placed);
+    m.attr("OFF_RESULT") = (int)offsetof(hive_gpu::HiveState, result);
+    m.attr("OFF_STUNNED_CELL") = (int)offsetof(hive_gpu::HiveState, stunned_cell);
+    m.attr("OFF_QUEEN_CELL") = (int)offsetof(hive_gpu::HiveState, queen_cell);
+    m.attr("OFF_HANDS") = (int)offsetof(hive_gpu::HiveState, hands);
     m.attr("MAX_ENC_NODES") = hive_gpu::MAX_ENC_NODES;
     m.attr("MAX_ENC_EDGES") = hive_gpu::MAX_ENC_EDGES;
     m.attr("NODE_FEAT_DIM") = hive_gpu::NODE_FEAT_DIM;

@@ -228,6 +228,25 @@ __device__ inline bool state_has_immediate_win_for_current_player(
     return has_immediate_surround_win_for_current_player(s);
 }
 
+__global__ void debug_tactical_state_kernel(
+    const HiveState* states,
+    int* current_out,
+    int* own_out,
+    int* opp_out,
+    int* imm_out,
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+    const HiveState& s = states[idx];
+    Color player = current_player(s);
+    Color target = (player == WHITE) ? BLACK : WHITE;
+    current_out[idx] = (int)player;
+    own_out[idx] = queen_surround_count_for_color_device(s, player);
+    opp_out[idx] = queen_surround_count_for_color_device(s, target);
+    imm_out[idx] = has_immediate_surround_win_for_current_player(s) ? 1 : 0;
+}
+
 __global__ void root_tactical_probe_kernel(
     const HiveState* states,
     const GPUMove* legal_moves,       // [B, MAX_LEGAL_MOVES]
@@ -322,7 +341,10 @@ __global__ void root_tactical_probe_kernel(
         for (int r = 0; r < nreply; ++r) {
             HiveState grand = child;
             apply_move(grand, replies[r]);
-            if (!state_has_immediate_win_for_current_player(grand)) {
+            bool already_won =
+                (root_player == WHITE && grand.result == WHITE_WINS) ||
+                (root_player == BLACK && grand.result == BLACK_WINS);
+            if (!already_won && !state_has_immediate_win_for_current_player(grand)) {
                 candidate_ok = false;
                 break;
             }
@@ -1458,6 +1480,31 @@ root_tactical_probe_batch(
         batch_size);
 
     return std::make_tuple(winning, allowed, forced);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+debug_tactical_state_batch(
+    at::Tensor states_tensor,
+    int batch_size
+) {
+    auto opts_i32 = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto current = at::zeros({batch_size}, opts_i32);
+    auto own = at::zeros({batch_size}, opts_i32);
+    auto opp = at::zeros({batch_size}, opts_i32);
+    auto imm = at::zeros({batch_size}, opts_i32);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(states_tensor.data_ptr());
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    debug_tactical_state_kernel<<<blocks, threads>>>(
+        states_ptr,
+        static_cast<int*>(current.data_ptr()),
+        static_cast<int*>(own.data_ptr()),
+        static_cast<int*>(opp.data_ptr()),
+        static_cast<int*>(imm.data_ptr()),
+        batch_size);
+
+    return std::make_tuple(current, own, opp, imm);
 }
 
 /**

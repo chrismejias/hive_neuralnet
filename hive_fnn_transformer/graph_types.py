@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-NODE_FEAT_DIM = 25
+NODE_FEAT_DIM = 26
 GLOBAL_FEAT_DIM = 6
 MAX_PIECE_TOKENS = 28
 
