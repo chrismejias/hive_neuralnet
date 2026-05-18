@@ -48,12 +48,17 @@ import hive_gpu
 from hive_fnn.fnn_mcts_orchestrator import FNNMCTSConfig, FNNMCTSOrchestrator
 from hive_fnn.fnn_network import HiveFNN
 from hive_fnn.fnn_puct_orchestrator import FNNPUCTConfig, FNNPUCTOrchestrator
+from hive_fnn_transformer.fnn_transformer_mcts_orchestrator import (
+    HybridMCTSConfig,
+    HybridMCTSOrchestrator,
+)
+from hive_fnn_transformer.fnn_transformer_net import HiveHybridGNN
 from hive_prs.prs_mcts_orchestrator_v2 import PRSMCTSConfigV2, PRSMCTSOrchestratorV2
 from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
 from hive_prs.prs_transformer_v3 import HivePRSTransformerV3
 from hive_prs.slot_map import N_SLOTS
 
-ModelType = Literal["fnn", "prs"]
+ModelType = Literal["fnn", "fnn_transformer", "prs"]
 
 FNN_DEFAULT_PATTERNS = (
     "checkpoints_fnn_small/hive_fnn_checkpoint_*.pt",
@@ -63,6 +68,10 @@ FNN_DEFAULT_PATTERNS = (
 )
 PRS_DEFAULT_PATTERNS = (
     "checkpoints_prs_v2/prs_v2_iter_*.pt",
+)
+FNN_TRANSFORMER_DEFAULT_PATTERNS = (
+    "checkpoints_fnn_transformer/hybrid_gnn_checkpoint_*.pt",
+    "checkpoints_bootstrap_*_fnn_transformer_*/hybrid_gnn_checkpoint_*.pt",
 )
 
 
@@ -79,7 +88,12 @@ def _latest_by_mtime(paths: list[str]) -> str | None:
 
 
 def latest_checkpoint(model_type: ModelType) -> str | None:
-    patterns = FNN_DEFAULT_PATTERNS if model_type == "fnn" else PRS_DEFAULT_PATTERNS
+    if model_type == "fnn":
+        patterns = FNN_DEFAULT_PATTERNS
+    elif model_type == "fnn_transformer":
+        patterns = FNN_TRANSFORMER_DEFAULT_PATTERNS
+    else:
+        patterns = PRS_DEFAULT_PATTERNS
     paths: list[str] = []
     for pattern in patterns:
         paths.extend(glob.glob(pattern))
@@ -87,7 +101,7 @@ def latest_checkpoint(model_type: ModelType) -> str | None:
 
 
 def default_sims(model_type: ModelType) -> int:
-    return 1024 if model_type == "fnn" else 256
+    return 1024 if model_type in ("fnn", "fnn_transformer") else 256
 
 
 def default_k(_: ModelType) -> int:
@@ -95,7 +109,7 @@ def default_k(_: ModelType) -> int:
 
 
 def default_wave_size(model_type: ModelType) -> int:
-    return 4 if model_type == "fnn" else 16
+    return 4 if model_type in ("fnn", "fnn_transformer") else 16
 
 
 def parse_wave_schedule(spec: str | None) -> list[int] | None:
@@ -111,6 +125,9 @@ def load_checkpoint(model_type: ModelType, path: str) -> torch.nn.Module:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if model_type == "fnn":
         net = HiveFNN(ckpt["net_config"]).cuda().eval()
+        net.load_state_dict(ckpt["model_state_dict"])
+    elif model_type == "fnn_transformer":
+        net = HiveHybridGNN(ckpt["net_config"]).cuda().eval()
         net.load_state_dict(ckpt["model_state_dict"])
     else:
         prs_version = ckpt.get("model_version", "v2")
@@ -147,8 +164,10 @@ def build_orchestrator(
     root_q_min_visits: int | None = None,
     eval_mode: bool = True,
 ) -> tuple[object, object]:
-    if model_type == "fnn":
+    if model_type in ("fnn", "fnn_transformer"):
         if use_puct:
+            if model_type == "fnn_transformer":
+                raise ValueError("fnn_transformer arena currently supports only Gumbel root search")
             cfg = FNNPUCTConfig(
                 num_simulations=sims,
                 c_puct=c_puct if c_puct is not None else FNNPUCTConfig.c_puct,
@@ -164,7 +183,8 @@ def build_orchestrator(
                 cfg.temperature_drop_move = 0
             orch = FNNPUCTOrchestrator(net, cfg)
         else:
-            cfg = FNNMCTSConfig(
+            config_cls = HybridMCTSConfig if model_type == "fnn_transformer" else FNNMCTSConfig
+            cfg = config_cls(
                 num_simulations=sims,
                 max_num_considered_actions=k,
                 c_puct=c_puct if c_puct is not None else FNNMCTSConfig.c_puct,
@@ -184,7 +204,11 @@ def build_orchestrator(
             if eval_mode:
                 cfg.dirichlet_epsilon = 0.0
                 cfg.temperature_drop_move = 0
-            orch = FNNMCTSOrchestrator(net, cfg)
+            orch = (
+                HybridMCTSOrchestrator(net, cfg)
+                if model_type == "fnn_transformer"
+                else FNNMCTSOrchestrator(net, cfg)
+            )
     else:
         cfg = PRSMCTSConfigV2(
             num_simulations=sims,
@@ -629,18 +653,20 @@ def choose_fnn_puct_moves(
             move_bytes=np.zeros((B, orch.ext.SIZEOF_GPU_MOVE), dtype=np.uint8),
         )
 
-    priors_per_legal, _root_vals, child_q_per_legal = orch._eval_states(
-        states, legal_moves, num_legal, B, root_features,
-    )
+    eval_out = orch._eval_states(states, legal_moves, num_legal, B, root_features)
+    if len(eval_out) >= 2:
+        priors_per_legal = eval_out[0]
+        _root_vals = eval_out[1]
+    else:
+        raise RuntimeError("FNN PUCT eval_states returned an unexpected result")
     if bool(has_immediate_win.any().item()):
         priors_per_legal.zero_()
         priors_per_legal[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
-        child_q_per_legal.zero_()
 
     game_active_t = has_actions.to(torch.int8)
     orch._expand_root_if_needed(
         tree, states, legal_moves, num_legal,
-        priors_per_legal, child_q_per_legal, game_active_t, B,
+        priors_per_legal, game_active_t, B,
     )
     orch._apply_root_dirichlet(tree, B, has_actions)
 
@@ -715,7 +741,7 @@ def choose_moves(
     policy_only: bool = False,
 ) -> ArenaMoveResult:
     if policy_only:
-        if model_type == "fnn":
+        if model_type in ("fnn", "fnn_transformer"):
             return choose_fnn_policy_moves(
                 orch,
                 states,
@@ -732,7 +758,7 @@ def choose_moves(
             stochastic=stochastic,
             gumbel_noise_scale=gumbel_noise_scale,
         )
-    if model_type == "fnn":
+    if model_type in ("fnn", "fnn_transformer"):
         return choose_fnn_moves(
             orch,
             states,
@@ -787,7 +813,8 @@ def _reset_tree_rows(
     tree["visit_count"][row_t] = 0
     tree["total_value"][row_t] = 0
     tree["prior"][row_t] = 0
-    tree["virtual_q_penalty"][row_t] = 0
+    if "virtual_q_penalty" in tree:
+        tree["virtual_q_penalty"][row_t] = 0
     tree["parent_idx"][row_t] = -1
     tree["move_bytes"][row_t] = 0
     tree["action_idx"][row_t] = -1
@@ -797,7 +824,8 @@ def _reset_tree_rows(
     tree["terminal_value"][row_t] = 0
     tree["node_count"][row_t] = 1
     tree["root_node"][row_t] = 0
-    tree["child_init_q"][row_t] = 0
+    if "child_init_q" in tree:
+        tree["child_init_q"][row_t] = 0
 
 
 def main() -> None:
@@ -820,8 +848,8 @@ def main() -> None:
             "      --black-checkpoint checkpoints_prs_v2/prs_v2_iter_0600.pt\n"
         ),
     )
-    ap.add_argument("--white-model", choices=["fnn", "prs"], default="prs")
-    ap.add_argument("--black-model", choices=["fnn", "prs"], default="fnn")
+    ap.add_argument("--white-model", choices=["fnn", "fnn_transformer", "prs"], default="prs")
+    ap.add_argument("--black-model", choices=["fnn", "fnn_transformer", "prs"], default="fnn")
     ap.add_argument("--white-checkpoint", type=str, default=None)
     ap.add_argument("--black-checkpoint", type=str, default=None)
     ap.add_argument("--games", type=int, default=50)
@@ -865,7 +893,7 @@ def main() -> None:
     ap.add_argument(
         "--gumbel-noise-scale",
         type=float,
-        default=0.0,
+        default=0.1,
         help="Scale for root Gumbel noise in evaluation; 0 disables noise.",
     )
     ap.add_argument("--compile-forward", action=argparse.BooleanOptionalAction, default=False)
@@ -917,9 +945,9 @@ def main() -> None:
         root_q_min_visits=args.black_root_q_min_visits,
         eval_mode=eval_mode,
     )
-    if args.white_model == "fnn":
+    if args.white_model in ("fnn", "fnn_transformer"):
         setattr(white_cfg, "wave_schedule", white_wave_schedule)
-    if args.black_model == "fnn":
+    if args.black_model in ("fnn", "fnn_transformer"):
         setattr(black_cfg, "wave_schedule", black_wave_schedule)
     ext = hive_gpu.load_extension()
 
