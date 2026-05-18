@@ -72,6 +72,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 generate_legal_moves_and_fnn_features_batch(
     torch::Tensor states_tensor,
     int batch_size);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor>
+generate_legal_moves_and_hybrid_root_features_batch(
+    torch::Tensor states_tensor,
+    int batch_size);
 torch::Tensor queen_escape_flags_batch(
     torch::Tensor states_tensor,
     int batch_size);
@@ -304,6 +310,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("generate_legal_moves_and_fnn_features_batch",
           &hive_gpu::generate_legal_moves_and_fnn_features_batch,
           "Generate legal moves and extract FNN features in one kernel",
+          py::arg("states"), py::arg("batch_size"));
+    m.def("generate_legal_moves_and_hybrid_root_features_batch",
+          &hive_gpu::generate_legal_moves_and_hybrid_root_features_batch,
+          "Generate legal moves plus fused FNN-transformer root features in one kernel",
           py::arg("states"), py::arg("batch_size"));
     m.def("queen_escape_flags_batch",
           &hive_gpu::queen_escape_flags_batch,

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import torch
 
 from hive_fnn.fnn_mcts_orchestrator import FNNMCTSConfig, FNNMCTSOrchestrator
-from hive_fnn_transformer.gpu_encoder import HybridTransformerGPUEncoder
+from hive_fnn_transformer.graph_types import HybridPieceTensorBatch
 from hive_fnn_transformer.fnn_transformer_net import HiveHybridGNN
 
 
@@ -34,7 +34,6 @@ class HybridMCTSOrchestrator(FNNMCTSOrchestrator):
         super().__init__(net, cfg)
         self.net: HiveHybridGNN = net
         self.config: HybridMCTSConfig = cfg
-        self.graph_encoder = HybridTransformerGPUEncoder()
 
     def _eval_states(
         self,
@@ -52,29 +51,60 @@ class HybridMCTSOrchestrator(FNNMCTSOrchestrator):
         """
         dev = "cuda"
         max_legal = self._max_legal
-        n64 = num_legal.to(torch.int64)
-
-        if root_features is None:
-            root_features = self.ext.extract_fnn_features_batch(
-                states, legal_moves, num_legal, total,
-            )
-
         if total == 0:
             empty = torch.zeros(0, max_legal, dtype=torch.float32, device=dev)
             return empty, empty.new_zeros((0,)), empty
+
+        n64 = num_legal.to(torch.int64)
+
+        if root_features is None:
+            (
+                fused_legal_moves,
+                fused_num_legal,
+                root_features,
+                token_features,
+                token_q,
+                token_r,
+                token_z,
+                token_mask,
+                global_features,
+                move_features_per_legal,
+            ) = self.ext.generate_legal_moves_and_hybrid_root_features_batch(
+                states, total,
+            )
+            legal_moves = fused_legal_moves
+            num_legal = fused_num_legal
+            n64 = num_legal.to(torch.int64)
+            piece_batch = HybridPieceTensorBatch(
+                token_features=token_features,
+                token_q=token_q,
+                token_r=token_r,
+                token_z=token_z,
+                token_mask=token_mask,
+                global_features=global_features,
+                num_tokens=token_mask.sum(dim=1, dtype=torch.int32),
+            )
+        else:
+            piece_batch = HybridPieceTensorBatch(
+                *self.ext.hybrid_transformer_encode_with_moves_batch(
+                    states,
+                    legal_moves,
+                    num_legal,
+                    total,
+                )
+            )
+            move_features_per_legal = self.ext.hybrid_transformer_move_features_batch(
+                states,
+                legal_moves,
+                num_legal,
+                total,
+            )
 
         slot_idx = self._slot_idx
         valid = slot_idx < n64.unsqueeze(1)
         action_to_root = self._row_indices(total).expand_as(valid)[valid]
         move_indices = slot_idx.expand_as(valid)[valid]
         n_total = int(action_to_root.shape[0])
-
-        piece_batch = self.graph_encoder.encode_batch(
-            states,
-            total,
-            legal_moves=legal_moves,
-            num_legal=num_legal,
-        )
 
         with torch.inference_mode():
             with torch.amp.autocast("cuda"):
@@ -95,9 +125,6 @@ class HybridMCTSOrchestrator(FNNMCTSOrchestrator):
 
                 succ_features = self.ext.fnn_successor_features_batch(
                     states, legal_moves, action_to_root, move_indices, n_total,
-                )
-                move_features_per_legal = self.ext.hybrid_transformer_move_features_batch(
-                    states, legal_moves, num_legal, total,
                 )
                 succ_emb = self.net.fnn.encode(succ_features)
                 gathered_root = root_emb[action_to_root]
