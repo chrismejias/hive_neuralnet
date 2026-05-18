@@ -28,6 +28,7 @@ from hive_engine.elo import EloTracker
 
 from hive_prs.prs_transformer import PRSConfig
 from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
+from hive_prs.prs_transformer_v3 import HivePRSTransformerV3
 from hive_prs.prs_replay_buffer_v2 import PRSReplayBufferV2, PRSTrainingBatchV2
 from hive_prs.prs_mcts_orchestrator_v2 import (
     PRSMCTSConfigV2, PRSMCTSOrchestratorV2,
@@ -56,6 +57,8 @@ class PRSTrainConfigV2:
     learning_rate:             float = 5e-4
     weight_decay:              float = 1e-4
     max_grad_norm:             float = 1.0
+    slot_legality_loss_weight:  float = 0.0
+    articulation_loss_weight:   float = 0.0
 
     # LR schedule
     lr_schedule:               str   = "cosine"
@@ -66,7 +69,7 @@ class PRSTrainConfigV2:
     buffer_max_size:           int   = 150_000
 
     # Checkpointing
-    checkpoint_dir:            str   = "checkpoints_prs_v2"
+    checkpoint_dir:            str   = "checkpoints_prs_v3"
     checkpoint_keep_every:     int   = 0
 
     # Arena
@@ -82,6 +85,7 @@ class PRSTrainConfigV2:
     virtual_q_penalty:         float = 0.25
     non_root_sigma:            float = 1.0
     compile_forward:           bool  = False
+    model_version:             str   = "v3"
 
     # C6 (6-fold) rotational augmentation for training batches.
     # With this probability, a random rotation k∈{1..5} is applied to every
@@ -112,6 +116,11 @@ def compute_prs_v2_loss(
     legal_mask:    torch.Tensor,     # (B, N_SLOTS) bool
     value_targets: torch.Tensor,     # (B, 1) float32
     value_mask:    torch.Tensor,     # (B, 1) float32, 1 = include in value loss
+    aux_outputs:   dict[str, torch.Tensor],
+    articulation_targets: torch.Tensor,    # (B, MAX_BOARD)
+    articulation_mask:    torch.Tensor,    # (B, MAX_BOARD)
+    slot_legality_weight: float = 0.15,
+    articulation_weight:  float = 0.15,
 ) -> tuple[torch.Tensor, dict]:
     """Masked CE over legal slots + value MSE.
 
@@ -142,7 +151,38 @@ def compute_prs_v2_loss(
     else:
         value_loss = torch.tensor(0.0, device=policy_logits.device)
     total_loss = policy_loss + value_loss
-    return total_loss, {"policy_loss": policy_loss, "value_loss": value_loss}
+    loss_dict: dict[str, torch.Tensor] = {
+        "policy_loss": policy_loss,
+        "value_loss": value_loss,
+    }
+
+    if (
+        slot_legality_weight > 0.0
+        and "slot_legality_logits" in aux_outputs
+    ):
+        sl_logits = aux_outputs["slot_legality_logits"]
+        sl_target = legal_mask.float()
+        sl_loss = F.binary_cross_entropy_with_logits(sl_logits, sl_target)
+        total_loss = total_loss + slot_legality_weight * sl_loss
+        loss_dict["slot_legality_loss"] = sl_loss
+
+    if (
+        articulation_weight > 0.0
+        and "articulation_logits" in aux_outputs
+        and articulation_targets.numel() > 0
+    ):
+        art_logits = aux_outputs["articulation_logits"]
+        art_bce = F.binary_cross_entropy_with_logits(
+            art_logits, articulation_targets, reduction="none",
+        )
+        if articulation_mask.sum() > 0:
+            art_loss = (art_bce * articulation_mask).sum() / articulation_mask.sum()
+        else:
+            art_loss = torch.tensor(0.0, device=policy_logits.device)
+        total_loss = total_loss + articulation_weight * art_loss
+        loss_dict["articulation_loss"] = art_loss
+
+    return total_loss, loss_dict
 
 
 # ── Trainer ────────────────────────────────────────────────────────────
@@ -163,7 +203,8 @@ class PRSTrainerV2:
 
         # Compile only tensor-heavy trunk/head paths; the CUDA bridge stays
         # outside Dynamo because its output structure depends on game state.
-        self.best_net: HivePRSTransformerV2 = HivePRSTransformerV2(self.net_config).to(self.device)
+        net_cls = HivePRSTransformerV3 if self.config.model_version == "v3" else HivePRSTransformerV2
+        self.best_net: HivePRSTransformerV2 = net_cls(self.net_config).to(self.device)
         self.best_net.enable_compiled_forward(cfg.compile_forward and self.device.type == "cuda")
         self._train_net = self.best_net   # same instance; no compile gap
 
@@ -244,19 +285,22 @@ class PRSTrainerV2:
 
     def _forward_train(
         self, batch: PRSTrainingBatchV2,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Full v2 forward from a training batch (trunk + CUDA bridge + head)."""
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Full v2 forward from a training batch (trunk + CUDA bridge + heads)."""
         ext = hive_gpu.load_extension()
-        B = batch.state_bytes.shape[0]
-        # Upload state_bytes once and regenerate legal moves on GPU so the
-        # CUDA prs_v2_classify kernel can produce all bridge inputs.
-        states_gpu = torch.from_numpy(batch.state_bytes).cuda()
-        legal_t, nlegal_t = ext.generate_legal_moves_batch(states_gpu, B)
+        B = int(batch.state_bytes.shape[0])
+        states_gpu = batch.state_bytes
+        legal_t = batch.legal_moves_raw
+        nlegal_t = batch.nlegal_raw
         kernel_out = ext.prs_v2_classify_batch(
             states_gpu, legal_t, nlegal_t, B, int(legal_t.shape[1]),
         )
 
-        return self._train_net.forward_from_kernel(batch.prs_batch, kernel_out)
+        cfg = self.config
+        if cfg.slot_legality_loss_weight <= 0.0 and cfg.articulation_loss_weight <= 0.0:
+            logits, value = self._train_net.forward_from_kernel(batch.prs_batch, kernel_out)
+            return logits, value, {}
+        return self._train_net.forward_train_from_kernel(batch.prs_batch, kernel_out)
 
     def _train(self, iteration: int) -> tuple[float, dict]:
         cfg = self.config
@@ -270,23 +314,45 @@ class PRSTrainerV2:
         total_loss_sum = 0.0
         comp_sums: dict[str, float] = {}
         n_batches = 0
+        total_batches = cfg.num_epochs * max(1, len(self.buffer) // cfg.batch_size)
+        prefetch_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+
+        def fetch_next_batch() -> PRSTrainingBatchV2:
+            batch = self.buffer.sample_batch(
+                cfg.batch_size, augment_prob=cfg.augment_prob,
+            )
+            if prefetch_stream is None:
+                return batch.to(self.device, non_blocking=True)
+            with torch.cuda.stream(prefetch_stream):
+                return batch.to(self.device, non_blocking=True)
 
         for _ in range(cfg.num_epochs):
             batches_per_epoch = max(1, len(self.buffer) // cfg.batch_size)
+            next_batch = fetch_next_batch()
             for _ in range(batches_per_epoch):
-                batch = self.buffer.sample_batch(
-                    cfg.batch_size, augment_prob=cfg.augment_prob,
-                )
-                batch = batch.to(self.device, non_blocking=True)
+                if prefetch_stream is not None:
+                    torch.cuda.current_stream(self.device).wait_stream(prefetch_stream)
+                batch = next_batch
+                if n_batches + 1 < total_batches:
+                    next_batch = fetch_next_batch()
 
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)
                 if self.use_amp and self._scaler is not None:
                     with torch.amp.autocast("cuda"):
-                        logits, value = self._forward_train(batch)
+                        logits, value, aux = self._forward_train(batch)
                         loss, ld = compute_prs_v2_loss(
                             logits, value,
                             batch.slot_targets, batch.legal_masks,
                             batch.value_targets, batch.value_masks,
+                            aux,
+                            batch.articulation_targets,
+                            batch.articulation_mask,
+                            slot_legality_weight=cfg.slot_legality_loss_weight,
+                            articulation_weight=cfg.articulation_loss_weight,
                         )
                     self._scaler.scale(loss).backward()
                     if cfg.max_grad_norm > 0:
@@ -297,11 +363,16 @@ class PRSTrainerV2:
                     self._scaler.step(opt)
                     self._scaler.update()
                 else:
-                    logits, value = self._forward_train(batch)
+                    logits, value, aux = self._forward_train(batch)
                     loss, ld = compute_prs_v2_loss(
                         logits, value,
                         batch.slot_targets, batch.legal_masks,
                         batch.value_targets, batch.value_masks,
+                        aux,
+                        batch.articulation_targets,
+                        batch.articulation_mask,
+                        slot_legality_weight=cfg.slot_legality_loss_weight,
+                        articulation_weight=cfg.articulation_loss_weight,
                     )
                     loss.backward()
                     if cfg.max_grad_norm > 0:
@@ -331,7 +402,7 @@ class PRSTrainerV2:
                 iteration,
             )
             print(f"\n{'='*60}")
-            print(f"PRS v2 Iteration {iteration}/{self.config.num_iterations}")
+            print(f"PRS {self.config.model_version} Iteration {iteration}/{self.config.num_iterations}")
             print(f"  Simulations: {sims_this_iter}")
             print(f"{'='*60}")
 
@@ -371,16 +442,37 @@ class PRSTrainerV2:
         keep = cfg.checkpoint_keep_every
         if keep > 0 and iteration % keep != 0:
             return
-        path = os.path.join(cfg.checkpoint_dir, f"prs_v2_iter_{iteration:04d}.pt")
+        prefix = "prs_v3" if cfg.model_version == "v3" else "prs_v2"
+        path = os.path.join(cfg.checkpoint_dir, f"{prefix}_iter_{iteration:04d}.pt")
         torch.save({
             "iteration":   iteration,
             "model_state": self.best_net.state_dict(),
             "net_config":  self.net_config,
+            "model_version": cfg.model_version,
         }, path)
         print(f"  Saved: {path}")
 
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.best_net.load_state_dict(ckpt["model_state"])
+        model_state = ckpt["model_state"]
+        current = self.best_net.state_dict()
+        filtered_state = {}
+        skipped: list[str] = []
+        for key, tensor in model_state.items():
+            if key not in current:
+                continue
+            if current[key].shape != tensor.shape:
+                skipped.append(key)
+                continue
+            filtered_state[key] = tensor
+        missing, unexpected = self.best_net.load_state_dict(
+            filtered_state, strict=False,
+        )
         self._start_iter = ckpt["iteration"] + 1
+        if skipped:
+            print(f"Checkpoint shape-mismatch keys skipped: {skipped}")
+        if missing:
+            print(f"Checkpoint missing keys: {missing}")
+        if unexpected:
+            print(f"Checkpoint unexpected keys: {unexpected}")
         print(f"Resumed from {path} (iter {ckpt['iteration']})")

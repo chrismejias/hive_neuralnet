@@ -1,10 +1,10 @@
-"""Tests for hive_transformer.transformer_net — Transformer network."""
+"""Tests for archived transformer network wrappers."""
 
 import numpy as np
 import pytest
 import torch
 
-from hive_transformer.token_types import (
+from hive_common.token_types import (
     TOKEN_FEAT_DIM,
     GLOBAL_FEAT_DIM,
     TOKEN_TYPE_CLS,
@@ -14,7 +14,7 @@ from hive_transformer.token_types import (
     HiveTokenSequence,
     HiveTokenBatch,
 )
-from hive_transformer.transformer_net import (
+from archive.legacy_transformer.hive_transformer.transformer_net import (
     TransformerConfig,
     TransformerPolicyHead,
     TransformerValueHead,

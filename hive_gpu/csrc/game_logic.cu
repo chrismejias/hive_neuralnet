@@ -90,6 +90,95 @@ __global__ void generate_legal_moves_and_fnn_features_kernel(
     }
 }
 
+__global__ void generate_legal_moves_and_hybrid_root_features_kernel(
+    const HiveState* states,
+    GPUMove* moves_out,       // [MAX_LEGAL_MOVES * batch_size]
+    int* num_legal_out,       // [batch_size]
+    float* fnn_features_out,  // [FNN_FEAT_DIM * batch_size]
+    float* token_features_out,// [B, HYBRID_MAX_PIECE_TOKENS, HYBRID_NODE_FEAT_DIM]
+    int* token_q_out,         // [B, HYBRID_MAX_PIECE_TOKENS]
+    int* token_r_out,         // [B, HYBRID_MAX_PIECE_TOKENS]
+    int* token_z_out,         // [B, HYBRID_MAX_PIECE_TOKENS]
+    bool* token_mask_out,     // [B, HYBRID_MAX_PIECE_TOKENS]
+    float* global_features_out,// [B, HYBRID_GLOBAL_FEAT_DIM]
+    int* num_tokens_out,      // [B]
+    float* move_features_out, // [B, MAX_LEGAL_MOVES, HYBRID_MOVE_FEAT_DIM]
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    const HiveState& s = states[idx];
+    GPUMove* my_moves = moves_out + idx * MAX_LEGAL_MOVES;
+    int n = generate_legal_moves(s, my_moves);
+    num_legal_out[idx] = n;
+
+    extract_fnn_features_device(
+        s, my_moves, n, fnn_features_out + idx * FNN_FEAT_DIM);
+
+    float* tf = token_features_out + idx * HYBRID_MAX_PIECE_TOKENS * HYBRID_NODE_FEAT_DIM;
+    int* tq = token_q_out + idx * HYBRID_MAX_PIECE_TOKENS;
+    int* tr = token_r_out + idx * HYBRID_MAX_PIECE_TOKENS;
+    int* tz = token_z_out + idx * HYBRID_MAX_PIECE_TOKENS;
+    bool* tm = token_mask_out + idx * HYBRID_MAX_PIECE_TOKENS;
+    float* gf = global_features_out + idx * HYBRID_GLOBAL_FEAT_DIM;
+    float* mf = move_features_out + (int64_t)idx * MAX_LEGAL_MOVES * HYBRID_MOVE_FEAT_DIM;
+
+    int token_count = 0;
+    extract_hybrid_transformer_tokens_device(s, tf, tq, tr, tz, tm, gf, token_count);
+    num_tokens_out[idx] = token_count;
+    extract_hybrid_transformer_move_features_device(s, my_moves, n, mf);
+}
+
+__global__ void queen_escape_flags_kernel(
+    const HiveState* states,
+    uint8_t* flags_out,
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        flags_out[idx] = has_queen_escape_move(states[idx]) ? 1 : 0;
+    }
+}
+
+__global__ void endgame_hit_mask_kernel(
+    const HiveState* states,
+    uint8_t* hit_out,
+    int min_surround,
+    int max_surround,
+    uint8_t require_mixed_pair,
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch_size) {
+        const HiveState& s = states[idx];
+        if (s.result != IN_PROGRESS ||
+            !is_queen_placed(s, WHITE) ||
+            !is_queen_placed(s, BLACK)) {
+            hit_out[idx] = 0;
+            return;
+        }
+        int w = num_occupied_neighbors(s, s.queen_cell[WHITE]);
+        int b = num_occupied_neighbors(s, s.queen_cell[BLACK]);
+        bool in_range = (
+            w >= min_surround && w <= max_surround &&
+            b >= min_surround && b <= max_surround
+        );
+        if (!in_range) {
+            hit_out[idx] = 0;
+            return;
+        }
+        if (require_mixed_pair) {
+            hit_out[idx] = (
+                (w == min_surround && b == max_surround) ||
+                (w == max_surround && b == min_surround)
+            ) ? 1 : 0;
+        } else {
+            hit_out[idx] = 1;
+        }
+    }
+}
+
 __global__ void fnn_successor_features_kernel(
     const HiveState* states,
     const GPUMove* legal_moves,       // [B, MAX_LEGAL_MOVES]
@@ -162,6 +251,148 @@ __global__ void check_results_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size) {
         results_out[idx] = (int)states[idx].result;
+    }
+}
+
+__device__ __forceinline__ int queen_surround_count_for_color(
+    const HiveState& s,
+    Color c
+) {
+    if (!is_queen_placed(s, c)) return 0;
+    return num_occupied_neighbors(s, s.queen_cell[c]);
+}
+
+__device__ inline bool state_has_immediate_win_for_current_player(
+    const HiveState& s
+) {
+    return has_immediate_surround_win_for_current_player(s);
+}
+
+__global__ void debug_tactical_state_kernel(
+    const HiveState* states,
+    int* current_out,
+    int* own_out,
+    int* opp_out,
+    int* imm_out,
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+    const HiveState& s = states[idx];
+    Color player = current_player(s);
+    Color target = (player == WHITE) ? BLACK : WHITE;
+    current_out[idx] = (int)player;
+    own_out[idx] = queen_surround_count_for_color_device(s, player);
+    opp_out[idx] = queen_surround_count_for_color_device(s, target);
+    imm_out[idx] = has_immediate_surround_win_for_current_player(s) ? 1 : 0;
+}
+
+__global__ void root_tactical_probe_kernel(
+    const HiveState* states,
+    const GPUMove* legal_moves,       // [B, MAX_LEGAL_MOVES]
+    const int* num_legal,             // [B]
+    const float* priors,              // [B, MAX_LEGAL_MOVES]
+    int64_t* winning_move_out,        // [B]
+    uint8_t* allowed_slot_out,        // [B, MAX_LEGAL_MOVES]
+    uint8_t* forced_random_out,       // [B]
+    uint8_t enable_win_in_one,
+    uint8_t enable_check_opponent_wins,
+    uint8_t enable_win_in_two,
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    const HiveState& root = states[idx];
+    const GPUMove* root_moves = legal_moves + (int64_t)idx * MAX_LEGAL_MOVES;
+    const float* root_priors = priors + (int64_t)idx * MAX_LEGAL_MOVES;
+    uint8_t* allowed = allowed_slot_out + (int64_t)idx * MAX_LEGAL_MOVES;
+    int nlegal = num_legal[idx];
+
+    winning_move_out[idx] = -1;
+    forced_random_out[idx] = 0;
+    for (int i = 0; i < MAX_LEGAL_MOVES; ++i) {
+        allowed[i] = (i < nlegal) ? 1 : 0;
+    }
+    if (nlegal <= 0 || root.result != IN_PROGRESS) return;
+
+    Color root_player = current_player(root);
+    Color opp_color = (root_player == WHITE) ? BLACK : WHITE;
+    int opp_surround = queen_surround_count_for_color(root, opp_color);
+    int own_surround = queen_surround_count_for_color(root, root_player);
+
+    // 1. Immediate win probe, gated to opponent surround == 5.
+    if (enable_win_in_one && opp_surround == 5) {
+        int best_move = -1;
+        float best_prior = -1e30f;
+        for (int i = 0; i < nlegal; ++i) {
+            HiveState child = root;
+            apply_move(child, root_moves[i]);
+            if ((root_player == WHITE && child.result == WHITE_WINS) ||
+                (root_player == BLACK && child.result == BLACK_WINS)) {
+                if (best_move < 0 || root_priors[i] > best_prior) {
+                    best_move = i;
+                    best_prior = root_priors[i];
+                }
+            }
+        }
+        if (best_move >= 0) {
+            winning_move_out[idx] = best_move;
+            return;
+        }
+    }
+
+    // 2. Opponent immediate-win screen, only when our own queen surround is 5.
+    if (enable_check_opponent_wins && own_surround == 5) {
+        bool any_safe = false;
+        for (int i = 0; i < nlegal; ++i) {
+            HiveState child = root;
+            apply_move(child, root_moves[i]);
+            bool opp_can_win = state_has_immediate_win_for_current_player(child);
+            allowed[i] = opp_can_win ? 0 : 1;
+            any_safe |= !opp_can_win;
+        }
+        if (!any_safe) {
+            forced_random_out[idx] = 1;
+            return;
+        }
+    }
+
+    // 3. Forced win-in-2/3 tactical probe on opponent surround 4 or 5.
+    if (!enable_win_in_two || !(opp_surround == 4 || opp_surround == 5)) return;
+
+    for (int i = 0; i < nlegal; ++i) {
+        if (!allowed[i]) continue;
+        HiveState child = root;
+        apply_move(child, root_moves[i]);
+        int child_surround = queen_surround_count_for_color(child, opp_color);
+        if (opp_surround == 4 && child_surround <= opp_surround) continue;
+        if (opp_surround == 5 && child_surround < opp_surround) continue;
+
+        GPUMove replies[MAX_LEGAL_MOVES];
+        bool all_non_decreasing = true;
+        int nreply = generate_non_decreasing_surround_replies(
+            child, opp_color, child_surround, replies, all_non_decreasing
+        );
+        if (!all_non_decreasing) {
+            continue;
+        }
+        bool candidate_ok = true;
+        for (int r = 0; r < nreply; ++r) {
+            HiveState grand = child;
+            apply_move(grand, replies[r]);
+            bool already_won =
+                (root_player == WHITE && grand.result == WHITE_WINS) ||
+                (root_player == BLACK && grand.result == BLACK_WINS);
+            if (!already_won && !state_has_immediate_win_for_current_player(grand)) {
+                candidate_ok = false;
+                break;
+            }
+        }
+        if (candidate_ok) {
+            winning_move_out[idx] = i;
+            return;
+        }
     }
 }
 
@@ -308,6 +539,192 @@ encode_states_batch(at::Tensor states_tensor, int batch_size) {
         node_features, node_grid_pos, node_piece_types, global_features,
         num_nodes, num_board_nodes, edge_index, edge_features, num_edges
     );
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+hybrid_gnn_encode_batch(at::Tensor states_tensor, int batch_size, int radius) {
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto opts_i = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto opts_l = at::TensorOptions().dtype(c10::kLong).device(c10::kCUDA);
+    auto opts_b = at::TensorOptions().dtype(c10::kBool).device(c10::kCUDA);
+
+    auto node_features = at::zeros(
+        {batch_size, HYBRID_MAX_NODES, HYBRID_NODE_FEAT_DIM}, opts_f);
+    auto edge_src = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_l);
+    auto edge_dst = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_l);
+    auto edge_features = at::zeros(
+        {batch_size, HYBRID_MAX_EDGES, HYBRID_EDGE_FEAT_DIM}, opts_f);
+    auto node_mask = at::zeros({batch_size, HYBRID_MAX_NODES}, opts_b);
+    auto edge_mask = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_b);
+    auto global_features = at::zeros(
+        {batch_size, HYBRID_GLOBAL_FEAT_DIM}, opts_f);
+    auto num_nodes = at::zeros({batch_size}, opts_i);
+    auto num_edges = at::zeros({batch_size}, opts_i);
+
+    HiveState* states_ptr = reinterpret_cast<HiveState*>(states_tensor.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    hybrid_gnn_encode_states_kernel<<<blocks, threads>>>(
+        states_ptr,
+        nullptr,
+        nullptr,
+        static_cast<float*>(node_features.data_ptr()),
+        static_cast<int64_t*>(edge_src.data_ptr()),
+        static_cast<int64_t*>(edge_dst.data_ptr()),
+        static_cast<float*>(edge_features.data_ptr()),
+        static_cast<bool*>(node_mask.data_ptr()),
+        static_cast<bool*>(edge_mask.data_ptr()),
+        static_cast<float*>(global_features.data_ptr()),
+        static_cast<int*>(num_nodes.data_ptr()),
+        static_cast<int*>(num_edges.data_ptr()),
+        batch_size,
+        radius,
+        false
+    );
+
+    return std::make_tuple(
+        node_features, edge_src, edge_dst, edge_features,
+        node_mask, edge_mask, global_features, num_nodes, num_edges
+    );
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+hybrid_gnn_encode_with_moves_batch(
+    at::Tensor states_tensor,
+    at::Tensor legal_moves_tensor,
+    at::Tensor num_legal_tensor,
+    int batch_size,
+    int radius
+) {
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto opts_i = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto opts_l = at::TensorOptions().dtype(c10::kLong).device(c10::kCUDA);
+    auto opts_b = at::TensorOptions().dtype(c10::kBool).device(c10::kCUDA);
+
+    auto node_features = at::zeros(
+        {batch_size, HYBRID_MAX_NODES, HYBRID_NODE_FEAT_DIM}, opts_f);
+    auto edge_src = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_l);
+    auto edge_dst = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_l);
+    auto edge_features = at::zeros(
+        {batch_size, HYBRID_MAX_EDGES, HYBRID_EDGE_FEAT_DIM}, opts_f);
+    auto node_mask = at::zeros({batch_size, HYBRID_MAX_NODES}, opts_b);
+    auto edge_mask = at::zeros({batch_size, HYBRID_MAX_EDGES}, opts_b);
+    auto global_features = at::zeros(
+        {batch_size, HYBRID_GLOBAL_FEAT_DIM}, opts_f);
+    auto num_nodes = at::zeros({batch_size}, opts_i);
+    auto num_edges = at::zeros({batch_size}, opts_i);
+
+    HiveState* states_ptr = reinterpret_cast<HiveState*>(states_tensor.data_ptr());
+    GPUMove* legal_moves_ptr = reinterpret_cast<GPUMove*>(legal_moves_tensor.data_ptr());
+    int* num_legal_ptr = static_cast<int*>(num_legal_tensor.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    hybrid_gnn_encode_states_kernel<<<blocks, threads>>>(
+        states_ptr,
+        legal_moves_ptr,
+        num_legal_ptr,
+        static_cast<float*>(node_features.data_ptr()),
+        static_cast<int64_t*>(edge_src.data_ptr()),
+        static_cast<int64_t*>(edge_dst.data_ptr()),
+        static_cast<float*>(edge_features.data_ptr()),
+        static_cast<bool*>(node_mask.data_ptr()),
+        static_cast<bool*>(edge_mask.data_ptr()),
+        static_cast<float*>(global_features.data_ptr()),
+        static_cast<int*>(num_nodes.data_ptr()),
+        static_cast<int*>(num_edges.data_ptr()),
+        batch_size,
+        radius,
+        true
+    );
+
+    return std::make_tuple(
+        node_features, edge_src, edge_dst, edge_features,
+        node_mask, edge_mask, global_features, num_nodes, num_edges
+    );
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor>
+hybrid_transformer_encode_with_moves_batch(
+    at::Tensor states_tensor,
+    at::Tensor legal_moves_tensor,
+    at::Tensor num_legal_tensor,
+    int batch_size
+) {
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto opts_i = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto opts_b = at::TensorOptions().dtype(c10::kBool).device(c10::kCUDA);
+
+    auto token_features = at::zeros(
+        {batch_size, HYBRID_MAX_PIECE_TOKENS, HYBRID_NODE_FEAT_DIM}, opts_f);
+    auto token_q = at::zeros({batch_size, HYBRID_MAX_PIECE_TOKENS}, opts_i);
+    auto token_r = at::zeros({batch_size, HYBRID_MAX_PIECE_TOKENS}, opts_i);
+    auto token_z = at::zeros({batch_size, HYBRID_MAX_PIECE_TOKENS}, opts_i);
+    auto token_mask = at::zeros({batch_size, HYBRID_MAX_PIECE_TOKENS}, opts_b);
+    auto global_features = at::zeros(
+        {batch_size, HYBRID_GLOBAL_FEAT_DIM}, opts_f);
+    auto num_tokens = at::zeros({batch_size}, opts_i);
+
+    HiveState* states_ptr = reinterpret_cast<HiveState*>(states_tensor.data_ptr());
+    GPUMove* legal_moves_ptr = reinterpret_cast<GPUMove*>(legal_moves_tensor.data_ptr());
+    int* num_legal_ptr = static_cast<int*>(num_legal_tensor.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    hybrid_transformer_encode_states_kernel<<<blocks, threads>>>(
+        states_ptr,
+        legal_moves_ptr,
+        num_legal_ptr,
+        static_cast<float*>(token_features.data_ptr()),
+        static_cast<int*>(token_q.data_ptr()),
+        static_cast<int*>(token_r.data_ptr()),
+        static_cast<int*>(token_z.data_ptr()),
+        static_cast<bool*>(token_mask.data_ptr()),
+        static_cast<float*>(global_features.data_ptr()),
+        static_cast<int*>(num_tokens.data_ptr()),
+        batch_size,
+        true
+    );
+
+    return std::make_tuple(
+        token_features,
+        token_q,
+        token_r,
+        token_z,
+        token_mask,
+        global_features,
+        num_tokens
+    );
+}
+
+at::Tensor hybrid_transformer_move_features_batch(
+    at::Tensor states_tensor,
+    at::Tensor legal_moves_tensor,
+    at::Tensor num_legal_tensor,
+    int batch_size
+) {
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto move_features = at::zeros(
+        {batch_size, MAX_LEGAL_MOVES, HYBRID_MOVE_FEAT_DIM}, opts_f);
+
+    HiveState* states_ptr = reinterpret_cast<HiveState*>(states_tensor.data_ptr());
+    GPUMove* legal_moves_ptr = reinterpret_cast<GPUMove*>(legal_moves_tensor.data_ptr());
+    int* num_legal_ptr = static_cast<int*>(num_legal_tensor.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    hybrid_transformer_move_features_kernel<<<blocks, threads>>>(
+        states_ptr,
+        legal_moves_ptr,
+        num_legal_ptr,
+        static_cast<float*>(move_features.data_ptr()),
+        batch_size
+    );
+    return move_features;
 }
 
 /**
@@ -1044,6 +1461,182 @@ generate_legal_moves_and_fnn_features_batch(
         states_ptr, moves_ptr, num_legal_ptr, features_ptr, batch_size);
 
     return std::make_tuple(moves_tensor, num_legal, features);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor>
+generate_legal_moves_and_hybrid_root_features_batch(
+    at::Tensor states_tensor,
+    int batch_size
+) {
+    auto opts_u8 = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+    auto opts_i = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto opts_f = at::TensorOptions().dtype(c10::kFloat).device(c10::kCUDA);
+    auto opts_b = at::TensorOptions().dtype(c10::kBool).device(c10::kCUDA);
+
+    auto moves_tensor = at::zeros(
+        {batch_size, (int64_t)MAX_LEGAL_MOVES, (int64_t)sizeof(GPUMove)}, opts_u8);
+    auto num_legal = at::zeros({batch_size}, opts_i);
+    auto fnn_features = at::zeros({batch_size, (int64_t)FNN_FEAT_DIM}, opts_f);
+    auto token_features = at::zeros(
+        {batch_size, HYBRID_MAX_PIECE_TOKENS, HYBRID_NODE_FEAT_DIM}, opts_f);
+    auto token_q = at::zeros({batch_size, HYBRID_MAX_PIECE_TOKENS}, opts_i);
+    auto token_r = at::zeros({batch_size, HYBRID_MAX_PIECE_TOKENS}, opts_i);
+    auto token_z = at::zeros({batch_size, HYBRID_MAX_PIECE_TOKENS}, opts_i);
+    auto token_mask = at::zeros({batch_size, HYBRID_MAX_PIECE_TOKENS}, opts_b);
+    auto global_features = at::zeros(
+        {batch_size, HYBRID_GLOBAL_FEAT_DIM}, opts_f);
+    auto num_tokens = at::zeros({batch_size}, opts_i);
+    auto move_features = at::zeros(
+        {batch_size, MAX_LEGAL_MOVES, HYBRID_MOVE_FEAT_DIM}, opts_f);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(states_tensor.data_ptr());
+    GPUMove* moves_ptr = reinterpret_cast<GPUMove*>(moves_tensor.data_ptr());
+    int* num_legal_ptr = static_cast<int*>(num_legal.data_ptr());
+    float* fnn_features_ptr = static_cast<float*>(fnn_features.data_ptr());
+    float* token_features_ptr = static_cast<float*>(token_features.data_ptr());
+    int* token_q_ptr = static_cast<int*>(token_q.data_ptr());
+    int* token_r_ptr = static_cast<int*>(token_r.data_ptr());
+    int* token_z_ptr = static_cast<int*>(token_z.data_ptr());
+    bool* token_mask_ptr = static_cast<bool*>(token_mask.data_ptr());
+    float* global_features_ptr = static_cast<float*>(global_features.data_ptr());
+    int* num_tokens_ptr = static_cast<int*>(num_tokens.data_ptr());
+    float* move_features_ptr = static_cast<float*>(move_features.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    generate_legal_moves_and_hybrid_root_features_kernel<<<blocks, threads>>>(
+        states_ptr,
+        moves_ptr,
+        num_legal_ptr,
+        fnn_features_ptr,
+        token_features_ptr,
+        token_q_ptr,
+        token_r_ptr,
+        token_z_ptr,
+        token_mask_ptr,
+        global_features_ptr,
+        num_tokens_ptr,
+        move_features_ptr,
+        batch_size);
+
+    return std::make_tuple(
+        moves_tensor,
+        num_legal,
+        fnn_features,
+        token_features,
+        token_q,
+        token_r,
+        token_z,
+        token_mask,
+        global_features,
+        move_features
+    );
+}
+
+at::Tensor queen_escape_flags_batch(
+    at::Tensor states_tensor,
+    int batch_size
+) {
+    auto opts_u8 = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+    auto flags = at::zeros({batch_size}, opts_u8);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(states_tensor.data_ptr());
+    uint8_t* flags_ptr = static_cast<uint8_t*>(flags.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    queen_escape_flags_kernel<<<blocks, threads>>>(
+        states_ptr, flags_ptr, batch_size);
+
+    return flags;
+}
+
+at::Tensor endgame_hit_mask_batch(
+    at::Tensor states_tensor,
+    int batch_size,
+    int min_surround,
+    int max_surround,
+    bool require_mixed_pair
+) {
+    auto opts_u8 = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+    auto hit = at::zeros({batch_size}, opts_u8);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(states_tensor.data_ptr());
+    uint8_t* hit_ptr = static_cast<uint8_t*>(hit.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    endgame_hit_mask_kernel<<<blocks, threads>>>(
+        states_ptr, hit_ptr, min_surround, max_surround,
+        require_mixed_pair ? 1 : 0, batch_size);
+
+    return hit;
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+root_tactical_probe_batch(
+    at::Tensor states_tensor,
+    at::Tensor legal_moves_tensor,
+    at::Tensor num_legal_tensor,
+    at::Tensor priors_tensor,
+    int batch_size,
+    bool enable_win_in_one,
+    bool enable_check_opponent_wins,
+    bool enable_win_in_two
+) {
+    auto opts_i64 = at::TensorOptions().dtype(c10::kLong).device(c10::kCUDA);
+    auto opts_u8 = at::TensorOptions().dtype(c10::kByte).device(c10::kCUDA);
+
+    auto winning = at::full({batch_size}, -1, opts_i64);
+    auto allowed = at::zeros({batch_size, (int64_t)MAX_LEGAL_MOVES}, opts_u8);
+    auto forced = at::zeros({batch_size}, opts_u8);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(states_tensor.data_ptr());
+    const GPUMove* moves_ptr = reinterpret_cast<const GPUMove*>(legal_moves_tensor.data_ptr());
+    const int* num_legal_ptr = static_cast<const int*>(num_legal_tensor.data_ptr());
+    const float* priors_ptr = static_cast<const float*>(priors_tensor.data_ptr());
+    int64_t* winning_ptr = static_cast<int64_t*>(winning.data_ptr());
+    uint8_t* allowed_ptr = static_cast<uint8_t*>(allowed.data_ptr());
+    uint8_t* forced_ptr = static_cast<uint8_t*>(forced.data_ptr());
+
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    root_tactical_probe_kernel<<<blocks, threads>>>(
+        states_ptr, moves_ptr, num_legal_ptr, priors_ptr,
+        winning_ptr, allowed_ptr, forced_ptr,
+        enable_win_in_one ? 1 : 0,
+        enable_check_opponent_wins ? 1 : 0,
+        enable_win_in_two ? 1 : 0,
+        batch_size);
+
+    return std::make_tuple(winning, allowed, forced);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+debug_tactical_state_batch(
+    at::Tensor states_tensor,
+    int batch_size
+) {
+    auto opts_i32 = at::TensorOptions().dtype(c10::kInt).device(c10::kCUDA);
+    auto current = at::zeros({batch_size}, opts_i32);
+    auto own = at::zeros({batch_size}, opts_i32);
+    auto opp = at::zeros({batch_size}, opts_i32);
+    auto imm = at::zeros({batch_size}, opts_i32);
+
+    const HiveState* states_ptr = reinterpret_cast<const HiveState*>(states_tensor.data_ptr());
+    int threads = 256;
+    int blocks = (batch_size + threads - 1) / threads;
+    debug_tactical_state_kernel<<<blocks, threads>>>(
+        states_ptr,
+        static_cast<int*>(current.data_ptr()),
+        static_cast<int*>(own.data_ptr()),
+        static_cast<int*>(opp.data_ptr()),
+        static_cast<int*>(imm.data_ptr()),
+        batch_size);
+
+    return std::make_tuple(current, own, opp, imm);
 }
 
 /**

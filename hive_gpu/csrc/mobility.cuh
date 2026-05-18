@@ -46,7 +46,9 @@ __device__ inline bool can_be_thrown_by_enemy(
     const Bitboard& ap_mask, Color enemy
 ) {
     // Piece must not be pinned
+    if (s.height[cell] != 1) return false;
     if (is_pinned(s, ap_mask, cell)) return false;
+    if (is_stunned_cell(s, cell)) return false;
 
     // Check each neighbor for an enemy pillbug (or ground mosquito adj to pillbug)
     for (int d = 0; d < NUM_DIRS; d++) {

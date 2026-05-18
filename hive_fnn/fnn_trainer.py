@@ -50,12 +50,24 @@ class FNNTrainConfig:
 
     draw_keep_rate: float = 1.0
     expansion_mask: int = 0
+    endgame_frac: float = 0.0
+    endgame_surround: int = 5
+    endgame_mixed_pair: bool = False
     device: str | None = None
     use_amp: bool | None = None
 
     use_puct: bool = False
+    c_puct: float = 1.25
+    c_scale: float = 1.0
     gumbel_wave_parallel: bool = True
+    gumbel_wave_size: int = 4
     puct_wave_size: int = 16
+    queen_surround_reserve_slots: int = 10
+    queen_surround_reserve_immobile_only: bool = True
+    short_forced_win_probe: bool = False
+    probe_win_in_one: bool = True
+    probe_check_opponent_wins: bool = True
+    probe_win_in_two: bool = True
 
 
 def _simulations_for_iteration(
@@ -94,6 +106,7 @@ def _policy_cross_entropy(
     flat_logits: torch.Tensor,
     policy_targets: torch.Tensor,
     num_actions: torch.Tensor,
+    policy_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Cross-entropy policy loss over ragged legal moves."""
     padded_logits = _flat_to_padded(flat_logits, num_actions, pad_value=float("-inf"))
@@ -104,7 +117,13 @@ def _policy_cross_entropy(
     masked_logits = padded_logits.masked_fill(~legal_mask, float("-inf"))
     log_probs = F.log_softmax(masked_logits, dim=1)
     log_probs = torch.nan_to_num(log_probs, nan=-1000.0, neginf=-1000.0)
-    return -(policy_targets[:, :max_actions] * log_probs).sum(dim=1).mean()
+    per_example = -(policy_targets[:, :max_actions] * log_probs).sum(dim=1)
+    if policy_mask is not None:
+        mask_1d = policy_mask.squeeze(-1)
+        if mask_1d.sum() > 0:
+            return (per_example * mask_1d).sum() / mask_1d.sum()
+        return torch.tensor(0.0, device=flat_logits.device)
+    return per_example.mean()
 
 
 def compute_fnn_loss(
@@ -113,10 +132,13 @@ def compute_fnn_loss(
     policy_targets: torch.Tensor,
     value_targets: torch.Tensor,
     num_actions: torch.Tensor,
+    policy_mask: torch.Tensor,
     value_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Combined loss: policy cross-entropy + value MSE."""
-    policy_loss = _policy_cross_entropy(action_logits, policy_targets, num_actions)
+    policy_loss = _policy_cross_entropy(
+        action_logits, policy_targets, num_actions, policy_mask,
+    )
     value_diff = (root_values.squeeze(-1) - value_targets.squeeze(-1)) ** 2
     mask_1d = value_mask.squeeze(-1)
     if mask_1d.sum() > 0:
@@ -142,7 +164,12 @@ class FNNTrainer:
         self.device = get_device(self.config.device)
         self.ext = hive_gpu.load_extension()
         self.best_net = HiveFNN(self.net_config).to(self.device)
-        self.buffer = FNNReplayBuffer(self.config.buffer_max_size)
+        self.buffer = FNNReplayBuffer(
+            self.config.buffer_max_size,
+            device=self.device,
+            cache_root_features=self.device.type == "cuda",
+            gpu_sampling=self.device.type == "cuda",
+        )
         self.elo_tracker = EloTracker()
         self._start_iter = 1
         self.use_amp = (
@@ -215,7 +242,7 @@ class FNNTrainer:
                 self.best_net,
                 FNNPUCTConfig(
                     num_simulations=sims_this_iter,
-                    c_puct=1.25,
+                    c_puct=cfg.c_puct,
                     temperature=cfg.temperature,
                     temperature_drop_move=cfg.temperature_drop_move,
                     batch_size=cfg.games_per_batch,
@@ -230,17 +257,57 @@ class FNNTrainer:
                 FNNMCTSConfig(
                     num_simulations=sims_this_iter,
                     max_num_considered_actions=cfg.max_num_considered,
+                    c_puct=cfg.c_puct,
+                    c_scale=cfg.c_scale,
                     temperature=cfg.temperature,
                     temperature_drop_move=cfg.temperature_drop_move,
                     batch_size=cfg.games_per_batch,
                     max_game_length=cfg.max_game_length,
                     expansion_mask=cfg.expansion_mask,
                     wave_parallel=cfg.gumbel_wave_parallel,
+                    wave_size=cfg.gumbel_wave_size,
+                    queen_surround_reserve_slots=cfg.queen_surround_reserve_slots,
+                    queen_surround_reserve_immobile_only=cfg.queen_surround_reserve_immobile_only,
+                    short_forced_win_probe=cfg.short_forced_win_probe,
+                    probe_win_in_one=cfg.probe_win_in_one,
+                    probe_check_opponent_wins=cfg.probe_check_opponent_wins,
+                    probe_win_in_two=cfg.probe_win_in_two,
                 ),
             )
-        raw = orch.self_play_batch()
+        start_states_t = None
+        endgame_games = 0
+        if cfg.endgame_frac > 0.0:
+            from hive_gpu.endgame_generator import generate_endgame_positions, positions_to_tensor
+
+            n_endgame = max(1, int(cfg.games_per_batch * cfg.endgame_frac))
+            endgame_pool = generate_endgame_positions(
+                n_positions=n_endgame,
+                expansion_mask=cfg.expansion_mask,
+                min_surround=max(0, cfg.endgame_surround - 1)
+                if cfg.endgame_mixed_pair else cfg.endgame_surround,
+                max_surround=cfg.endgame_surround,
+                gpu_batch=min(cfg.games_per_batch, 256),
+                mixed_pair=cfg.endgame_mixed_pair,
+            )
+            endgame_games = len(endgame_pool)
+            tensors = []
+            if endgame_pool:
+                tensors.append(positions_to_tensor(endgame_pool, device="cuda"))
+            n_fresh = cfg.games_per_batch - len(endgame_pool)
+            if n_fresh > 0:
+                tensors.append(orch.ext.create_initial_states(n_fresh, cfg.expansion_mask))
+            if tensors:
+                start_states_t = torch.cat(tensors, dim=0)
+
+        raw = orch.self_play_batch(start_states=start_states_t)
         flat = []
-        stats = {"num_games": 0, "white_wins": 0, "black_wins": 0, "draws": 0}
+        stats = {
+            "num_games": 0,
+            "white_wins": 0,
+            "black_wins": 0,
+            "draws": 0,
+            "endgame_games": endgame_games,
+        }
         for game in raw:
             if not game:
                 stats["num_games"] += 1
@@ -263,7 +330,12 @@ class FNNTrainer:
         return flat, stats
 
     def _build_forward_batch(
-        self, state_bytes: torch.Tensor, batch_size: int,
+        self,
+        state_bytes: torch.Tensor,
+        batch_size: int,
+        num_actions: torch.Tensor | None = None,
+        cached_root_features: torch.Tensor | None = None,
+        cached_legal_moves: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode root + all successors for training.
 
@@ -273,12 +345,19 @@ class FNNTrainer:
             action_to_root: (N_total,) int64
             num_actions: (B,) int64
         """
-        legal_moves, num_legal, root_features = (
-            self.ext.generate_legal_moves_and_fnn_features_batch(
-                state_bytes, batch_size,
+        if cached_root_features is not None and cached_legal_moves is not None:
+            root_features = cached_root_features.float()
+            legal_moves = cached_legal_moves
+            if num_actions is None:
+                raise ValueError("Cached legal moves require cached action counts")
+            num_actions = num_actions.to(torch.int64)
+        else:
+            legal_moves, num_legal, root_features = (
+                self.ext.generate_legal_moves_and_fnn_features_batch(
+                    state_bytes, batch_size,
+                )
             )
-        )
-        num_actions = num_legal.to(torch.int64)
+            num_actions = num_legal.to(torch.int64)
 
         max_legal = legal_moves.shape[1]
         device = state_bytes.device
@@ -315,17 +394,37 @@ class FNNTrainer:
         comp_sums: dict[str, float] = {}
         n_batches = 0
         self.best_net.train()
+        prefetch_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+
+        def fetch_next_batch() -> FNNTrainingBatch:
+            if prefetch_stream is None:
+                return self.buffer.sample_batch(cfg.batch_size, device=self.device)
+            with torch.cuda.stream(prefetch_stream):
+                return self.buffer.sample_batch(
+                    cfg.batch_size, device=self.device, non_blocking=True,
+                )
 
         for _epoch in range(cfg.num_epochs):
             batches_per_epoch = max(1, len(self.buffer) // cfg.batch_size)
+            next_batch = fetch_next_batch()
             for _ in range(batches_per_epoch):
-                batch: FNNTrainingBatch = self.buffer.sample_batch(
-                    cfg.batch_size,
-                ).to(self.device, non_blocking=True)
+                if prefetch_stream is not None:
+                    torch.cuda.current_stream(self.device).wait_stream(prefetch_stream)
+                batch = next_batch
+                if n_batches + 1 < batches_per_epoch * cfg.num_epochs:
+                    next_batch = fetch_next_batch()
 
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)
                 root_feat, succ_feat, a2r, n_act = self._build_forward_batch(
-                    batch.state_bytes, batch.state_bytes.shape[0],
+                    batch.state_bytes,
+                    batch.state_bytes.shape[0],
+                    batch.num_actions,
+                    batch.root_features,
+                    batch.legal_moves,
                 )
 
                 if self.use_amp and self.scaler is not None:
@@ -339,6 +438,7 @@ class FNNTrainer:
                             batch.policy_targets,
                             batch.value_targets,
                             batch.num_actions,
+                            batch.policy_mask,
                             batch.value_mask,
                         )
                     self.scaler.scale(loss).backward()
@@ -358,6 +458,7 @@ class FNNTrainer:
                         batch.policy_targets,
                         batch.value_targets,
                         batch.num_actions,
+                        batch.policy_mask,
                         batch.value_mask,
                     )
                     loss.backward()

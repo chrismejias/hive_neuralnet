@@ -39,7 +39,7 @@ from hive_gpu.gpu_mcts import (
     GPUMCTSOrchestrator,
     GPUTrainingExample,
 )
-from hive_transformer.token_types import HiveTokenSequence
+from hive_common.token_types import HiveTokenSequence
 
 
 # ── MCGS Data Structures ──────────────────────────────────────────────

@@ -1,10 +1,10 @@
-"""Tests for hive_transformer.token_types data structures."""
+"""Tests for shared token type data structures."""
 
 import numpy as np
 import pytest
 import torch
 
-from hive_transformer.token_types import (
+from hive_common.token_types import (
     TOKEN_FEAT_DIM,
     GLOBAL_FEAT_DIM,
     TOKEN_TYPE_CLS,

@@ -50,7 +50,7 @@ try:
 except ImportError:
     GNNNetConfig = None  # type: ignore[assignment,misc]
     HiveGNN = None       # type: ignore[assignment,misc]
-from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
+from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig, HiveTransformer
 from hive_gpu.gpu_trainer import GPUTrainConfig, GPUTrainer
 
 

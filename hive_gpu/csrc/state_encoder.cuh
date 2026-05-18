@@ -12,6 +12,7 @@
 
 #include "hex_grid.cuh"
 #include "hive_state.cuh"
+#include "articulation.cuh"
 
 namespace hive_gpu {
 
@@ -24,6 +25,18 @@ constexpr int EDGE_FEAT_DIM = 9;
 constexpr int GLOBAL_FEAT_DIM = 6;
 constexpr int ENC_GRID = 17;         // 17×17 grid for NN spatial scatter
 constexpr int ENC_HALF = 8;
+
+// Hybrid GNN value-trunk encoder. Kept separate from the legacy encoder ABI:
+// radius-2 spatial neighborhoods need a wider edge feature vector and more
+// padded edge slots than the PRS/FNN graph encoder above.
+constexpr int HYBRID_MAX_NODES = 48;
+constexpr int HYBRID_MAX_EDGES = 640;
+constexpr int HYBRID_MAX_PIECE_TOKENS = 28;
+constexpr int HYBRID_NODE_FEAT_DIM = 26;
+constexpr int HYBRID_GLOBAL_FEAT_DIM = 6;
+constexpr int HYBRID_MOVE_FEAT_DIM = 25;
+constexpr int HYBRID_MAX_RADIUS = 2;
+constexpr int HYBRID_EDGE_FEAT_DIM = 3;
 
 // ── Action space constants (matches hive_engine/encoder.py) ──────────
 constexpr int NUM_ENC_GRID_CELLS = ENC_GRID * ENC_GRID;           // 169
@@ -63,6 +76,424 @@ __device__ __forceinline__ int bankers_round_div(int sum, int n) {
         if ((q & 1) == 0) return q;  // q is even, keep it
         return candidate;  // candidate is the other, must be even
     }
+}
+
+__device__ __forceinline__ int hex_distance_delta(int dq, int dr) {
+    int ds = dq + dr;
+    int adq = dq < 0 ? -dq : dq;
+    int adr = dr < 0 ? -dr : dr;
+    int ads = ds < 0 ? -ds : ds;
+    int m = adq > adr ? adq : adr;
+    return m > ads ? m : ads;
+}
+
+__global__ void hybrid_gnn_encode_states_kernel(
+    const HiveState* states,
+    const GPUMove* legal_moves,     // [B, MAX_LEGAL_MOVES] or nullptr
+    const int* num_legal,           // [B] or nullptr
+    float* node_features,       // [B, HYBRID_MAX_NODES, HYBRID_NODE_FEAT_DIM]
+    int64_t* edge_src,          // [B, HYBRID_MAX_EDGES]
+    int64_t* edge_dst,          // [B, HYBRID_MAX_EDGES]
+    float* edge_features,       // [B, HYBRID_MAX_EDGES, HYBRID_EDGE_FEAT_DIM]
+    bool* node_mask,            // [B, HYBRID_MAX_NODES]
+    bool* edge_mask,            // [B, HYBRID_MAX_EDGES]
+    float* global_features,     // [B, HYBRID_GLOBAL_FEAT_DIM]
+    int* num_nodes_out,         // [B]
+    int* num_edges_out,         // [B]
+    int batch_size,
+    int radius,
+    bool use_move_flags
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    if (radius < 1) radius = 1;
+    if (radius > HYBRID_MAX_RADIUS) radius = HYBRID_MAX_RADIUS;
+
+    const HiveState& s = states[idx];
+    float* nf = node_features + idx * HYBRID_MAX_NODES * HYBRID_NODE_FEAT_DIM;
+    int64_t* es = edge_src + idx * HYBRID_MAX_EDGES;
+    int64_t* ed = edge_dst + idx * HYBRID_MAX_EDGES;
+    float* ef = edge_features + idx * HYBRID_MAX_EDGES * HYBRID_EDGE_FEAT_DIM;
+    bool* nm = node_mask + idx * HYBRID_MAX_NODES;
+    bool* em = edge_mask + idx * HYBRID_MAX_EDGES;
+    float* gf = global_features + idx * HYBRID_GLOBAL_FEAT_DIM;
+
+    for (int i = 0; i < HYBRID_MAX_NODES * HYBRID_NODE_FEAT_DIM; ++i) nf[i] = 0.0f;
+    for (int i = 0; i < HYBRID_MAX_EDGES * HYBRID_EDGE_FEAT_DIM; ++i) ef[i] = 0.0f;
+    for (int i = 0; i < HYBRID_MAX_NODES; ++i) nm[i] = false;
+    for (int i = 0; i < HYBRID_MAX_EDGES; ++i) {
+        es[i] = 0;
+        ed[i] = 0;
+        em[i] = false;
+    }
+    for (int i = 0; i < HYBRID_GLOBAL_FEAT_DIM; ++i) gf[i] = 0.0f;
+
+    float queen_surround[2] = {0.0f, 0.0f};
+    for (int c = 0; c < 2; ++c) {
+        uint16_t qc = s.queen_cell[c];
+        if (qc != 0xFFFF) {
+            int cnt = 0;
+            for (int d = 0; d < NUM_DIRS; ++d) {
+                int16_t nb = NEIGHBORS[qc][d];
+                if (nb >= 0 && s.height[nb] > 0) cnt++;
+            }
+            queen_surround[c] = cnt / 6.0f;
+        }
+    }
+
+    int node_count = 0;
+    int16_t top_node_at[NUM_CELLS];
+    int16_t first_node_at[NUM_CELLS];
+    for (int cell = 0; cell < NUM_CELLS; ++cell) {
+        top_node_at[cell] = -1;
+        first_node_at[cell] = -1;
+    }
+
+    for (int cell = 0; cell < NUM_CELLS; ++cell) {
+        int h = s.height[cell];
+        if (h == 0) continue;
+
+        int occ_flags[NUM_DIRS];
+        int occ_count = 0;
+        for (int d = 0; d < NUM_DIRS; ++d) {
+            int16_t nb = NEIGHBORS[cell][d];
+            occ_flags[d] = (nb >= 0 && s.height[nb] > 0) ? 1 : 0;
+            occ_count += occ_flags[d];
+        }
+
+        first_node_at[cell] = (int16_t)node_count;
+        for (int level = 0; level < h; ++level) {
+            if (node_count >= HYBRID_MAX_NODES) break;
+            uint8_t packed = s.pieces[level][cell];
+            PieceType pt = cell_piece_type(packed);
+            Color pc = cell_color(packed);
+            bool is_top = (level == h - 1);
+
+            float* f = nf + node_count * HYBRID_NODE_FEAT_DIM;
+            f[pt - 1] = 1.0f;
+            f[8 + pc] = 1.0f;
+            f[10] = (level == 0) ? 1.0f : 0.0f;
+            f[11] = is_top ? 1.0f : 0.0f;
+            f[12] = h / 4.0f;
+            f[13] = (pt == PT_QUEEN) ? 1.0f : 0.0f;
+            f[14] = queen_surround[pc];
+            f[15] = occ_count / 6.0f;
+            if (is_top) {
+                for (int d = 0; d < NUM_DIRS; ++d) {
+                    if (!occ_flags[d]) f[16 + d] = 1.0f;
+                }
+                top_node_at[cell] = (int16_t)node_count;
+            }
+            f[24] = level * 0.25f;
+            nm[node_count] = true;
+            node_count++;
+        }
+    }
+
+    for (int c = 0; c < 2; ++c) {
+        for (int p = 0; p < NUM_PIECE_TYPES; ++p) {
+            int count = s.hands[c][p];
+            if (count == 0) continue;
+            if (node_count >= HYBRID_MAX_NODES) break;
+            float* f = nf + node_count * HYBRID_NODE_FEAT_DIM;
+            f[p] = 1.0f;
+            f[8 + c] = 1.0f;
+            if (p == 0) f[13] = 1.0f;
+            f[22] = 1.0f;
+            f[23] = count / COUNTS_PER_PLAYER[p];
+            nm[node_count] = true;
+            node_count++;
+        }
+    }
+
+    int edge_count = 0;
+    for (int src_cell = 0; src_cell < NUM_CELLS; ++src_cell) {
+        int16_t src_node = top_node_at[src_cell];
+        if (src_node < 0) continue;
+        int src_col = src_cell % BOARD_SIZE;
+        int src_row = src_cell / BOARD_SIZE;
+        for (int dist = 1; dist <= radius; ++dist) {
+            for (int dq = -radius; dq <= radius; ++dq) {
+                for (int dr = -radius; dr <= radius; ++dr) {
+                    if (hex_distance_delta(dq, dr) != dist) continue;
+                    int dst_col = src_col + dq;
+                    int dst_row = src_row + dr;
+                    if (dst_col < 0 || dst_col >= BOARD_SIZE ||
+                        dst_row < 0 || dst_row >= BOARD_SIZE) {
+                        continue;
+                    }
+                    int dst_cell = dst_row * BOARD_SIZE + dst_col;
+                    int16_t dst_node = top_node_at[dst_cell];
+                    if (dst_node < 0) continue;
+                    if (edge_count >= HYBRID_MAX_EDGES) break;
+
+                    es[edge_count] = src_node;
+                    ed[edge_count] = dst_node;
+                    float* e = ef + edge_count * HYBRID_EDGE_FEAT_DIM;
+                    e[0] = (float)dq / (float)radius;
+                    e[1] = (float)dr / (float)radius;
+                    em[edge_count] = true;
+                    edge_count++;
+                }
+                if (edge_count >= HYBRID_MAX_EDGES) break;
+            }
+            if (edge_count >= HYBRID_MAX_EDGES) break;
+        }
+        if (edge_count >= HYBRID_MAX_EDGES) break;
+    }
+
+    for (int cell = 0; cell < NUM_CELLS; ++cell) {
+        int h = s.height[cell];
+        if (h < 2) continue;
+        int16_t base = first_node_at[cell];
+        if (base < 0) continue;
+        for (int level = 0; level < h - 1; ++level) {
+            int lower = base + level;
+            int upper = base + level + 1;
+            if (lower >= HYBRID_MAX_NODES || upper >= HYBRID_MAX_NODES) break;
+            if (edge_count < HYBRID_MAX_EDGES) {
+                es[edge_count] = lower;
+                ed[edge_count] = upper;
+                ef[edge_count * HYBRID_EDGE_FEAT_DIM + 2] = 1.0f;
+                em[edge_count] = true;
+                edge_count++;
+            }
+            if (edge_count < HYBRID_MAX_EDGES) {
+                es[edge_count] = upper;
+                ed[edge_count] = lower;
+                ef[edge_count * HYBRID_EDGE_FEAT_DIM + 2] = 1.0f;
+                em[edge_count] = true;
+                edge_count++;
+            }
+        }
+    }
+
+    Color cur = current_player(s);
+    gf[0] = (cur == WHITE) ? 1.0f : 0.0f;
+    gf[1] = (s.turn / 100.0f < 1.0f) ? s.turn / 100.0f : 1.0f;
+    gf[2] = is_queen_placed(s, WHITE) ? 1.0f : 0.0f;
+    gf[3] = is_queen_placed(s, BLACK) ? 1.0f : 0.0f;
+    int white_hand = 0;
+    int black_hand = 0;
+    for (int p = 0; p < NUM_PIECE_TYPES; ++p) {
+        white_hand += s.hands[0][p];
+        black_hand += s.hands[1][p];
+    }
+    gf[4] = white_hand / 14.0f;
+    gf[5] = black_hand / 14.0f;
+
+    num_nodes_out[idx] = node_count;
+    num_edges_out[idx] = edge_count;
+}
+
+__device__ inline void extract_hybrid_transformer_tokens_device(
+    const HiveState& s,
+    float* tf,
+    int* tq,
+    int* tr,
+    int* tz,
+    bool* tm,
+    float* gf,
+    int& token_count
+) {
+    for (int i = 0; i < HYBRID_MAX_PIECE_TOKENS * HYBRID_NODE_FEAT_DIM; ++i) tf[i] = 0.0f;
+    for (int i = 0; i < HYBRID_MAX_PIECE_TOKENS; ++i) {
+        tq[i] = 0;
+        tr[i] = 0;
+        tz[i] = 0;
+        tm[i] = false;
+    }
+    for (int i = 0; i < HYBRID_GLOBAL_FEAT_DIM; ++i) gf[i] = 0.0f;
+
+    float queen_surround[2] = {0.0f, 0.0f};
+    for (int c = 0; c < 2; ++c) {
+        uint16_t qc = s.queen_cell[c];
+        if (qc != 0xFFFF) {
+            int cnt = 0;
+            for (int d = 0; d < NUM_DIRS; ++d) {
+                int16_t nb = NEIGHBORS[qc][d];
+                if (nb >= 0 && s.height[nb] > 0) cnt++;
+            }
+            queen_surround[c] = cnt / 6.0f;
+        }
+    }
+
+    token_count = 0;
+    for (int cell = 0; cell < NUM_CELLS; ++cell) {
+        int h = s.height[cell];
+        if (h == 0) continue;
+
+        int occ_flags[NUM_DIRS];
+        int occ_count = 0;
+        for (int d = 0; d < NUM_DIRS; ++d) {
+            int16_t nb = NEIGHBORS[cell][d];
+            occ_flags[d] = (nb >= 0 && s.height[nb] > 0) ? 1 : 0;
+            occ_count += occ_flags[d];
+        }
+
+        int col = cell % BOARD_SIZE;
+        int row = cell / BOARD_SIZE;
+        for (int level = 0; level < h; ++level) {
+            if (token_count >= HYBRID_MAX_PIECE_TOKENS) break;
+            uint8_t packed = s.pieces[level][cell];
+            PieceType pt = cell_piece_type(packed);
+            Color pc = cell_color(packed);
+            bool is_top = (level == h - 1);
+
+            float* f = tf + token_count * HYBRID_NODE_FEAT_DIM;
+            f[pt - 1] = 1.0f;
+            f[8 + pc] = 1.0f;
+            f[10] = (level == 0) ? 1.0f : 0.0f;
+            f[11] = is_top ? 1.0f : 0.0f;
+            f[12] = h / 4.0f;
+            f[13] = (pt == PT_QUEEN) ? 1.0f : 0.0f;
+            f[14] = queen_surround[pc];
+            f[15] = occ_count / 6.0f;
+            if (is_top) {
+                for (int d = 0; d < NUM_DIRS; ++d) {
+                    if (!occ_flags[d]) f[16 + d] = 1.0f;
+                }
+            }
+            f[24] = level * 0.25f;
+            f[25] = is_stunned_cell(s, cell) ? 1.0f : 0.0f;
+
+            tq[token_count] = col;
+            tr[token_count] = row;
+            tz[token_count] = level;
+            tm[token_count] = true;
+            token_count++;
+        }
+    }
+
+    Color cur = current_player(s);
+    gf[0] = (cur == WHITE) ? 1.0f : 0.0f;
+    gf[1] = (s.turn / 100.0f < 1.0f) ? s.turn / 100.0f : 1.0f;
+    gf[2] = is_queen_placed(s, WHITE) ? 1.0f : 0.0f;
+    gf[3] = is_queen_placed(s, BLACK) ? 1.0f : 0.0f;
+    int white_hand = 0;
+    int black_hand = 0;
+    for (int p = 0; p < NUM_PIECE_TYPES; ++p) {
+        white_hand += s.hands[0][p];
+        black_hand += s.hands[1][p];
+    }
+    gf[4] = white_hand / 14.0f;
+    gf[5] = black_hand / 14.0f;
+}
+
+__device__ inline void extract_hybrid_transformer_move_features_device(
+    const HiveState& s,
+    const GPUMove* my_moves,
+    int nlegal,
+    float* out
+) {
+    for (int i = 0; i < MAX_LEGAL_MOVES * HYBRID_MOVE_FEAT_DIM; ++i) out[i] = 0.0f;
+
+    Color mover = current_player(s);
+    Color opp = (mover == WHITE) ? BLACK : WHITE;
+    int own_q = (int)s.queen_cell[mover];
+    int opp_q = (int)s.queen_cell[opp];
+    int own_q_col = (own_q >= 0 && own_q != 0xFFFF) ? (own_q % BOARD_SIZE - HALF_BOARD) : 0;
+    int own_q_row = (own_q >= 0 && own_q != 0xFFFF) ? (own_q / BOARD_SIZE - HALF_BOARD) : 0;
+    int opp_q_col = (opp_q >= 0 && opp_q != 0xFFFF) ? (opp_q % BOARD_SIZE - HALF_BOARD) : 0;
+    int opp_q_row = (opp_q >= 0 && opp_q != 0xFFFF) ? (opp_q / BOARD_SIZE - HALF_BOARD) : 0;
+
+    for (int m = 0; m < nlegal; ++m) {
+        const GPUMove& mv = my_moves[m];
+        float* f = out + (int64_t)m * HYBRID_MOVE_FEAT_DIM;
+
+        f[(int)mv.type] = 1.0f;  // 0: place, 1: move, 2: pass
+        if (mv.piece_type >= PT_QUEEN && mv.piece_type <= PT_PILLBUG) {
+            f[3 + ((int)mv.piece_type - 1)] = 1.0f;
+        }
+
+        bool has_source = (mv.type == MOVE_MOVE);
+        f[11] = has_source ? 1.0f : 0.0f;
+
+        int src_q = 0;
+        int src_r = 0;
+        int dst_q = 0;
+        int dst_r = 0;
+        int src_stack = 0;
+        int dst_stack = 0;
+        int dst_occ = 0;
+
+        if (mv.to_cell < NUM_CELLS) {
+            dst_q = (int)mv.to_cell % BOARD_SIZE - HALF_BOARD;
+            dst_r = (int)mv.to_cell / BOARD_SIZE - HALF_BOARD;
+            dst_stack = s.height[mv.to_cell];
+            dst_occ = dst_stack > 0 ? 1 : 0;
+        }
+        if (has_source && mv.from_cell < NUM_CELLS) {
+            src_q = (int)mv.from_cell % BOARD_SIZE - HALF_BOARD;
+            src_r = (int)mv.from_cell / BOARD_SIZE - HALF_BOARD;
+            src_stack = s.height[mv.from_cell];
+        }
+
+        f[12] = has_source ? (float)(dst_q - src_q) / (float)HALF_BOARD : 0.0f;
+        f[13] = has_source ? (float)(dst_r - src_r) / (float)HALF_BOARD : 0.0f;
+
+        f[14] = (float)(dst_q - own_q_col) / (float)HALF_BOARD;
+        f[15] = (float)(dst_r - own_q_row) / (float)HALF_BOARD;
+        f[16] = (float)(dst_q - opp_q_col) / (float)HALF_BOARD;
+        f[17] = (float)(dst_r - opp_q_row) / (float)HALF_BOARD;
+
+        f[18] = has_source ? (float)(src_q - own_q_col) / (float)HALF_BOARD : 0.0f;
+        f[19] = has_source ? (float)(src_r - own_q_row) / (float)HALF_BOARD : 0.0f;
+        f[20] = has_source ? (float)(src_q - opp_q_col) / (float)HALF_BOARD : 0.0f;
+        f[21] = has_source ? (float)(src_r - opp_q_row) / (float)HALF_BOARD : 0.0f;
+
+        f[22] = (float)src_stack / (float)MAX_STACK;
+        f[23] = (float)dst_stack / (float)MAX_STACK;
+        f[24] = (float)dst_occ;
+    }
+}
+
+__global__ void hybrid_transformer_encode_states_kernel(
+    const HiveState* states,
+    const GPUMove* legal_moves,
+    const int* num_legal,
+    float* token_features,     // [B, HYBRID_MAX_PIECE_TOKENS, HYBRID_NODE_FEAT_DIM]
+    int* token_q,              // [B, HYBRID_MAX_PIECE_TOKENS]
+    int* token_r,              // [B, HYBRID_MAX_PIECE_TOKENS]
+    int* token_z,              // [B, HYBRID_MAX_PIECE_TOKENS]
+    bool* token_mask,          // [B, HYBRID_MAX_PIECE_TOKENS]
+    float* global_features,    // [B, HYBRID_GLOBAL_FEAT_DIM]
+    int* num_tokens_out,       // [B]
+    int batch_size,
+    bool use_move_flags
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    const HiveState& s = states[idx];
+    float* tf = token_features + idx * HYBRID_MAX_PIECE_TOKENS * HYBRID_NODE_FEAT_DIM;
+    int* tq = token_q + idx * HYBRID_MAX_PIECE_TOKENS;
+    int* tr = token_r + idx * HYBRID_MAX_PIECE_TOKENS;
+    int* tz = token_z + idx * HYBRID_MAX_PIECE_TOKENS;
+    bool* tm = token_mask + idx * HYBRID_MAX_PIECE_TOKENS;
+    float* gf = global_features + idx * HYBRID_GLOBAL_FEAT_DIM;
+
+    int token_count = 0;
+    extract_hybrid_transformer_tokens_device(s, tf, tq, tr, tz, tm, gf, token_count);
+    num_tokens_out[idx] = token_count;
+}
+
+__global__ void hybrid_transformer_move_features_kernel(
+    const HiveState* states,
+    const GPUMove* legal_moves,
+    const int* num_legal,
+    float* move_features,   // [B, MAX_LEGAL_MOVES, HYBRID_MOVE_FEAT_DIM]
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    const HiveState& s = states[idx];
+    const GPUMove* my_moves = legal_moves + (int64_t)idx * MAX_LEGAL_MOVES;
+    float* out = move_features + (int64_t)idx * MAX_LEGAL_MOVES * HYBRID_MOVE_FEAT_DIM;
+    int nlegal = num_legal[idx];
+    extract_hybrid_transformer_move_features_device(s, my_moves, nlegal, out);
 }
 
 // ── Encode kernel ────────────────────────────────────────────────────

@@ -11,6 +11,7 @@
  */
 
 #include <torch/extension.h>
+#include <cstddef>
 #include "hive_state.cuh"
 #include "state_encoder.cuh"  // for encoder constants (kernel guarded by __CUDACC__)
 #include "fnn_features.cuh"   // for FNN_FEAT_DIM constant
@@ -31,6 +32,24 @@ torch::Tensor check_results_batch(torch::Tensor states_tensor, int batch_size);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 encode_states_batch(torch::Tensor states_tensor, int batch_size);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+hybrid_gnn_encode_batch(torch::Tensor states_tensor, int batch_size, int radius);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+hybrid_gnn_encode_with_moves_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    int batch_size,
+    int radius);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor>
+hybrid_transformer_encode_with_moves_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    int batch_size);
 std::tuple<torch::Tensor, torch::Tensor> generate_legal_mask_batch(
     torch::Tensor states_tensor, int batch_size);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> generate_legal_moves_and_mask_batch(
@@ -53,12 +72,46 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 generate_legal_moves_and_fnn_features_batch(
     torch::Tensor states_tensor,
     int batch_size);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor>
+generate_legal_moves_and_hybrid_root_features_batch(
+    torch::Tensor states_tensor,
+    int batch_size);
+torch::Tensor queen_escape_flags_batch(
+    torch::Tensor states_tensor,
+    int batch_size);
+torch::Tensor endgame_hit_mask_batch(
+    torch::Tensor states_tensor,
+    int batch_size,
+    int min_surround,
+    int max_surround,
+    bool require_mixed_pair);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+root_tactical_probe_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    torch::Tensor priors_tensor,
+    int batch_size,
+    bool enable_win_in_one,
+    bool enable_check_opponent_wins,
+    bool enable_win_in_two);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+debug_tactical_state_batch(
+    torch::Tensor states_tensor,
+    int batch_size);
 torch::Tensor fnn_successor_features_batch(
     torch::Tensor states_tensor,
     torch::Tensor legal_moves_tensor,
     torch::Tensor action_to_root_tensor,
     torch::Tensor move_indices_tensor,
     int num_actions);
+torch::Tensor hybrid_transformer_move_features_batch(
+    torch::Tensor states_tensor,
+    torch::Tensor legal_moves_tensor,
+    torch::Tensor num_legal_tensor,
+    int batch_size);
 
 // GPU-native FNN self-play
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -228,6 +281,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Encode batch of HiveStates into NN input features",
           py::arg("states"), py::arg("batch_size"));
 
+    m.def("hybrid_gnn_encode_batch", &hive_gpu::hybrid_gnn_encode_batch,
+          "Encode HiveStates into padded graph tensors for the hybrid GNN",
+          py::arg("states"), py::arg("batch_size"), py::arg("radius") = 2);
+    m.def("hybrid_gnn_encode_with_moves_batch", &hive_gpu::hybrid_gnn_encode_with_moves_batch,
+          "Encode HiveStates into padded graph tensors using a precomputed legal move list",
+          py::arg("states"), py::arg("legal_moves"), py::arg("num_legal"),
+          py::arg("batch_size"), py::arg("radius") = 2);
+
     m.def("generate_legal_mask_batch", &hive_gpu::generate_legal_mask_batch,
           "Generate legal action masks (29407-dim) for a batch of states",
           py::arg("states"), py::arg("batch_size"));
@@ -258,6 +319,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &hive_gpu::generate_legal_moves_and_fnn_features_batch,
           "Generate legal moves and extract FNN features in one kernel",
           py::arg("states"), py::arg("batch_size"));
+    m.def("generate_legal_moves_and_hybrid_root_features_batch",
+          &hive_gpu::generate_legal_moves_and_hybrid_root_features_batch,
+          "Generate legal moves plus fused FNN-transformer root features in one kernel",
+          py::arg("states"), py::arg("batch_size"));
+    m.def("queen_escape_flags_batch",
+          &hive_gpu::queen_escape_flags_batch,
+          "Return whether the side to move's queen has any legal escape, including pillbug or mosquito throws",
+          py::arg("states"), py::arg("batch_size"));
+    m.def("endgame_hit_mask_batch",
+          &hive_gpu::endgame_hit_mask_batch,
+          "Return a per-state mask for in-progress positions where both queens are placed and both queen surrounds lie within [min_surround, max_surround]",
+          py::arg("states"), py::arg("batch_size"),
+          py::arg("min_surround"), py::arg("max_surround"),
+          py::arg("require_mixed_pair") = false);
+    m.def("root_tactical_probe_batch",
+          &hive_gpu::root_tactical_probe_batch,
+          "Root tactical probe: immediate wins, opponent immediate-win pruning, and short forced-win checks",
+          py::arg("states"), py::arg("legal_moves"),
+          py::arg("num_legal"), py::arg("priors"),
+          py::arg("batch_size"),
+          py::arg("enable_win_in_one") = true,
+          py::arg("enable_check_opponent_wins") = true,
+          py::arg("enable_win_in_two") = true);
+    m.def("debug_tactical_state_batch",
+          &hive_gpu::debug_tactical_state_batch,
+          "Debug tactical state summaries",
+          py::arg("states"), py::arg("batch_size"));
 
     m.def("fnn_successor_features_batch",
           &hive_gpu::fnn_successor_features_batch,
@@ -265,6 +353,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("states"), py::arg("legal_moves"),
           py::arg("action_to_root"), py::arg("move_indices"),
           py::arg("num_actions"));
+    m.def("hybrid_transformer_move_features_batch",
+          &hive_gpu::hybrid_transformer_move_features_batch,
+          "Extract per-legal-move descriptors for the FNN transformer policy head",
+          py::arg("states"), py::arg("legal_moves"),
+          py::arg("num_legal"), py::arg("batch_size"));
+    m.def("hybrid_transformer_encode_with_moves_batch",
+          &hive_gpu::hybrid_transformer_encode_with_moves_batch,
+          "Encode current-state piece tokens for the hybrid relative transformer",
+          py::arg("states"), py::arg("legal_moves"),
+          py::arg("num_legal"), py::arg("batch_size"));
 
     // ── GPU-native FNN self-play ────────────────────────────────────
     m.def("fnn_selfplay_batch", &hive_gpu::fnn_selfplay_batch,
@@ -350,11 +448,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MAX_STACK") = hive_gpu::MAX_STACK;
     m.attr("SIZEOF_HIVE_STATE") = (int)sizeof(hive_gpu::HiveState);
     m.attr("SIZEOF_GPU_MOVE") = (int)sizeof(hive_gpu::GPUMove);
+    m.attr("OFF_TURN") = (int)offsetof(hive_gpu::HiveState, turn);
+    m.attr("OFF_QUEEN_PLACED") = (int)offsetof(hive_gpu::HiveState, queen_placed);
+    m.attr("OFF_RESULT") = (int)offsetof(hive_gpu::HiveState, result);
+    m.attr("OFF_STUNNED_CELL") = (int)offsetof(hive_gpu::HiveState, stunned_cell);
+    m.attr("OFF_QUEEN_CELL") = (int)offsetof(hive_gpu::HiveState, queen_cell);
+    m.attr("OFF_HANDS") = (int)offsetof(hive_gpu::HiveState, hands);
     m.attr("MAX_ENC_NODES") = hive_gpu::MAX_ENC_NODES;
     m.attr("MAX_ENC_EDGES") = hive_gpu::MAX_ENC_EDGES;
     m.attr("NODE_FEAT_DIM") = hive_gpu::NODE_FEAT_DIM;
     m.attr("EDGE_FEAT_DIM") = hive_gpu::EDGE_FEAT_DIM;
     m.attr("GLOBAL_FEAT_DIM") = hive_gpu::GLOBAL_FEAT_DIM;
+    m.attr("HYBRID_MAX_NODES") = hive_gpu::HYBRID_MAX_NODES;
+    m.attr("HYBRID_MAX_EDGES") = hive_gpu::HYBRID_MAX_EDGES;
+    m.attr("HYBRID_MAX_PIECE_TOKENS") = hive_gpu::HYBRID_MAX_PIECE_TOKENS;
+    m.attr("HYBRID_NODE_FEAT_DIM") = hive_gpu::HYBRID_NODE_FEAT_DIM;
+    m.attr("HYBRID_MOVE_FEAT_DIM") = hive_gpu::HYBRID_MOVE_FEAT_DIM;
+    m.attr("HYBRID_EDGE_FEAT_DIM") = hive_gpu::HYBRID_EDGE_FEAT_DIM;
+    m.attr("HYBRID_GLOBAL_FEAT_DIM") = hive_gpu::HYBRID_GLOBAL_FEAT_DIM;
     m.attr("ENC_GRID") = hive_gpu::ENC_GRID;
     m.attr("ACTION_SPACE_SIZE") = hive_gpu::ACTION_SPACE_SIZE;
     m.attr("PASS_ACTION_INDEX") = hive_gpu::PASS_ACTION_INDEX;

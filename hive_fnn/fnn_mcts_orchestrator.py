@@ -31,6 +31,15 @@ _OFF_TURN = 3412
 _GUMBEL_K = 16
 _GUMBEL_ROUNDS = 4
 _GUMBEL_WAVE_SCHEDULE = (2, 4, 8, 16)
+_OFF_HEIGHT = 2645
+_OFF_QUEEN_CELL = 3392
+_NUM_CELLS = 529
+_BOARD_SIZE = 23
+_GPU_MOVE_SIZE = 6
+_GPU_MOVE_PLACE = 0
+_GPU_MOVE_MOVE = 1
+_GPU_PT_QUEEN = 1
+_SHORT_PROBE_CHUNK = 64
 
 
 @dataclass
@@ -53,10 +62,24 @@ class FNNMCTSConfig:
     dirichlet_alpha:             float = 0.3
     dirichlet_epsilon:           float = 0.25
     max_tree_nodes:              int   = 65536
+    queen_surround_reserve_slots: int  = 10
+    queen_surround_reserve_immobile_only: bool = True
+    root_q_min_visits:            int   = 0
+    short_forced_win_probe:       bool  = False
+    probe_win_in_one:             bool  = True
+    probe_check_opponent_wins:    bool  = True
+    probe_win_in_two:             bool  = True
     # Rebase each game's tree to a fresh root after applying a move.
     # This prevents node-id growth across plies from exhausting the fixed
     # tree node pool in long games.
     rebase_tree_each_move:       bool  = True
+
+
+@dataclass
+class RootTacticalAnalysis:
+    winning_moves: torch.Tensor
+    allowed_slots: torch.Tensor
+    forced_random: torch.Tensor
 
 
 class FNNMCTSOrchestrator:
@@ -78,6 +101,23 @@ class FNNMCTSOrchestrator:
         ).unsqueeze(0)
         self._row_idx_cache: dict[int, torch.Tensor] = {}
         self._keep_rank_cache: dict[int, torch.Tensor] = {}
+        self._neighbor_cells = self._build_neighbor_cells()
+
+    def _build_neighbor_cells(self) -> torch.Tensor:
+        neigh = torch.full((_NUM_CELLS, 6), -1, dtype=torch.int64, device="cuda")
+        dirs = ((1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1))
+        for cell in range(_NUM_CELLS):
+            row, col = divmod(cell, _BOARD_SIZE)
+            q = col - (_BOARD_SIZE // 2)
+            r = row - (_BOARD_SIZE // 2)
+            for i, (dq, dr) in enumerate(dirs):
+                nq = q + dq
+                nr = r + dr
+                ncol = nq + (_BOARD_SIZE // 2)
+                nrow = nr + (_BOARD_SIZE // 2)
+                if 0 <= ncol < _BOARD_SIZE and 0 <= nrow < _BOARD_SIZE:
+                    neigh[cell, i] = nrow * _BOARD_SIZE + ncol
+        return neigh
 
     def _row_indices(self, n: int) -> torch.Tensor:
         cached = self._row_idx_cache.get(n)
@@ -135,8 +175,7 @@ class FNNMCTSOrchestrator:
     def _tree_args(self, tree: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         return [
             tree["visit_count"], tree["total_value"], tree["prior"],
-            tree["parent_idx"], tree["virtual_q_penalty"],
-            tree["move_bytes"], tree["action_idx"],
+            tree["parent_idx"], tree["move_bytes"], tree["action_idx"],
             tree["first_child"], tree["num_children"],
             tree["is_terminal"], tree["terminal_value"], tree["node_count"],
         ]
@@ -218,12 +257,143 @@ class FNNMCTSOrchestrator:
 
         return prior_pad, root_values, child_q_per_legal
 
+    def _queen_surround_count(
+        self,
+        states: torch.Tensor,
+        queen_color: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = torch.arange(states.shape[0], device="cuda", dtype=torch.int64)
+        qbase = (_OFF_QUEEN_CELL + 2 * queen_color).to(torch.int64)
+        qcell = (
+            states[rows, qbase].to(torch.int32)
+            | (states[rows, qbase + 1].to(torch.int32) << 8)
+        )
+        valid_queen = qcell != 0xFFFF
+        qcell_clamped = qcell.clamp(min=0, max=_NUM_CELLS - 1).to(torch.int64)
+        neigh = self._neighbor_cells[qcell_clamped]
+        neigh_valid = neigh >= 0
+        heights = states[:, _OFF_HEIGHT:_OFF_HEIGHT + _NUM_CELLS].to(torch.int16)
+        neigh_heights = heights.gather(1, neigh.clamp(min=0))
+        surround = (neigh_valid & (neigh_heights > 0)).sum(dim=1).to(torch.int32)
+        surround = torch.where(valid_queen, surround, torch.zeros_like(surround))
+        return surround, qcell
+
+    def _queen_surround_qualifying_mask(
+        self,
+        states: torch.Tensor,
+        legal_moves: torch.Tensor,
+        num_legal: torch.Tensor,
+        total: int,
+    ) -> torch.Tensor:
+        dev = "cuda"
+        max_legal = legal_moves.shape[1]
+        slot_idx = torch.arange(max_legal, device=dev, dtype=torch.int64).unsqueeze(0)
+        valid = slot_idx < num_legal.to(torch.int64).unsqueeze(1)
+        if total == 0 or not bool(valid.any().item()):
+            return torch.zeros((total, max_legal), dtype=torch.bool, device=dev)
+
+        root_rows = self._row_indices(total).expand_as(valid)[valid]
+        move_indices = slot_idx.expand_as(valid)[valid]
+        n_total = int(root_rows.shape[0])
+        child_states = states[root_rows].clone()
+        child_moves = legal_moves[root_rows, move_indices]
+        self.ext.apply_moves_batch(child_states, child_moves, n_total)
+
+        parent_turn = (
+            states[:, _OFF_TURN].to(torch.int32)
+            | (states[:, _OFF_TURN + 1].to(torch.int32) << 8)
+        )
+        opp_color = ((parent_turn + 1) & 1).to(torch.int64)
+        before_counts, _ = self._queen_surround_count(states, opp_color)
+        before_flat = before_counts[root_rows]
+
+        child_turn = (
+            child_states[:, _OFF_TURN].to(torch.int32)
+            | (child_states[:, _OFF_TURN + 1].to(torch.int32) << 8)
+        )
+        child_player = (child_turn & 1).to(torch.int64)
+        after_counts, queen_cells = self._queen_surround_count(child_states, child_player)
+        qualifies_flat = after_counts > before_flat
+
+        if self.config.queen_surround_reserve_immobile_only and bool(qualifies_flat.any().item()):
+            has_queen_reply = self.ext.queen_escape_flags_batch(child_states, n_total).to(torch.bool)
+            qualifies_flat &= ~has_queen_reply
+
+        qual = torch.zeros((total, max_legal), dtype=torch.bool, device=dev)
+        qual[valid] = qualifies_flat
+        return qual
+
+    def _root_candidate_slots(
+        self,
+        states: torch.Tensor,
+        legal_moves: torch.Tensor,
+        num_legal: torch.Tensor,
+        priors_per_legal: torch.Tensor,
+        legal_logits: torch.Tensor,
+        total: int,
+        allowed_slot_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        dev = "cuda"
+        max_legal = legal_moves.shape[1]
+        k = min(int(self.config.max_num_considered_actions), max_legal)
+        slot_idx = torch.arange(max_legal, device=dev, dtype=torch.int64).unsqueeze(0)
+        valid = slot_idx < num_legal.to(torch.int64).unsqueeze(1)
+        if allowed_slot_mask is not None:
+            valid &= allowed_slot_mask
+
+        reserve_slots = min(int(self.config.queen_surround_reserve_slots), k)
+        if reserve_slots <= 0:
+            u = torch.rand(total, max_legal, device=dev).clamp(1e-4, 1 - 1e-4)
+            gumbel = -torch.log(-torch.log(u))
+            gumbel = torch.where(valid, gumbel, torch.full_like(gumbel, -1e30))
+            _, topk_slots = torch.topk(gumbel + legal_logits, k, dim=1)
+            return topk_slots.to(torch.int32)
+
+        qual = self._queen_surround_qualifying_mask(states, legal_moves, num_legal, total)
+        reserve_scores = torch.where(
+            qual, priors_per_legal, torch.full_like(priors_per_legal, -1e30),
+        )
+        reserve_per_game = qual.sum(dim=1).clamp(max=reserve_slots)
+        _, reserve_order = torch.topk(reserve_scores, reserve_slots, dim=1)
+        reserve_rank = self._keep_rank(reserve_slots)
+        reserve_valid = reserve_rank < reserve_per_game.unsqueeze(1)
+        reserve_candidates = torch.where(
+            reserve_valid,
+            reserve_order.to(torch.int32),
+            torch.full_like(reserve_order.to(torch.int32), -1),
+        )
+
+        chosen_mask = torch.zeros((total, max_legal), dtype=torch.bool, device=dev)
+        if bool(reserve_valid.any().item()):
+            rows = self._row_indices(total).expand_as(reserve_valid)[reserve_valid]
+            cols = reserve_order[reserve_valid]
+            chosen_mask[rows, cols] = True
+
+        fill_scores = torch.where(
+            valid & ~chosen_mask,
+            priors_per_legal,
+            torch.full_like(priors_per_legal, -1e30),
+        )
+        _, fill_order = torch.topk(fill_scores, k, dim=1)
+        fill_keep = (k - reserve_per_game).clamp(min=0)
+        fill_rank = self._keep_rank(k)
+        fill_valid = fill_rank < fill_keep.unsqueeze(1)
+        fill_candidates = torch.where(
+            fill_valid,
+            fill_order.to(torch.int32),
+            torch.full_like(fill_order.to(torch.int32), -1),
+        )
+        return torch.cat([reserve_candidates, fill_candidates], dim=1)[:, :k]
+
     def _find_immediate_wins(
         self,
         states: torch.Tensor,
         legal_moves: torch.Tensor,
         num_legal: torch.Tensor,
         total: int,
+        *,
+        row_mask: torch.Tensor | None = None,
+        slot_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return winning legal-move index per game, or -1 if none exists."""
         dev = states.device
@@ -235,6 +405,10 @@ class FNNMCTSOrchestrator:
         max_legal = legal_moves.shape[1]
         slot_idx = torch.arange(max_legal, device=dev, dtype=torch.int64).unsqueeze(0)
         valid = slot_idx < n64.unsqueeze(1)
+        if row_mask is not None:
+            valid &= row_mask.unsqueeze(1)
+        if slot_mask is not None:
+            valid &= slot_mask
         action_to_root = torch.arange(total, device=dev, dtype=torch.int64).unsqueeze(1).expand_as(valid)[valid]
         move_indices = slot_idx.expand_as(valid)[valid]
         n_total = int(action_to_root.shape[0])
@@ -260,6 +434,70 @@ class FNNMCTSOrchestrator:
                 winners[i] = win_moves[mask_i][0]
         return winners
 
+    def _write_turn_values(
+        self,
+        states: torch.Tensor,
+        turns: torch.Tensor,
+    ) -> None:
+        turn16 = turns.to(torch.int32).clamp(min=0, max=0xFFFF)
+        states[:, _OFF_TURN] = (turn16 & 0xFF).to(torch.uint8)
+        states[:, _OFF_TURN + 1] = ((turn16 >> 8) & 0xFF).to(torch.uint8)
+
+    def _immediate_win_mask_by_child(
+        self,
+        child_states: torch.Tensor,
+        chunk_size: int = _SHORT_PROBE_CHUNK,
+    ) -> torch.Tensor:
+        total = int(child_states.shape[0])
+        out = torch.zeros((total,), dtype=torch.bool, device=child_states.device)
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+            chunk_states = child_states[start:end]
+            chunk_total = end - start
+            chunk_legal, chunk_num_legal = self.ext.generate_legal_moves_batch(
+                chunk_states, chunk_total,
+            )
+            out[start:end] = self._find_immediate_wins(
+                chunk_states, chunk_legal, chunk_num_legal, chunk_total,
+            ) >= 0
+        return out
+
+    def _analyze_short_tactics(
+        self,
+        states: torch.Tensor,
+        legal_moves: torch.Tensor,
+        num_legal: torch.Tensor,
+        total: int,
+        priors_per_legal: torch.Tensor,
+    ) -> RootTacticalAnalysis:
+        winning, allowed, forced = self.ext.root_tactical_probe_batch(
+            states,
+            legal_moves,
+            num_legal,
+            priors_per_legal,
+            total,
+            self.config.probe_win_in_one,
+            self.config.probe_check_opponent_wins,
+            self.config.probe_win_in_two,
+        )
+        return RootTacticalAnalysis(
+            winning_moves=winning.to(torch.int64),
+            allowed_slots=allowed.to(torch.bool),
+            forced_random=forced.to(torch.bool),
+        )
+
+    def _find_short_forced_wins(
+        self,
+        states: torch.Tensor,
+        legal_moves: torch.Tensor,
+        num_legal: torch.Tensor,
+        total: int,
+        priors_per_legal: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._analyze_short_tactics(
+            states, legal_moves, num_legal, total, priors_per_legal,
+        ).winning_moves
+
     # ── Public API ────────────────────────────────────────────────────
 
     def self_play_batch(
@@ -281,7 +519,7 @@ class FNNMCTSOrchestrator:
 
         active_mask = torch.ones((B,), dtype=torch.bool, device=dev)
         move_numbers = torch.zeros((B,), dtype=torch.int64, device=dev)
-        histories: list[list[tuple[np.ndarray, np.ndarray]]] = [[] for _ in range(B)]
+        histories: list[list[tuple[np.ndarray, np.ndarray, bool]]] = [[] for _ in range(B)]
 
         while bool(active_mask.any().item()):
             legal_moves, num_legal, root_features = (
@@ -295,63 +533,68 @@ class FNNMCTSOrchestrator:
             if newly_finished.any():
                 active_mask = active_mask & ~newly_finished
 
-            immediate_wins = self._find_immediate_wins(states, legal_moves, num_legal, B)
-            has_immediate_win = immediate_wins >= 0
-
             max_n = int(n_per_game.max().item()) if B > 0 else 0
             if max_n == 0:
                 break
-            if cfg.max_num_considered_actions != _GUMBEL_K:
-                cfg.max_num_considered_actions = _GUMBEL_K
+            cfg.max_num_considered_actions = max(1, min(cfg.max_num_considered_actions, self._max_legal))
 
             priors_per_legal, root_vals, child_q_per_legal = self._eval_states(
                 states, legal_moves, num_legal, B, root_features,
             )
+            slot_idx = torch.arange(self._max_legal, device=dev).unsqueeze(0)
+            valid_slot = slot_idx < n_per_game.unsqueeze(1)
+            forced_random = torch.zeros((B,), dtype=torch.bool, device=dev)
+            allowed_slot_mask = valid_slot
+            if cfg.short_forced_win_probe:
+                tactical = self._analyze_short_tactics(
+                    states, legal_moves, num_legal, B, priors_per_legal,
+                )
+                immediate_wins = tactical.winning_moves
+                allowed_slot_mask = tactical.allowed_slots & valid_slot
+                forced_random = tactical.forced_random & has_actions
+            else:
+                immediate_wins = self._find_immediate_wins(states, legal_moves, num_legal, B)
+            has_immediate_win = immediate_wins >= 0
             if bool(has_immediate_win.any().item()):
                 priors_per_legal.zero_()
                 priors_per_legal[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
                 child_q_per_legal.zero_()
+            search_rows = has_actions & ~has_immediate_win & ~forced_random
 
             # Padded logits over MAX_LEGAL slots (log of prior, with -inf on invalid).
             MAX_L = self._max_legal
-            slot_idx = torch.arange(MAX_L, device=dev).unsqueeze(0)
-            valid_slot = slot_idx < n_per_game.unsqueeze(1)
             safe_prior = priors_per_legal.clamp(min=1e-20)
             legal_logits = torch.where(
-                valid_slot, safe_prior.log(),
+                allowed_slot_mask, safe_prior.log(),
                 torch.full_like(priors_per_legal, -1e30),
             )
 
-            # ── Gumbel top-k over legal slots ─────────────────────────
             u = torch.rand(B, MAX_L, device=dev).clamp(1e-4, 1 - 1e-4)
             gumbel = -torch.log(-torch.log(u))
-            gumbel = torch.where(valid_slot, gumbel, torch.full_like(gumbel, -1e30))
-            perturbed = gumbel + legal_logits
-            _, topk_slots = torch.topk(perturbed, _GUMBEL_K, dim=1)
+            gumbel = torch.where(allowed_slot_mask, gumbel, torch.full_like(gumbel, -1e30))
+            topk_slots = self._root_candidate_slots(
+                states, legal_moves, num_legal, priors_per_legal, legal_logits, B,
+                allowed_slot_mask=allowed_slot_mask,
+            )
 
             # ── Expand root if needed ────────────────────────────────
-            game_active_t = has_actions.to(torch.int8)
+            game_active_t = search_rows.to(torch.int8)
             self._expand_root_if_needed(
                 tree, states, legal_moves, num_legal,
                 priors_per_legal, child_q_per_legal, game_active_t, B,
             )
-            self._apply_root_dirichlet(tree, B, has_actions)
+            self._apply_root_dirichlet(tree, B, search_rows)
 
-            if bool(has_immediate_win.any().item()):
-                slot_visits = torch.zeros(B, MAX_L, dtype=torch.int32, device=dev)
-                slot_visits[has_immediate_win, immediate_wins[has_immediate_win]] = cfg.num_simulations
-                probs_pad = torch.zeros(B, MAX_L, dtype=torch.float32, device=dev)
-                probs_pad[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
-                chosen_slot = torch.where(
-                    has_immediate_win,
-                    immediate_wins,
-                    torch.zeros_like(immediate_wins),
-                )
-            else:
+            slot_visits = torch.zeros(B, MAX_L, dtype=torch.int32, device=dev)
+            probs_pad = torch.zeros(B, MAX_L, dtype=torch.float32, device=dev)
+            chosen_slot = torch.zeros((B,), dtype=torch.long, device=dev)
+            if bool(search_rows.any().item()):
                 candidate_slots = topk_slots.to(torch.int32)
+                candidate_idx = candidate_slots.long().clamp(min=0)
                 candidate_valid = torch.gather(
-                    valid_slot, 1, candidate_slots.long(),
+                    valid_slot, 1, candidate_idx,
                 )
+                candidate_valid &= candidate_slots >= 0
                 candidate_slots = torch.where(
                     candidate_valid,
                     candidate_slots,
@@ -442,17 +685,50 @@ class FNNMCTSOrchestrator:
                 probs_pad = torch.softmax(sampled_logits, dim=1)
                 probs_pad = torch.where(valid_slot, probs_pad, torch.zeros_like(probs_pad))
 
+            if bool(has_immediate_win.any().item()):
+                slot_visits[has_immediate_win] = 0
+                slot_visits[has_immediate_win, immediate_wins[has_immediate_win]] = cfg.num_simulations
+                probs_pad[has_immediate_win] = 0.0
+                probs_pad[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
+                chosen_slot = torch.where(
+                    has_immediate_win,
+                    immediate_wins,
+                    chosen_slot,
+                )
+
+            if bool(forced_random.any().item()):
+                random_slots = (
+                    torch.rand((B,), device=dev) * n_per_game.clamp(min=1).to(torch.float32)
+                ).to(torch.int64)
+                chosen_slot = torch.where(forced_random, random_slots, chosen_slot)
+                probs_pad = torch.where(
+                    forced_random.unsqueeze(1),
+                    torch.zeros_like(probs_pad),
+                    probs_pad,
+                )
+
             # ── Record history ───────────────────────────────────────
             has_actions_cpu = has_actions.cpu().numpy()
+            forced_random_cpu = forced_random.cpu().numpy()
             states_cpu = states.cpu().numpy()
             probs_cpu  = probs_pad.cpu().numpy()
             for i in range(B):
-                if not bool(has_actions_cpu[i]):
+                if not bool(has_actions_cpu[i]) or bool(forced_random_cpu[i]):
                     continue
                 n = int(nlegal_np[i])
                 histories[i].append((
                     states_cpu[i].copy(),
                     probs_cpu[i, :n].astype(np.float32, copy=True),
+                    True,
+                ))
+            for i in range(B):
+                if not bool(has_actions_cpu[i]) or not bool(forced_random_cpu[i]):
+                    continue
+                n = int(nlegal_np[i])
+                histories[i].append((
+                    states_cpu[i].copy(),
+                    np.zeros((n,), dtype=np.float32),
+                    False,
                 ))
 
             # ── Apply chosen moves + re-root ──────────────────────────
@@ -492,7 +768,7 @@ class FNNMCTSOrchestrator:
         for i in range(B):
             winner = final_results[i]
             use_for_value = (winner != 0)
-            for state_bytes, target_pi in histories[i]:
+            for state_bytes, target_pi, use_for_policy in histories[i]:
                 turn = int(state_bytes[_OFF_TURN]) | (
                     int(state_bytes[_OFF_TURN + 1]) << 8
                 )
@@ -501,6 +777,7 @@ class FNNMCTSOrchestrator:
                     state_bytes=state_bytes,
                     policy_target=target_pi.astype(np.float32),
                     value_target=float(value),
+                    use_for_policy=bool(use_for_policy),
                     use_for_value=use_for_value,
                 ))
         return examples
@@ -526,7 +803,6 @@ class FNNMCTSOrchestrator:
         results = self.ext.check_results_batch(states, B)
         self.ext.mcts_expand_dense_priors_batch(
             *self._tree_args(tree),
-            tree["child_init_q"], child_q_per_legal,
             leaf_indices, states,
             legal_moves, num_legal, priors_per_legal, results,
             B, B, self._max_nodes,
@@ -577,11 +853,9 @@ class FNNMCTSOrchestrator:
             leaf_idx, move_paths, path_lens, vl_paths, vl_lens = (
                 self.ext.mcts_select_with_root_mask_batch(
                     *self._tree_args(tree),
-                    tree["child_init_q"],
                     game_active_t, tree["root_node"],
                     alive_mask, self._max_legal,
                     cfg.c_puct, B, actual_w, self._max_nodes,
-                    cfg.deterministic_non_root, cfg.non_root_sigma, q_penalty,
                 )
             )
 
@@ -604,11 +878,10 @@ class FNNMCTSOrchestrator:
 
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
                 *self._tree_args(tree),
-                tree["child_init_q"], child_q_leaf,
                 leaf_idx[:total], leaf_states[:total],
                 legal_moves, num_legal, priors_leaf, results,
                 leaf_vals, vl_paths[:total], vl_lens[:total],
-                B, total, self._max_nodes, q_penalty,
+                B, total, self._max_nodes,
             )
 
     def _run_simulations_for_root_slots(
@@ -642,22 +915,18 @@ class FNNMCTSOrchestrator:
                     leaf_features, results, vl_paths, vl_lens,
                 ) = self.ext.mcts_select_replay_legal_fnn_root_slots_batch(
                     *self._tree_args(tree),
-                    tree["child_init_q"],
                     root_states,
                     game_active_t, tree["root_node"],
                     root_slots, C, self._max_legal,
                     cfg.c_puct, B, actual_w, self._max_nodes,
-                    cfg.deterministic_non_root, cfg.non_root_sigma, q_penalty,
                 )
             else:
                 leaf_idx, move_paths, path_lens, vl_paths, vl_lens = (
                     self.ext.mcts_select_with_root_slots_batch(
                         *self._tree_args(tree),
-                        tree["child_init_q"],
                         game_active_t, tree["root_node"],
                         root_slots, C, self._max_legal,
                         cfg.c_puct, B, actual_w, self._max_nodes,
-                        cfg.deterministic_non_root, cfg.non_root_sigma, q_penalty,
                     )
                 )
 
@@ -681,11 +950,10 @@ class FNNMCTSOrchestrator:
 
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
                 *self._tree_args(tree),
-                tree["child_init_q"], child_q_leaf,
                 leaf_idx[:total], leaf_states_wave,
                 legal_moves, num_legal, priors_leaf, results,
                 leaf_vals, vl_paths[:total], vl_lens[:total],
-                B, total, self._max_nodes, q_penalty,
+                B, total, self._max_nodes,
             )
 
     def _alive_root_slots(self, alive: torch.Tensor) -> torch.Tensor:
@@ -721,8 +989,9 @@ class FNNMCTSOrchestrator:
         visits_raw = tree["visit_count"][row2, child_idx]
         total_raw = tree["total_value"][row2, child_idx]
         visits = torch.where(valid, visits_raw, torch.zeros_like(visits_raw))
+        min_visits = int(self.config.root_q_min_visits)
         q = torch.where(
-            valid & (visits_raw > 0),
+            valid & (visits_raw > min_visits),
             -total_raw / visits_raw.clamp(min=1).float(),
             torch.zeros_like(total_raw),
         )
@@ -744,8 +1013,9 @@ class FNNMCTSOrchestrator:
         visits_raw = tree["visit_count"][row2, child_idx]
         total_raw = tree["total_value"][row2, child_idx]
         visits = torch.where(valid, visits_raw, torch.zeros_like(visits_raw))
+        min_visits = int(self.config.root_q_min_visits)
         q = torch.where(
-            valid & (visits_raw > 0),
+            valid & (visits_raw > min_visits),
             -total_raw / visits_raw.clamp(min=1).float(),
             torch.zeros_like(total_raw),
         )

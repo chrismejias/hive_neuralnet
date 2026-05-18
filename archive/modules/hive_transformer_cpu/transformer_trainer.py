@@ -53,15 +53,15 @@ from hive_engine.trainer import (
     TrainStats,
 )
 
-from hive_transformer.token_encoder import TokenEncoder
-from hive_transformer.transformer_encoder import TransformerEncoder
-from hive_transformer.transformer_net import TransformerConfig, HiveTransformer
-from hive_transformer.transformer_replay_buffer import (
+from archive.legacy_transformer.hive_transformer.token_encoder import TokenEncoder
+from archive.legacy_transformer.hive_transformer.transformer_encoder import TransformerEncoder
+from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig, HiveTransformer
+from archive.modules.hive_transformer_cpu.transformer_replay_buffer import (
     TransformerTrainingExample,
     TransformerTrainingBatch,
     TokenReplayBuffer,
 )
-from hive_transformer.token_types import HiveTokenSequence
+from hive_common.token_types import HiveTokenSequence
 
 
 # ── Configuration ──────────────────────────────────────────────────
@@ -621,7 +621,7 @@ class TransformerTrainer:
             BatchedInferenceServer,
             BatchedPredictor,
         )
-        from hive_transformer.token_types import HiveTokenBatch
+        from hive_common.token_types import HiveTokenBatch
 
         # Start batch inference server
         server = BatchedInferenceServer(

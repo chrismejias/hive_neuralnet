@@ -1,5 +1,5 @@
 """
-CLI entry point for PRS v2 training (default PRS path).
+CLI entry point for PRS training.
 
 Usage:
     python -m hive_prs.train_prs [options]
@@ -16,36 +16,43 @@ import textwrap
 
 from hive_prs.prs_transformer import PRSConfig
 from hive_prs.prs_transformer_v2 import HivePRSTransformerV2
+from hive_prs.prs_transformer_v3 import HivePRSTransformerV3
 from hive_prs.prs_trainer_v2 import PRSTrainConfigV2, PRSTrainerV2
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Train the PRS v2 Transformer",
+        description="Train the PRS Transformer",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Long-running background launch:
               cd /workspace/hive_neuralnet
-              mkdir -p checkpoints_prs_v2
+              mkdir -p checkpoints_prs_v3
               nohup python3.11 -u -m hive_prs.train_prs \\
+                --model-version v3 \\
                 --iterations 1000 \\
                 --games 256 \\
                 --simulations 256 \\
                 --max-considered 16 \\
-                --checkpoint-dir checkpoints_prs_v2 \\
+                --checkpoint-dir checkpoints_prs_v3 \\
                 --checkpoint-keep-every 50 \\
-                --resume checkpoints_prs_v2/prs_v2_iter_0500.pt \\
+                --resume checkpoints_prs_v2/prs_v2_iter_1500.pt \\
                 --wave-parallel \\
-                >> checkpoints_prs_v2/training.log 2>&1 < /dev/null &
+                >> checkpoints_prs_v3/training.log 2>&1 < /dev/null &
               echo $!
 
             Checks:
               pgrep -af 'hive_prs.train_prs|train_prs'
-              tail -f checkpoints_prs_v2/training.log
+              tail -f checkpoints_prs_v3/training.log
 
             Notes:
-              - The current Gumbel defaults standardize on k=16, so the
-                training and profiling scripts now pass max-considered 16.
+              - PRS v3 is the current default trunk. It keeps the v2 tokenization
+                and structured 813-slot head, but adds relative attention bias.
+              - The current Gumbel defaults standardize on k=16, so the training
+                and profiling scripts now pass max-considered 16.
+              - Auxiliary heads default to weight 0.0. Earlier queen-surround,
+                endgame-mobility, slot-legality, and articulation experiments
+                all hurt playing strength and are now archived.
               - python -u keeps startup and per-iteration output unbuffered.
               - < /dev/null prevents the process from inheriting a terminal stdin.
               - If launched through a tool that kills detached children, use a
@@ -58,6 +65,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-heads", type=int, default=8)
     p.add_argument("--num-layers", type=int, default=6)
     p.add_argument("--dim-ff", type=int, default=512)
+    p.add_argument(
+        "--model-version",
+        choices=["v2", "v3"],
+        default="v3",
+        help="PRS transformer trunk version. v3 adds relative hex-offset attention bias.",
+    )
+    p.add_argument(
+        "--relative-position-clip",
+        type=int,
+        default=8,
+        help="PRS v3 relative attention offset clip radius in row/col space.",
+    )
 
     # Self-play
     p.add_argument("--iterations", type=int, default=1500)
@@ -87,10 +106,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--lr-min", type=float, default=1e-5)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--slot-legality-loss-weight", type=float, default=0.0)
+    p.add_argument("--articulation-loss-weight", type=float, default=0.0)
 
     # Buffer & checkpoints
     p.add_argument("--buffer-size", type=int, default=150_000)
-    p.add_argument("--checkpoint-dir", type=str, default="checkpoints_prs_v2")
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints_prs_v3")
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
     p.add_argument(
         "--resume",
@@ -176,6 +197,7 @@ def main() -> None:
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         dim_feedforward=args.dim_ff,
+        relative_position_clip=args.relative_position_clip,
     )
 
     train_config = PRSTrainConfigV2(
@@ -191,6 +213,8 @@ def main() -> None:
         lr_schedule=args.lr_schedule,
         lr_min=args.lr_min,
         weight_decay=args.weight_decay,
+        slot_legality_loss_weight=args.slot_legality_loss_weight,
+        articulation_loss_weight=args.articulation_loss_weight,
         buffer_max_size=args.buffer_size,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_keep_every=args.checkpoint_keep_every,
@@ -202,18 +226,25 @@ def main() -> None:
         virtual_q_penalty=args.virtual_q_penalty,
         non_root_sigma=args.non_root_sigma,
         compile_forward=args.compile_forward,
+        model_version=args.model_version,
         augment_prob=args.augment_prob,
     )
 
-    net = HivePRSTransformerV2(net_config)
+    net_cls = HivePRSTransformerV3 if args.model_version == "v3" else HivePRSTransformerV2
+    net = net_cls(net_config)
     n_params = net.count_parameters()
-    print(f"PRS v2 Transformer: {n_params:,} parameters")
+    print(f"PRS {args.model_version} Transformer: {n_params:,} parameters")
     print(
         f"  d_model={net_config.d_model}, heads={net_config.num_heads}, "
         f"layers={net_config.num_layers}, dim_ff={net_config.dim_feedforward}"
     )
     print("  Policy head: structured 813-slot legal-masked head")
     print(f"  Position table: {net_config.max_positions} (23x23 + 1 off-board)")
+    if args.model_version == "v3":
+        print(
+            f"  Relative attention bias: per-head row/col offsets clipped at "
+            f"{net_config.relative_position_clip}"
+        )
     del net
 
     trainer = PRSTrainerV2(train_config, net_config)

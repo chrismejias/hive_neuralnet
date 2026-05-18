@@ -1,0 +1,106 @@
+"""Compatibility wrapper for the archived move-conditioned trainer CLI."""
+
+from archive.legacy_mc.hive_mc.train_mc import main
+
+<<<<<<<< HEAD:hive_mc/train_mc.py
+__all__ = ["main"]
+========
+from archive.legacy_mc.hive_mc.mc_trainer import MCTrainConfig, MCTrainer
+from archive.legacy_mc.hive_mc.mc_transformer import HiveMoveTransformer, MCTransformerConfig
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Train the move-conditioned Hive transformer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Long-running background launch:
+              cd /workspace/hive_neuralnet
+              mkdir -p checkpoints_mc
+              nohup python3.11 -u -m hive_mc.train_mc \\
+                --iterations 1500 \\
+                --games 128 \\
+                --simulations 256 \\
+                --gumbel-considered 16 \\
+                --checkpoint-dir checkpoints_mc \\
+                --checkpoint-keep-every 50 \\
+                >> checkpoints_mc/training.log 2>&1 < /dev/null &
+              echo $!
+
+            Checks:
+              pgrep -af 'hive_mc.train_mc|train_mc'
+              tail -f checkpoints_mc/training.log
+
+            Notes:
+              - python -u keeps startup and per-iteration output unbuffered.
+              - < /dev/null prevents the process from inheriting a terminal stdin.
+              - If launched through a tool that kills detached children, use a
+                persistent shell/tmux/session and run the same command in it.
+        """),
+    )
+    p.add_argument("--d-model", type=int, default=128)
+    p.add_argument("--num-heads", type=int, default=8)
+    p.add_argument("--num-layers", type=int, default=3)
+    p.add_argument("--dim-ff", type=int, default=512)
+    p.add_argument("--max-candidates", type=int, default=16)
+
+    p.add_argument("--iterations", type=int, default=1500)
+    p.add_argument("--games", type=int, default=128)
+    p.add_argument("--simulations", type=int, default=128)
+    p.add_argument("--gumbel-considered", type=int, default=16)
+    p.add_argument("--max-game-length", type=int, default=300)
+
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--buffer-size", type=int, default=100_000)
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints_mc")
+    p.add_argument("--checkpoint-keep-every", type=int, default=0)
+    p.add_argument("--expansion-mask", type=int, default=0)
+    p.add_argument("--draw-keep-rate", type=float, default=1.0)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    net_config = MCTransformerConfig(
+        d_model=args.d_model,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        dim_feedforward=args.dim_ff,
+        max_candidates=args.max_candidates,
+    )
+    train_config = MCTrainConfig(
+        num_iterations=args.iterations,
+        games_per_batch=args.games,
+        mcts_simulations=args.simulations,
+        max_num_considered=args.gumbel_considered,
+        max_game_length=args.max_game_length,
+        batch_size=args.batch_size,
+        num_epochs=args.epochs,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        buffer_max_size=args.buffer_size,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_keep_every=args.checkpoint_keep_every,
+        expansion_mask=args.expansion_mask,
+        draw_keep_rate=args.draw_keep_rate,
+    )
+
+    net = HiveMoveTransformer(net_config)
+    n_params = net.count_parameters()
+    print(f"Move-conditioned transformer: {n_params:,} parameters")
+    print(f"  Trunk: {net_config.num_layers} layers, d={net_config.d_model}")
+    print(f"  Screening head: lightweight (move features + root CLS)")
+    print(f"  Action head: successor comparison (root vs child CLS)")
+    print(f"  Max candidates: {net_config.max_candidates}")
+    del net
+
+    trainer = MCTrainer(train_config, net_config)
+    trainer.run()
+
+
+if __name__ == "__main__":
+    main()
+>>>>>>>> 7c7d146 (Refactor legacy transformer and MC packages):archive/legacy_mc/hive_mc/train_mc.py

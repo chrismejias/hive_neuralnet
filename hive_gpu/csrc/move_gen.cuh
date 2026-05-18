@@ -697,6 +697,8 @@ __device__ inline int gen_pillbug_throws(const HiveState& s, int pb_cell,
     for (int dt = 0; dt < NUM_DIRS; dt++) {
         int16_t target_cell = NEIGHBORS[pb_cell][dt];
         if (target_cell < 0 || !s.occupied.get(target_cell)) continue;
+        if (s.height[target_cell] != 1) continue;
+        if (is_stunned_cell(s, target_cell)) continue;
 
         // Target must be on top and not pinned
         if (is_pinned(cache, target_cell)) continue;
@@ -734,6 +736,164 @@ __device__ inline int gen_pillbug_throws(const HiveState& s, int pb_cell,
         }
     }
 
+    return count;
+}
+
+__device__ inline bool has_pillbug_throw_for_target(
+    const HiveState& s,
+    int pb_cell,
+    int target_cell,
+    const MovegenStateCache& cache
+) {
+    if (target_cell < 0 || !s.occupied.get(target_cell)) return false;
+    if (s.height[target_cell] != 1) return false;
+    if (is_stunned_cell(s, target_cell)) return false;
+    if (is_pinned(cache, target_cell)) return false;
+
+    int pb_height = s.height[pb_cell];
+    int lift_h = max(s.height[target_cell] - 1, pb_height);
+    int opp_dt = find_direction(target_cell, pb_cell);
+    if (opp_dt < 0) return false;
+    if (elevated_gate_blocked(s, target_cell, opp_dt, lift_h)) return false;
+
+    for (int dd = 0; dd < NUM_DIRS; dd++) {
+        int16_t dest_cell = NEIGHBORS[pb_cell][dd];
+        if (dest_cell < 0 || dest_cell == target_cell) continue;
+        if (s.occupied.get(dest_cell)) continue;
+        int drop_h = max(pb_height, 0);
+        if (!elevated_gate_blocked(s, pb_cell, dd, drop_h)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+__device__ inline bool has_queen_escape_move(const HiveState& s) {
+    Color color = current_player(s);
+    if (!is_queen_placed(s, color)) return false;
+    int qcell = s.queen_cell[(int)color];
+    if (qcell < 0 || qcell >= NUM_CELLS || !s.occupied.get(qcell)) return false;
+
+    MovegenStateCache cache;
+    init_movegen_state_cache(s, cache);
+
+    if (top_piece_type_at(s, qcell) == PT_QUEEN
+        && top_piece_color_at(s, qcell) == color
+        && !is_pinned(cache, qcell)
+        && has_queen_move(s, qcell)) {
+        return true;
+    }
+
+    const Bitboard& my_pieces = (color == WHITE) ? s.white_top : s.black_top;
+    for (int wi = 0; wi < BB_WORDS; wi++) {
+        uint64_t bits = my_pieces.w[wi];
+        while (bits) {
+            int bit = __ffsll(bits) - 1;
+            int cell = wi * 64 + bit;
+            bits &= bits - 1;
+            if (cell >= NUM_CELLS) continue;
+
+            PieceType pt = top_piece_type_at(s, cell);
+            if (pt == PT_PILLBUG) {
+                if (find_direction(cell, qcell) >= 0
+                    && has_pillbug_throw_for_target(s, cell, qcell, cache)) {
+                    return true;
+                }
+            } else if (pt == PT_MOSQUITO && s.height[cell] == 1) {
+                bool adj_pillbug = false;
+                for (int d = 0; d < NUM_DIRS; d++) {
+                    int16_t nb = NEIGHBORS[cell][d];
+                    if (nb >= 0 && s.occupied.get(nb)
+                        && top_piece_type_at(s, nb) == PT_PILLBUG) {
+                        adj_pillbug = true;
+                        break;
+                    }
+                }
+                if (adj_pillbug && find_direction(cell, qcell) >= 0
+                    && has_pillbug_throw_for_target(s, cell, qcell, cache)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+__device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out);
+
+__device__ __forceinline__ int queen_surround_count_for_color_device(
+    const HiveState& s,
+    Color c
+) {
+    if (!is_queen_placed(s, c)) return 0;
+    return num_occupied_neighbors(s, s.queen_cell[(int)c]);
+}
+
+__device__ inline int lone_empty_neighbor_of_queen(
+    const HiveState& s,
+    Color target
+) {
+    if (!is_queen_placed(s, target)) return -1;
+    int qcell = s.queen_cell[(int)target];
+    if (qcell < 0 || qcell >= NUM_CELLS) return -1;
+    if (num_occupied_neighbors(s, qcell) != 5) return -1;
+
+    int empty_nb = -1;
+    for (int d = 0; d < NUM_DIRS; ++d) {
+        int16_t nb = NEIGHBORS[qcell][d];
+        if (nb < 0) continue;
+        if (!s.occupied.get(nb)) {
+            if (empty_nb >= 0) return -1;
+            empty_nb = nb;
+        }
+    }
+    return empty_nb;
+}
+
+__device__ inline bool has_immediate_surround_win_for_current_player(
+    const HiveState& s
+) {
+    Color player = current_player(s);
+    Color target = (player == WHITE) ? BLACK : WHITE;
+    int winning_cell = lone_empty_neighbor_of_queen(s, target);
+    if (winning_cell < 0) return false;
+
+    GPUMove moves[MAX_LEGAL_MOVES];
+    int nlegal = generate_legal_moves(s, moves);
+    for (int i = 0; i < nlegal; ++i) {
+        if ((int)moves[i].to_cell != winning_cell) continue;
+        HiveState child = s;
+        apply_move(child, moves[i]);
+        if ((player == WHITE && child.result == WHITE_WINS) ||
+            (player == BLACK && child.result == BLACK_WINS)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+__device__ inline int generate_non_decreasing_surround_replies(
+    const HiveState& s,
+    Color target,
+    int baseline_surround,
+    GPUMove* out,
+    bool& all_non_decreasing
+) {
+    all_non_decreasing = true;
+    GPUMove all_moves[MAX_LEGAL_MOVES];
+    int nlegal = generate_legal_moves(s, all_moves);
+    int count = 0;
+    for (int i = 0; i < nlegal; ++i) {
+        HiveState child = s;
+        apply_move(child, all_moves[i]);
+        int next_surround = queen_surround_count_for_color_device(child, target);
+        if (next_surround < baseline_surround) {
+            all_non_decreasing = false;
+            return 0;
+        }
+        out[count++] = all_moves[i];
+    }
     return count;
 }
 
@@ -1068,6 +1228,7 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
 
                 // Only top pieces can move
                 // (white_top/black_top already tracks top-piece ownership)
+                if (is_stunned_cell(s, cell)) continue;
 
                 // Check if pinned
                 if (is_pinned(cache, cell)) continue;
@@ -1224,6 +1385,8 @@ __device__ inline void summarize_pillbug_throws_for_fnn(
     for (int dt = 0; dt < NUM_DIRS; dt++) {
         int16_t target_cell = NEIGHBORS[pb_cell][dt];
         if (target_cell < 0 || !s.occupied.get(target_cell)) continue;
+        if (s.height[target_cell] != 1) continue;
+        if (is_stunned_cell(s, target_cell)) continue;
         if (is_pinned(cache, target_cell)) continue;
 
         int lift_h = max(s.height[target_cell] - 1, pb_height);
@@ -1314,6 +1477,7 @@ __device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* ou
             int cell = wi * 64 + bit;
             bits &= bits - 1;
             if (cell >= NUM_CELLS) continue;
+            if (is_stunned_cell(s, cell)) continue;
             if (is_pinned(cache, cell)) continue;
 
             bool has_move = false;

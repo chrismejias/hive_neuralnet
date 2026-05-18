@@ -17,8 +17,8 @@ import sys
 
 from hive_engine.device import get_device, device_summary
 
-from hive_transformer.transformer_net import TransformerConfig
-from hive_transformer.transformer_trainer import (
+from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig
+from archive.modules.hive_transformer_cpu.transformer_trainer import (
     TransformerTrainConfig,
     TransformerTrainer,
 )
