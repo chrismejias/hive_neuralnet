@@ -828,6 +828,81 @@ def _reset_tree_rows(
         tree["child_init_q"][row_t] = 0
 
 
+def _slice_tree_rows(
+    tree: dict[str, torch.Tensor] | None,
+    rows: np.ndarray,
+) -> dict[str, torch.Tensor] | None:
+    if tree is None:
+        return None
+    if rows.size == 0:
+        return None
+    row_t = torch.from_numpy(rows.astype(np.int64, copy=False)).to("cuda")
+    out: dict[str, torch.Tensor] = {}
+    for key, tensor in tree.items():
+        out[key] = tensor.index_select(0, row_t).clone()
+    return out
+
+
+def _restore_tree_rows(
+    tree: dict[str, torch.Tensor] | None,
+    rows: np.ndarray,
+    compact_tree: dict[str, torch.Tensor] | None,
+) -> None:
+    if tree is None or compact_tree is None or rows.size == 0:
+        return
+    row_t = torch.from_numpy(rows.astype(np.int64, copy=False)).to("cuda")
+    for key, tensor in compact_tree.items():
+        tree[key].index_copy_(0, row_t, tensor)
+
+
+def _run_side_rows(
+    *,
+    model_type: ModelType,
+    orch: object,
+    tree: dict[str, torch.Tensor] | None,
+    states: torch.Tensor,
+    rows: np.ndarray,
+    move_numbers: np.ndarray,
+    stochastic: bool,
+    gumbel_noise_scale: float,
+    policy_only: bool,
+) -> None:
+    if rows.size == 0:
+        return
+
+    row_t = torch.from_numpy(rows.astype(np.int64, copy=False)).to("cuda")
+    sub_states = states.index_select(0, row_t).contiguous()
+    sub_tree = _slice_tree_rows(tree, rows)
+    sub_active = np.ones(rows.size, dtype=bool)
+    sub_move_numbers = move_numbers[rows].copy()
+
+    result = choose_moves(
+        model_type,
+        orch,
+        sub_states,
+        active_mask=sub_active,
+        tree=sub_tree,
+        move_numbers=sub_move_numbers,
+        stochastic=stochastic,
+        gumbel_noise_scale=gumbel_noise_scale,
+        policy_only=policy_only,
+    )
+
+    move_t = torch.from_numpy(result.move_bytes).cuda()
+    orch.ext.apply_moves_batch(sub_states, move_t, int(rows.size))
+    sub_move_numbers += 1
+
+    if sub_tree is not None:
+        child_nodes = _tree_child_nodes_from_slots(sub_tree, result.chosen_slots)
+        stale = np.array(child_nodes, dtype=np.int64) < 0
+        _reset_tree_rows(sub_tree, np.flatnonzero(stale))
+        orch._reroot_tree(sub_tree, int(rows.size), [True] * int(rows.size), child_nodes)
+        _restore_tree_rows(tree, rows, sub_tree)
+
+    states.index_copy_(0, row_t, sub_states)
+    move_numbers[rows] = sub_move_numbers
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="General arena: compare FNN and PRS checkpoints in any pairing.",
@@ -978,62 +1053,38 @@ def main() -> None:
         white_to_move = (turns % 2 == 0)
         white_turn = active & (white_to_move == white_is_model_a)
         black_turn = active & ~white_turn
-
-        white_result = choose_moves(
-            args.white_model,
-            white_orch,
-            states,
-            active_mask=white_turn,
+        white_rows = np.flatnonzero(white_turn)
+        black_rows = np.flatnonzero(black_turn)
+        _run_side_rows(
+            model_type=args.white_model,
+            orch=white_orch,
             tree=white_tree,
+            states=states,
+            rows=white_rows,
             move_numbers=move_numbers,
             stochastic=args.stochastic,
             gumbel_noise_scale=args.gumbel_noise_scale,
             policy_only=args.white_policy_only,
         )
-        black_result = choose_moves(
-            args.black_model,
-            black_orch,
-            states,
-            active_mask=black_turn,
+        _run_side_rows(
+            model_type=args.black_model,
+            orch=black_orch,
             tree=black_tree,
+            states=states,
+            rows=black_rows,
             move_numbers=move_numbers,
             stochastic=args.stochastic,
             gumbel_noise_scale=args.gumbel_noise_scale,
             policy_only=args.black_policy_only,
         )
 
-        move_bytes = np.zeros((B, ext.SIZEOF_GPU_MOVE), dtype=np.uint8)
-        if white_turn.any():
-            move_bytes[white_turn] = white_result.move_bytes[white_turn]
-        if black_turn.any():
-            move_bytes[black_turn] = black_result.move_bytes[black_turn]
-
-        moved_mask = white_turn | black_turn
-        chosen_slots_all = np.full(B, -1, dtype=np.int64)
-        chosen_slots_all[white_turn] = white_result.chosen_slots[white_turn]
-        chosen_slots_all[black_turn] = black_result.chosen_slots[black_turn]
-
-        white_child_nodes = _tree_child_nodes_from_slots(white_tree, chosen_slots_all)
-        black_child_nodes = _tree_child_nodes_from_slots(black_tree, chosen_slots_all)
-
-        active_idx = np.flatnonzero(active)
-        if active_idx.size == 0:
+        moved_rows = np.concatenate([white_rows, black_rows])
+        if moved_rows.size == 0:
             break
-        sub_states = states[active_idx].clone()
-        sub_moves = torch.from_numpy(move_bytes[active_idx]).cuda()
-        ext.apply_moves_batch(sub_states, sub_moves, int(active_idx.size))
-        states[active_idx] = sub_states
-        move_numbers[active_idx] += 1
-
-        stale_white = moved_mask & (np.array(white_child_nodes, dtype=np.int64) < 0)
-        stale_black = moved_mask & (np.array(black_child_nodes, dtype=np.int64) < 0)
-        _reset_tree_rows(white_tree, np.flatnonzero(stale_white))
-        _reset_tree_rows(black_tree, np.flatnonzero(stale_black))
-        white_orch._reroot_tree(white_tree, B, moved_mask.tolist(), white_child_nodes)
-        black_orch._reroot_tree(black_tree, B, moved_mask.tolist(), black_child_nodes)
-
-        final_results = ext.check_results_batch(states, B).cpu().numpy()
-        active = active & (final_results == 0) & (move_numbers < args.max_game_length)
+        moved_row_t = torch.from_numpy(moved_rows.astype(np.int64, copy=False)).to("cuda")
+        moved_states = states.index_select(0, moved_row_t)
+        moved_results = ext.check_results_batch(moved_states, int(moved_rows.size)).cpu().numpy()
+        active[moved_rows] = (moved_results == 0) & (move_numbers[moved_rows] < args.max_game_length)
 
     white_wins = 0
     black_wins = 0
