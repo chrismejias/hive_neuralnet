@@ -17,7 +17,7 @@ from hive_engine.device import get_device
 from hive_engine.elo import EloTracker
 from hive_fnn.fnn_replay_buffer import FNNReplayBuffer, FNNTrainingBatch
 from hive_fnn.fnn_trainer import compute_fnn_loss
-from hive_fnn_transformer.gpu_encoder import HybridTransformerGPUEncoder
+from hive_fnn_transformer.graph_types import HybridPieceTensorBatch
 from hive_fnn_transformer.fnn_transformer_net import HybridGNNConfig, HiveHybridGNN
 from hive_fnn_transformer.fnn_transformer_mcts_orchestrator import (
     HybridMCTSConfig,
@@ -62,6 +62,7 @@ class HybridTrainConfig:
     probe_win_in_one: bool = True
     probe_check_opponent_wins: bool = True
     probe_win_in_two: bool = True
+    policy_target_temperature: float = 2.0
 
 
 def _simulations_for_iteration(
@@ -85,11 +86,10 @@ class HybridTrainer:
         self.device = get_device(self.config.device)
         self.ext = hive_gpu.load_extension()
         self.best_net = HiveHybridGNN(self.net_config).to(self.device)
-        self.graph_encoder = HybridTransformerGPUEncoder()
         self.buffer = FNNReplayBuffer(
             self.config.buffer_max_size,
             device=self.device,
-            cache_root_features=self.device.type == "cuda",
+            cache_root_features=False,
             gpu_sampling=self.device.type == "cuda",
         )
         self.elo_tracker = EloTracker()
@@ -100,6 +100,11 @@ class HybridTrainer:
             else self.device.type == "cuda"
         )
         self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
+        self.optimizer = optim.Adam(
+            self.best_net.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+        )
 
     def _cleanup(self) -> None:
         if self.device.type == "cuda":
@@ -144,10 +149,18 @@ class HybridTrainer:
             )
 
             t0 = time.time()
-            loss, loss_dict = self._train(iteration)
+            loss, loss_dict, timing_dict = self._train(iteration)
             elo = self.elo_tracker.update(1.0, 0)
             parts = " ".join(f"{k}={v:.4f}" for k, v in loss_dict.items())
             print(f"  Training: loss={loss:.4f}, {time.time() - t0:.1f}s [{parts}]")
+            if timing_dict:
+                timing_parts = " ".join(
+                    f"{k}={v:.2f}s" for k, v in timing_dict.items() if k != "num_batches"
+                )
+                print(
+                    f"            breakdown: {timing_parts} "
+                    f"(batches={int(timing_dict.get('num_batches', 0))})"
+                )
             self._save_checkpoint(iteration)
             print(f"  ELO: {elo:.0f}  Buffer: {len(self.buffer)}")
 
@@ -175,6 +188,7 @@ class HybridTrainer:
                 probe_win_in_one=cfg.probe_win_in_one,
                 probe_check_opponent_wins=cfg.probe_check_opponent_wins,
                 probe_win_in_two=cfg.probe_win_in_two,
+                policy_target_temperature=cfg.policy_target_temperature,
             ),
         )
         raw = orch.self_play_batch()
@@ -207,30 +221,72 @@ class HybridTrainer:
         cached_root_features: torch.Tensor | None = None,
         cached_legal_moves: torch.Tensor | None = None,
     ):
-        if cached_root_features is not None and cached_legal_moves is not None:
-            if num_actions is None:
-                raise ValueError("Cached legal moves require cached action counts")
-            legal_moves = cached_legal_moves
-            root_features = cached_root_features.float()
-            num_legal = num_actions.to(torch.int64)
-        else:
-            legal_moves, num_legal, root_features = (
-                self.ext.generate_legal_moves_and_fnn_features_batch(
-                    state_bytes, batch_size,
-                )
+        if self.device.type == "cuda":
+            (
+                legal_moves,
+                num_legal,
+                root_features,
+                token_features,
+                token_q,
+                token_r,
+                token_z,
+                token_mask,
+                global_features,
+                move_features_per_legal,
+            ) = self.ext.generate_legal_moves_and_hybrid_root_features_batch(
+                state_bytes, batch_size,
             )
-        graph_batch = self.graph_encoder.encode_batch(
-            state_bytes,
-            batch_size,
-            legal_moves=legal_moves,
-            num_legal=num_legal,
-        )
-        move_features_per_legal = self.ext.hybrid_transformer_move_features_batch(
-            state_bytes,
-            legal_moves,
-            num_legal,
-            batch_size,
-        )
+            graph_batch = HybridPieceTensorBatch(
+                token_features=token_features,
+                token_q=token_q,
+                token_r=token_r,
+                token_z=token_z,
+                token_mask=token_mask,
+                global_features=global_features,
+                num_tokens=token_mask.sum(dim=1, dtype=torch.int32),
+            )
+        else:
+            if cached_root_features is not None and cached_legal_moves is not None:
+                if num_actions is None:
+                    raise ValueError("Cached legal moves require cached action counts")
+                legal_moves = cached_legal_moves
+                root_features = cached_root_features.float()
+                num_legal = num_actions.to(torch.int64)
+            else:
+                legal_moves, num_legal, root_features = (
+                    self.ext.generate_legal_moves_and_fnn_features_batch(
+                        state_bytes, batch_size,
+                    )
+                )
+            (
+                token_features,
+                token_q,
+                token_r,
+                token_z,
+                token_mask,
+                global_features,
+                num_tokens,
+            ) = self.ext.hybrid_transformer_encode_with_moves_batch(
+                state_bytes,
+                legal_moves,
+                num_legal,
+                batch_size,
+            )
+            graph_batch = HybridPieceTensorBatch(
+                token_features=token_features,
+                token_q=token_q,
+                token_r=token_r,
+                token_z=token_z,
+                token_mask=token_mask,
+                global_features=global_features,
+                num_tokens=num_tokens,
+            )
+            move_features_per_legal = self.ext.hybrid_transformer_move_features_batch(
+                state_bytes,
+                legal_moves,
+                num_legal,
+                batch_size,
+            )
         num_actions = num_legal.to(torch.int64)
 
         max_legal = legal_moves.shape[1]
@@ -263,18 +319,27 @@ class HybridTrainer:
         move_features = move_features_per_legal[valid]
         return root_features, succ_features, action_to_root, num_actions, graph_batch, move_features
 
-    def _train(self, iteration: int) -> tuple[float, dict[str, float]]:
+    def _set_optimizer_lr(self, iteration: int) -> None:
+        lr = self._lr(iteration)
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+
+    def _train(self, iteration: int) -> tuple[float, dict[str, float], dict[str, float]]:
         cfg = self.config
         if len(self.buffer) < cfg.batch_size:
-            return 0.0, {}
+            return 0.0, {}, {}
 
-        opt = optim.Adam(
-            self.best_net.parameters(),
-            lr=self._lr(iteration),
-            weight_decay=cfg.weight_decay,
-        )
+        self._set_optimizer_lr(iteration)
+        opt = self.optimizer
         total_loss = 0.0
         comp_sums: dict[str, float] = {}
+        timing_sums: dict[str, float] = {
+            "sample_wait": 0.0,
+            "sample_queue": 0.0,
+            "feature_build": 0.0,
+            "forward_loss": 0.0,
+            "backward_step": 0.0,
+        }
         n_batches = 0
         self.best_net.train()
         prefetch_stream = (
@@ -293,15 +358,22 @@ class HybridTrainer:
 
         for _epoch in range(cfg.num_epochs):
             batches_per_epoch = max(1, len(self.buffer) // cfg.batch_size)
+            t_sample = time.perf_counter()
             next_batch = fetch_next_batch()
+            timing_sums["sample_queue"] += time.perf_counter() - t_sample
             for _ in range(batches_per_epoch):
+                t_wait = time.perf_counter()
                 if prefetch_stream is not None:
                     torch.cuda.current_stream(self.device).wait_stream(prefetch_stream)
                 batch = next_batch
+                timing_sums["sample_wait"] += time.perf_counter() - t_wait
                 if n_batches + 1 < batches_per_epoch * cfg.num_epochs:
+                    t_sample = time.perf_counter()
                     next_batch = fetch_next_batch()
+                    timing_sums["sample_queue"] += time.perf_counter() - t_sample
 
                 opt.zero_grad(set_to_none=True)
+                t_build = time.perf_counter()
                 root_feat, succ_feat, a2r, n_act, graph_batch, move_features = self._build_forward_batch(
                     batch.state_bytes,
                     batch.state_bytes.shape[0],
@@ -309,8 +381,10 @@ class HybridTrainer:
                     batch.root_features,
                     batch.legal_moves,
                 )
+                timing_sums["feature_build"] += time.perf_counter() - t_build
 
                 if self.use_amp and self.scaler is not None:
+                    t_fwd = time.perf_counter()
                     with torch.amp.autocast("cuda"):
                         action_logits, root_values = self.best_net(
                             root_feat, succ_feat, a2r, n_act, graph_batch, move_features,
@@ -324,6 +398,8 @@ class HybridTrainer:
                             batch.policy_mask,
                             batch.value_mask,
                         )
+                    timing_sums["forward_loss"] += time.perf_counter() - t_fwd
+                    t_bwd = time.perf_counter()
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(
@@ -331,7 +407,9 @@ class HybridTrainer:
                     )
                     self.scaler.step(opt)
                     self.scaler.update()
+                    timing_sums["backward_step"] += time.perf_counter() - t_bwd
                 else:
+                    t_fwd = time.perf_counter()
                     action_logits, root_values = self.best_net(
                         root_feat, succ_feat, a2r, n_act, graph_batch, move_features,
                     )
@@ -344,11 +422,14 @@ class HybridTrainer:
                         batch.policy_mask,
                         batch.value_mask,
                     )
+                    timing_sums["forward_loss"] += time.perf_counter() - t_fwd
+                    t_bwd = time.perf_counter()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(
                         self.best_net.parameters(), cfg.max_grad_norm,
                     )
                     opt.step()
+                    timing_sums["backward_step"] += time.perf_counter() - t_bwd
 
                 total_loss += float(loss.item())
                 n_batches += 1
@@ -356,8 +437,13 @@ class HybridTrainer:
                     comp_sums[k] = comp_sums.get(k, 0.0) + float(v.item())
 
         if n_batches == 0:
-            return 0.0, {}
-        return total_loss / n_batches, {k: v / n_batches for k, v in comp_sums.items()}
+            return 0.0, {}, {}
+        timing_sums["num_batches"] = float(n_batches)
+        return (
+            total_loss / n_batches,
+            {k: v / n_batches for k, v in comp_sums.items()},
+            timing_sums,
+        )
 
     def _save_checkpoint(self, iteration: int) -> None:
         keep = self.config.checkpoint_keep_every
@@ -370,6 +456,12 @@ class HybridTrainer:
         torch.save(
             {
                 "model_state_dict": self.best_net.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scaler_state_dict": (
+                    self.scaler.state_dict()
+                    if self.scaler is not None
+                    else None
+                ),
                 "net_config": self.net_config,
                 "train_config": self.config,
                 "iteration": iteration,
@@ -391,6 +483,12 @@ class HybridTrainer:
                 state = dict(state)
                 state[key] = new
         self.best_net.load_state_dict(state)
+        opt_state = ckpt.get("optimizer_state_dict")
+        if opt_state is not None:
+            self.optimizer.load_state_dict(opt_state)
+        scaler_state = ckpt.get("scaler_state_dict")
+        if scaler_state is not None and self.scaler is not None:
+            self.scaler.load_state_dict(scaler_state)
         self._start_iter = int(ckpt["iteration"]) + 1
         print(f"Resumed from {path} (iter {ckpt['iteration']})")
 

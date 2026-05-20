@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--buffer-size", type=int, default=100_000)
+    p.add_argument("--policy-target-temperature", type=float, default=2.0)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints_fnn_transformer")
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
     p.add_argument("--resume", type=str, default=None)
@@ -147,6 +148,7 @@ def main() -> None:
         learning_rate=args.lr,
         weight_decay=args.weight_decay,
         buffer_max_size=args.buffer_size,
+        policy_target_temperature=args.policy_target_temperature,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_keep_every=args.checkpoint_keep_every,
         expansion_mask=args.expansion_mask,
