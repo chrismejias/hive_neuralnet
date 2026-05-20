@@ -305,6 +305,7 @@ __device__ inline void extract_fnn_features_device(
     }
 }
 
+#ifndef HIVE_CPU_NATIVE
 __global__ void extract_fnn_features_kernel(
     const HiveState* states,
     const GPUMove* legal_moves,   // [B, MAX_LEGAL_MOVES]
@@ -322,6 +323,7 @@ __global__ void extract_fnn_features_kernel(
         features_out + idx * FNN_FEAT_DIM
     );
 }
+#endif  // HIVE_CPU_NATIVE
 
 #endif  // __CUDACC__
 

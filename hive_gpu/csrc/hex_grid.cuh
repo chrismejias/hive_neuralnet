@@ -118,10 +118,12 @@ __constant__ int16_t SLIDE_FLANKS[NUM_CELLS][NUM_DIRS][3];
 /**
  * Copy host tables to CUDA constant memory. Call once after init_hex_tables().
  */
+#ifndef HIVE_CPU_NATIVE
 inline void copy_tables_to_device() {
     cudaMemcpyToSymbol(NEIGHBORS, HOST_NEIGHBOR_TABLE, sizeof(HOST_NEIGHBOR_TABLE));
     cudaMemcpyToSymbol(SLIDE_FLANKS, HOST_SLIDE_TABLE, sizeof(HOST_SLIDE_TABLE));
 }
+#endif  // HIVE_CPU_NATIVE
 
 // ── Device helper functions ─────────────────────────────────────────
 
