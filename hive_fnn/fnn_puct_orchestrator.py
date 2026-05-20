@@ -76,6 +76,7 @@ class FNNPUCTOrchestrator:
             "visit_count": torch.zeros(B, M, dtype=torch.int32, device=dev),
             "total_value": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "prior": torch.zeros(B, M, dtype=torch.float32, device=dev),
+            "virtual_q_penalty": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "parent_idx": torch.full((B, M), -1, dtype=torch.int32, device=dev),
             "move_bytes": torch.zeros(B, M, self._move_size, dtype=torch.uint8, device=dev),
             "action_idx": torch.full((B, M), -1, dtype=torch.int32, device=dev),
@@ -85,12 +86,14 @@ class FNNPUCTOrchestrator:
             "terminal_value": torch.zeros(B, M, dtype=torch.float32, device=dev),
             "node_count": torch.ones(B, dtype=torch.int32, device=dev),
             "root_node": torch.zeros(B, dtype=torch.int32, device=dev),
+            "child_init_q": torch.zeros(B, M, dtype=torch.float32, device=dev),
         }
 
     def _reset_tree(self, tree: dict[str, torch.Tensor]) -> None:
         tree["visit_count"].zero_()
         tree["total_value"].zero_()
         tree["prior"].zero_()
+        tree["virtual_q_penalty"].zero_()
         tree["parent_idx"].fill_(-1)
         tree["move_bytes"].zero_()
         tree["action_idx"].fill_(-1)
@@ -100,10 +103,12 @@ class FNNPUCTOrchestrator:
         tree["terminal_value"].zero_()
         tree["node_count"].fill_(1)
         tree["root_node"].zero_()
+        tree["child_init_q"].zero_()
 
     def _tree_args(self, tree: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         return [
             tree["visit_count"], tree["total_value"], tree["prior"],
+            tree["virtual_q_penalty"],
             tree["parent_idx"], tree["move_bytes"], tree["action_idx"],
             tree["first_child"], tree["num_children"],
             tree["is_terminal"], tree["terminal_value"], tree["node_count"],
@@ -170,17 +175,18 @@ class FNNPUCTOrchestrator:
             if max_n == 0:
                 break
 
-            priors_per_legal, _root_vals = self._eval_states(
+            priors_per_legal, _root_vals, child_q_per_legal = self._eval_states(
                 states, legal_moves, num_legal, B, root_features,
             )
             if bool(has_immediate_win.any().item()):
                 priors_per_legal.zero_()
                 priors_per_legal[has_immediate_win, immediate_wins[has_immediate_win]] = 1.0
+                child_q_per_legal.zero_()
 
             game_active_t = has_actions.to(torch.int8)
             self._expand_root_if_needed(
                 tree, states, legal_moves, num_legal,
-                priors_per_legal, game_active_t, B,
+                priors_per_legal, child_q_per_legal, game_active_t, B,
             )
             self._apply_root_dirichlet(tree, B, has_actions)
 
@@ -280,7 +286,7 @@ class FNNPUCTOrchestrator:
                 ))
         return examples
 
-    def _expand_root_if_needed(self, tree, states, legal_moves, num_legal, priors_per_legal, game_active_t, B):
+    def _expand_root_if_needed(self, tree, states, legal_moves, num_legal, priors_per_legal, child_q_per_legal, game_active_t, B):
         row = torch.arange(B, device="cuda")
         root_node = tree["root_node"]
         fc = tree["first_child"][row, root_node]
@@ -292,6 +298,7 @@ class FNNPUCTOrchestrator:
         results = self.ext.check_results_batch(states, B)
         self.ext.mcts_expand_dense_priors_batch(
             *self._tree_args(tree),
+            tree["child_init_q"], child_q_per_legal,
             leaf_indices, states,
             legal_moves, num_legal, priors_per_legal, results,
             B, B, self._max_nodes,
@@ -334,9 +341,11 @@ class FNNPUCTOrchestrator:
             leaf_idx, move_paths, path_lens, vl_paths, vl_lens = (
                 self.ext.mcts_select_with_root_mask_batch(
                     *self._tree_args(tree),
+                    tree["child_init_q"],
                     game_active_t, tree["root_node"],
                     alive_mask, self._max_legal,
                     cfg.c_puct, B, actual_w, self._max_nodes,
+                    False, 4.0, 0.0,
                 )
             )
 
@@ -352,16 +361,17 @@ class FNNPUCTOrchestrator:
                     leaf_states[:total], total,
                 )
             )
-            priors_leaf, leaf_vals = self._eval_states(
+            priors_leaf, leaf_vals, child_q_leaf = self._eval_states(
                 leaf_states[:total], legal_moves, num_legal, total, leaf_features,
             )
 
             self.ext.mcts_expand_and_backprop_dense_priors_batch(
                 *self._tree_args(tree),
+                tree["child_init_q"], child_q_leaf,
                 leaf_idx[:total], leaf_states[:total],
                 legal_moves, num_legal, priors_leaf, results,
                 leaf_vals, vl_paths[:total], vl_lens[:total],
-                B, total, self._max_nodes,
+                B, total, self._max_nodes, 0.0,
             )
 
     def _gather_root_child_stats(self, tree, B) -> tuple[torch.Tensor, torch.Tensor]:
@@ -407,6 +417,7 @@ class FNNPUCTOrchestrator:
                 tree["terminal_value"][i].zero_()
                 tree["node_count"][i] = 1
                 tree["root_node"][i] = 0
+                tree["child_init_q"][i].zero_()
             return
 
         # Legacy behavior: keep subtree rooted at chosen child.

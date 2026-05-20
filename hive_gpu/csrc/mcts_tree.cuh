@@ -32,6 +32,7 @@ struct MCTSTree {
     int*     visit_count;      // [B, max_nodes]
     float*   total_value;      // [B, max_nodes]
     float*   prior;            // [B, max_nodes]
+    float*   virtual_q_penalty; // [B, max_nodes] temporary deterministic-wave penalty
     int*     parent_idx;       // [B, max_nodes]  (-1 = no parent)
     uint8_t* move_bytes;       // [B, max_nodes, sizeof(GPUMove)]
     int*     action_idx;       // [B, max_nodes]  (-1 = root/none)
@@ -58,10 +59,87 @@ __device__ __forceinline__ float puct_score(
     int pi = tree_idx(t, game, parent_node);
     int child_visits = t.visit_count[ci];
     float q = (child_visits > 0) ? (-t.total_value[ci] / (float)child_visits) : 0.0f;
+    q -= t.virtual_q_penalty[ci];
     float exploration = c_puct * t.prior[ci]
                       * sqrtf((float)t.visit_count[pi])
                       / (1.0f + (float)child_visits);
     return q + exploration;
+}
+
+__device__ __forceinline__ float node_mean_value(
+    const MCTSTree& t, int game, int node
+) {
+    int ni = tree_idx(t, game, node);
+    int visits = t.visit_count[ni];
+    return (visits > 0) ? (t.total_value[ni] / (float)visits) : 0.0f;
+}
+
+__device__ __forceinline__ int deterministic_completed_q_child(
+    const MCTSTree& t, int game, int parent_node,
+    int first_child, int num_children,
+    float non_root_sigma,
+    const float* child_init_q  // [B, max_nodes] initial Q from parent's perspective
+) {
+    float sum_visits = 0.0f;
+
+    for (int c = 0; c < num_children; c++) {
+        int child_node = first_child + c;
+        if (child_node < 0 || child_node >= t.max_nodes) break;
+        int ci = tree_idx(t, game, child_node);
+        sum_visits += (float)t.visit_count[ci];
+    }
+
+    float sigma_scale = non_root_sigma;
+    float max_logit_q = -1e30f;
+    for (int c = 0; c < num_children; c++) {
+        int child_node = first_child + c;
+        if (child_node < 0 || child_node >= t.max_nodes) break;
+        int ci = tree_idx(t, game, child_node);
+        float visits = (float)t.visit_count[ci];
+        float q = (visits > 0.0f)
+            ? (-t.total_value[ci] / visits)
+            : child_init_q[ci];
+        q -= t.virtual_q_penalty[ci];
+        float prior = fmaxf(t.prior[ci], 1e-20f);
+        float logit_q = logf(prior) + sigma_scale * q;
+        if (logit_q > max_logit_q) max_logit_q = logit_q;
+    }
+    float sum_exp = 0.0f;
+    for (int c = 0; c < num_children; c++) {
+        int child_node = first_child + c;
+        if (child_node < 0 || child_node >= t.max_nodes) break;
+        int ci = tree_idx(t, game, child_node);
+        float visits = (float)t.visit_count[ci];
+        float q = (visits > 0.0f)
+            ? (-t.total_value[ci] / visits)
+            : child_init_q[ci];
+        q -= t.virtual_q_penalty[ci];
+        float prior = fmaxf(t.prior[ci], 1e-20f);
+        sum_exp += expf(logf(prior) + sigma_scale * q - max_logit_q);
+    }
+    sum_exp = fmaxf(sum_exp, 1e-20f);
+
+    int best_child = -1;
+    float best_score = -1e30f;
+    float denom = 1.0f + sum_visits;
+    for (int c = 0; c < num_children; c++) {
+        int child_node = first_child + c;
+        if (child_node < 0 || child_node >= t.max_nodes) break;
+        int ci = tree_idx(t, game, child_node);
+        float visits = (float)t.visit_count[ci];
+        float q = (visits > 0.0f)
+            ? (-t.total_value[ci] / visits)
+            : child_init_q[ci];
+        q -= t.virtual_q_penalty[ci];
+        float prior = fmaxf(t.prior[ci], 1e-20f);
+        float pi0 = expf(logf(prior) + sigma_scale * q - max_logit_q) / sum_exp;
+        float score = pi0 - (visits / denom);
+        if (score > best_score) {
+            best_score = score;
+            best_child = child_node;
+        }
+    }
+    return best_child;
 }
 
 // Map a GPUMove to an action index (same logic as legal_mask_kernel).
@@ -620,6 +698,10 @@ __global__ void mcts_select_with_root_mask_kernel(
     const int8_t* alive_mask,  // [B, max_root_children]
     int max_root_children,
     float c_puct,
+    bool deterministic_non_root,
+    float non_root_sigma,
+    float q_penalty,
+    const float* child_init_q, // [B, max_nodes] initial Q for unvisited children
     int B, int total_sims
 ) {
     int sim_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -642,6 +724,7 @@ __global__ void mcts_select_with_root_mask_kernel(
     int root_node = root_nodes[game];
     int node = root_node;
     int path_len = 0;
+    int vl_len = 0;
 
     for (int _loop_iter = 0; _loop_iter < MAX_TREE_DEPTH; _loop_iter++) {
         int ni = tree_idx(tree, game, node);
@@ -666,11 +749,20 @@ __global__ void mcts_select_with_root_mask_kernel(
             if (at_root) {
                 if (c >= max_root_children || !my_mask[c]) continue;
             }
+            if (deterministic_non_root && !at_root) {
+                break;
+            }
             float score = puct_score(tree, game, node, child_node, c_puct);
             if (score > best_score) {
                 best_score = score;
                 best_child = child_node;
             }
+        }
+
+        if (deterministic_non_root && !at_root) {
+            best_child = deterministic_completed_q_child(
+                tree, game, node, fc, nc, non_root_sigma, child_init_q
+            );
         }
 
         // No alive children at the root → root is the leaf.
@@ -679,11 +771,21 @@ __global__ void mcts_select_with_root_mask_kernel(
         node = best_child;
 
         int ni2 = tree_idx(tree, game, node);
-        atomicAdd(&tree.visit_count[ni2], 1);
-        atomicAdd(&tree.total_value[ni2], -1.0f);
+        if (deterministic_non_root && !at_root) {
+            atomicAdd(&tree.visit_count[ni2], 1);
+            atomicAdd(&tree.virtual_q_penalty[ni2], q_penalty);
+            if (vl_len < MAX_TREE_DEPTH) {
+                my_vl[vl_len++] = node;
+            }
+        } else {
+            atomicAdd(&tree.visit_count[ni2], 1);
+            atomicAdd(&tree.total_value[ni2], -1.0f);
+            if (vl_len < MAX_TREE_DEPTH) {
+                my_vl[vl_len++] = node;
+            }
+        }
 
         if (path_len < MAX_TREE_DEPTH) {
-            my_vl[path_len] = node;
             int64_t mb_base = ((int64_t)game * tree.max_nodes + node) * MOVE_SZ;
             uint8_t* dst = reinterpret_cast<uint8_t*>(&my_moves[path_len]);
             for (int b = 0; b < MOVE_SZ; b++)
@@ -694,7 +796,7 @@ __global__ void mcts_select_with_root_mask_kernel(
 
     leaf_indices[sim_idx] = node;
     path_lengths[sim_idx] = path_len;
-    vl_lengths[sim_idx]   = path_len;
+    vl_lengths[sim_idx]   = vl_len;
 }
 
 /**
@@ -719,6 +821,10 @@ __global__ void mcts_select_with_root_slots_kernel(
     int num_candidates,
     int max_root_children,
     float c_puct,
+    bool deterministic_non_root,
+    float non_root_sigma,
+    float q_penalty,
+    const float* child_init_q, // [B, max_nodes] initial Q for unvisited children
     int B, int total_sims
 ) {
     int sim_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -767,13 +873,18 @@ __global__ void mcts_select_with_root_slots_kernel(
     }
 
     int path_len = 0;
+    int vl_len = 0;
 
     int ni_root_child = tree_idx(tree, game, node);
-    atomicAdd(&tree.visit_count[ni_root_child], 1);
-    atomicAdd(&tree.total_value[ni_root_child], -1.0f);
+    if (!deterministic_non_root) {
+        atomicAdd(&tree.visit_count[ni_root_child], 1);
+        atomicAdd(&tree.total_value[ni_root_child], -1.0f);
+        if (vl_len < MAX_TREE_DEPTH) {
+            my_vl[vl_len++] = node;
+        }
+    }
 
     if (path_len < MAX_TREE_DEPTH) {
-        my_vl[path_len] = node;
         int64_t mb_base = ((int64_t)game * tree.max_nodes + node) * MOVE_SZ;
         uint8_t* dst = reinterpret_cast<uint8_t*>(&my_moves[path_len]);
         for (int b = 0; b < MOVE_SZ; b++)
@@ -794,6 +905,9 @@ __global__ void mcts_select_with_root_slots_kernel(
         for (int c = 0; c < child_nc; c++) {
             int child_node = child_fc + c;
             if (child_node < 0 || child_node >= tree.max_nodes) break;
+            if (deterministic_non_root) {
+                break;
+            }
             float score = puct_score(tree, game, node, child_node, c_puct);
             if (score > best_score) {
                 best_score = score;
@@ -801,16 +915,32 @@ __global__ void mcts_select_with_root_slots_kernel(
             }
         }
 
+        if (deterministic_non_root) {
+            best_child = deterministic_completed_q_child(
+                tree, game, node, child_fc, child_nc, non_root_sigma, child_init_q
+            );
+        }
+
         if (best_child < 0) break;
 
         node = best_child;
 
         int ni2 = tree_idx(tree, game, node);
-        atomicAdd(&tree.visit_count[ni2], 1);
-        atomicAdd(&tree.total_value[ni2], -1.0f);
+        if (deterministic_non_root) {
+            atomicAdd(&tree.visit_count[ni2], 1);
+            atomicAdd(&tree.virtual_q_penalty[ni2], q_penalty);
+            if (vl_len < MAX_TREE_DEPTH) {
+                my_vl[vl_len++] = node;
+            }
+        } else {
+            atomicAdd(&tree.visit_count[ni2], 1);
+            atomicAdd(&tree.total_value[ni2], -1.0f);
+            if (vl_len < MAX_TREE_DEPTH) {
+                my_vl[vl_len++] = node;
+            }
+        }
 
         if (path_len < MAX_TREE_DEPTH) {
-            my_vl[path_len] = node;
             int64_t mb_base = ((int64_t)game * tree.max_nodes + node) * MOVE_SZ;
             uint8_t* dst = reinterpret_cast<uint8_t*>(&my_moves[path_len]);
             for (int b = 0; b < MOVE_SZ; b++)
@@ -821,7 +951,7 @@ __global__ void mcts_select_with_root_slots_kernel(
 
     leaf_indices[sim_idx] = node;
     path_lengths[sim_idx] = path_len;
-    vl_lengths[sim_idx]   = path_len;
+    vl_lengths[sim_idx]   = vl_len;
 }
 
 /**
@@ -845,6 +975,8 @@ __global__ void mcts_expand_dense_priors_kernel(
     const GPUMove*    legal_moves,        // [total_sims, MAX_LEGAL_MOVES]
     const int*        num_legal,          // [total_sims]
     const float*      priors_per_legal,   // [total_sims, MAX_LEGAL_MOVES]
+    const float*      child_q_values,     // [total_sims, MAX_LEGAL_MOVES] Q per child from parent's perspective
+    float*            child_init_q,       // [B, max_nodes] output: stores initial Q per child node
     const int*        results,            // [total_sims]
     int8_t*           was_expanded,       // [total_sims]
     int B, int total_sims
@@ -887,8 +1019,9 @@ __global__ void mcts_expand_dense_priors_kernel(
         return;
     }
 
-    const GPUMove* my_moves = legal_moves + (int64_t)sim_idx * MAX_LEGAL_MOVES;
-    const float*   priors   = priors_per_legal + (int64_t)sim_idx * MAX_LEGAL_MOVES;
+    const GPUMove* my_moves    = legal_moves + (int64_t)sim_idx * MAX_LEGAL_MOVES;
+    const float*   priors      = priors_per_legal + (int64_t)sim_idx * MAX_LEGAL_MOVES;
+    const float*   my_child_q  = child_q_values + (int64_t)sim_idx * MAX_LEGAL_MOVES;
     constexpr int  MOVE_SZ  = (int)sizeof(GPUMove);
 
     int created = 0;
@@ -908,6 +1041,7 @@ __global__ void mcts_expand_dense_priors_kernel(
         tree.num_children[ci]   = 0;
         tree.is_terminal[ci]    = 0;
         tree.terminal_value[ci] = 0.0f;
+        child_init_q[ci]        = my_child_q[m];
 
         int64_t mb_base = ((int64_t)game * tree.max_nodes + child_node) * MOVE_SZ;
         const uint8_t* src = reinterpret_cast<const uint8_t*>(&mv);
@@ -938,10 +1072,13 @@ __global__ void mcts_expand_and_backprop_dense_priors_kernel(
     const GPUMove*    legal_moves,
     const int*        num_legal,
     const float*      priors_per_legal,   // [total_sims, MAX_LEGAL_MOVES]
+    const float*      child_q_values,     // [total_sims, MAX_LEGAL_MOVES] Q per child from parent's perspective
+    float*            child_init_q,       // [B, max_nodes] output: initial Q per child node
     const int*        results,
     const float*      nn_values,
     const int*        vl_paths,
     const int*        vl_lengths,
+    float             q_penalty,
     int B, int total_sims
 ) {
     int sim_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -969,8 +1106,9 @@ __global__ void mcts_expand_and_backprop_dense_priors_kernel(
 
                 int base = atomicAdd(&tree.node_count[game], n_legal);
                 if (base + n_legal <= tree.max_nodes) {
-                    const GPUMove* my_moves = legal_moves + (int64_t)sim_idx * MAX_LEGAL_MOVES;
-                    const float*   priors   = priors_per_legal + (int64_t)sim_idx * MAX_LEGAL_MOVES;
+                    const GPUMove* my_moves   = legal_moves + (int64_t)sim_idx * MAX_LEGAL_MOVES;
+                    const float*   priors     = priors_per_legal + (int64_t)sim_idx * MAX_LEGAL_MOVES;
+                    const float*   my_child_q = child_q_values + (int64_t)sim_idx * MAX_LEGAL_MOVES;
                     constexpr int  MOVE_SZ  = (int)sizeof(GPUMove);
 
                     int created = 0;
@@ -990,6 +1128,7 @@ __global__ void mcts_expand_and_backprop_dense_priors_kernel(
                         tree.num_children[ci]   = 0;
                         tree.is_terminal[ci]    = 0;
                         tree.terminal_value[ci] = 0.0f;
+                        child_init_q[ci]        = my_child_q[m];
 
                         int64_t mb_base = ((int64_t)game * tree.max_nodes + child_node) * MOVE_SZ;
                         const uint8_t* src = reinterpret_cast<const uint8_t*>(&mv);
@@ -1028,8 +1167,12 @@ __global__ void mcts_expand_and_backprop_dense_priors_kernel(
     const int* vl = vl_paths + (int64_t)sim_idx * MAX_TREE_DEPTH;
     for (int k = 0; k < vl_len; k++) {
         int ni = tree_idx(tree, game, vl[k]);
-        atomicAdd(&tree.visit_count[ni], -1);
-        atomicAdd(&tree.total_value[ni],  1.0f);
+        if (q_penalty > 0.0f) {
+            atomicAdd(&tree.virtual_q_penalty[ni], -q_penalty);
+        } else {
+            atomicAdd(&tree.visit_count[ni], -1);
+            atomicAdd(&tree.total_value[ni],  1.0f);
+        }
     }
 
     int node = leaf;

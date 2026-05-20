@@ -287,31 +287,16 @@ __global__ void hybrid_gnn_encode_states_kernel(
     num_edges_out[idx] = edge_count;
 }
 
-__global__ void hybrid_transformer_encode_states_kernel(
-    const HiveState* states,
-    const GPUMove* legal_moves,
-    const int* num_legal,
-    float* token_features,     // [B, HYBRID_MAX_PIECE_TOKENS, HYBRID_NODE_FEAT_DIM]
-    int* token_q,              // [B, HYBRID_MAX_PIECE_TOKENS]
-    int* token_r,              // [B, HYBRID_MAX_PIECE_TOKENS]
-    int* token_z,              // [B, HYBRID_MAX_PIECE_TOKENS]
-    bool* token_mask,          // [B, HYBRID_MAX_PIECE_TOKENS]
-    float* global_features,    // [B, HYBRID_GLOBAL_FEAT_DIM]
-    int* num_tokens_out,       // [B]
-    int batch_size,
-    bool use_move_flags
+__device__ inline void extract_hybrid_transformer_tokens_device(
+    const HiveState& s,
+    float* tf,
+    int* tq,
+    int* tr,
+    int* tz,
+    bool* tm,
+    float* gf,
+    int& token_count
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= batch_size) return;
-
-    const HiveState& s = states[idx];
-    float* tf = token_features + idx * HYBRID_MAX_PIECE_TOKENS * HYBRID_NODE_FEAT_DIM;
-    int* tq = token_q + idx * HYBRID_MAX_PIECE_TOKENS;
-    int* tr = token_r + idx * HYBRID_MAX_PIECE_TOKENS;
-    int* tz = token_z + idx * HYBRID_MAX_PIECE_TOKENS;
-    bool* tm = token_mask + idx * HYBRID_MAX_PIECE_TOKENS;
-    float* gf = global_features + idx * HYBRID_GLOBAL_FEAT_DIM;
-
     for (int i = 0; i < HYBRID_MAX_PIECE_TOKENS * HYBRID_NODE_FEAT_DIM; ++i) tf[i] = 0.0f;
     for (int i = 0; i < HYBRID_MAX_PIECE_TOKENS; ++i) {
         tq[i] = 0;
@@ -334,7 +319,7 @@ __global__ void hybrid_transformer_encode_states_kernel(
         }
     }
 
-    int token_count = 0;
+    token_count = 0;
     for (int cell = 0; cell < NUM_CELLS; ++cell) {
         int h = s.height[cell];
         if (h == 0) continue;
@@ -394,24 +379,14 @@ __global__ void hybrid_transformer_encode_states_kernel(
     }
     gf[4] = white_hand / 14.0f;
     gf[5] = black_hand / 14.0f;
-
-    num_tokens_out[idx] = token_count;
 }
 
-__global__ void hybrid_transformer_move_features_kernel(
-    const HiveState* states,
-    const GPUMove* legal_moves,
-    const int* num_legal,
-    float* move_features,   // [B, MAX_LEGAL_MOVES, HYBRID_MOVE_FEAT_DIM]
-    int batch_size
+__device__ inline void extract_hybrid_transformer_move_features_device(
+    const HiveState& s,
+    const GPUMove* my_moves,
+    int nlegal,
+    float* out
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= batch_size) return;
-
-    const HiveState& s = states[idx];
-    const GPUMove* my_moves = legal_moves + (int64_t)idx * MAX_LEGAL_MOVES;
-    float* out = move_features + (int64_t)idx * MAX_LEGAL_MOVES * HYBRID_MOVE_FEAT_DIM;
-    int nlegal = num_legal[idx];
     for (int i = 0; i < MAX_LEGAL_MOVES * HYBRID_MOVE_FEAT_DIM; ++i) out[i] = 0.0f;
 
     Color mover = current_player(s);
@@ -472,6 +447,53 @@ __global__ void hybrid_transformer_move_features_kernel(
         f[23] = (float)dst_stack / (float)MAX_STACK;
         f[24] = (float)dst_occ;
     }
+}
+
+__global__ void hybrid_transformer_encode_states_kernel(
+    const HiveState* states,
+    const GPUMove* legal_moves,
+    const int* num_legal,
+    float* token_features,     // [B, HYBRID_MAX_PIECE_TOKENS, HYBRID_NODE_FEAT_DIM]
+    int* token_q,              // [B, HYBRID_MAX_PIECE_TOKENS]
+    int* token_r,              // [B, HYBRID_MAX_PIECE_TOKENS]
+    int* token_z,              // [B, HYBRID_MAX_PIECE_TOKENS]
+    bool* token_mask,          // [B, HYBRID_MAX_PIECE_TOKENS]
+    float* global_features,    // [B, HYBRID_GLOBAL_FEAT_DIM]
+    int* num_tokens_out,       // [B]
+    int batch_size,
+    bool use_move_flags
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    const HiveState& s = states[idx];
+    float* tf = token_features + idx * HYBRID_MAX_PIECE_TOKENS * HYBRID_NODE_FEAT_DIM;
+    int* tq = token_q + idx * HYBRID_MAX_PIECE_TOKENS;
+    int* tr = token_r + idx * HYBRID_MAX_PIECE_TOKENS;
+    int* tz = token_z + idx * HYBRID_MAX_PIECE_TOKENS;
+    bool* tm = token_mask + idx * HYBRID_MAX_PIECE_TOKENS;
+    float* gf = global_features + idx * HYBRID_GLOBAL_FEAT_DIM;
+
+    int token_count = 0;
+    extract_hybrid_transformer_tokens_device(s, tf, tq, tr, tz, tm, gf, token_count);
+    num_tokens_out[idx] = token_count;
+}
+
+__global__ void hybrid_transformer_move_features_kernel(
+    const HiveState* states,
+    const GPUMove* legal_moves,
+    const int* num_legal,
+    float* move_features,   // [B, MAX_LEGAL_MOVES, HYBRID_MOVE_FEAT_DIM]
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch_size) return;
+
+    const HiveState& s = states[idx];
+    const GPUMove* my_moves = legal_moves + (int64_t)idx * MAX_LEGAL_MOVES;
+    float* out = move_features + (int64_t)idx * MAX_LEGAL_MOVES * HYBRID_MOVE_FEAT_DIM;
+    int nlegal = num_legal[idx];
+    extract_hybrid_transformer_move_features_device(s, my_moves, nlegal, out);
 }
 
 // ── Encode kernel ────────────────────────────────────────────────────
