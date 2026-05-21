@@ -68,6 +68,11 @@ class FNNTrainConfig:
     probe_win_in_one: bool = True
     probe_check_opponent_wins: bool = True
     probe_win_in_two: bool = True
+    policy_target_temperature: float = 2.0
+    adaptive_policy_target_temperature: bool = True
+    policy_target_top1_cap: float = 0.7
+    policy_target_min_temperature: float = 1.0
+    policy_target_max_temperature: float = 7.0
 
 
 def _simulations_for_iteration(
@@ -272,6 +277,11 @@ class FNNTrainer:
                     probe_win_in_one=cfg.probe_win_in_one,
                     probe_check_opponent_wins=cfg.probe_check_opponent_wins,
                     probe_win_in_two=cfg.probe_win_in_two,
+                    policy_target_temperature=cfg.policy_target_temperature,
+                    adaptive_policy_target_temperature=cfg.adaptive_policy_target_temperature,
+                    policy_target_top1_cap=cfg.policy_target_top1_cap,
+                    policy_target_min_temperature=cfg.policy_target_min_temperature,
+                    policy_target_max_temperature=cfg.policy_target_max_temperature,
                 ),
             )
         start_states_t = None

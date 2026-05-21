@@ -18,7 +18,6 @@ def parse_args() -> argparse.Namespace:
             Example:
               cd /workspace/hive_neuralnet
               python3.11 -u -m hive_fnn_transformer.train_fnn_transformer \\
-                --preset large \\
                 --iterations 1 \\
                 --games 32 \\
                 --simulations 64 \\
@@ -27,7 +26,7 @@ def parse_args() -> argparse.Namespace:
         """),
     )
 
-    p.add_argument("--preset", choices=["small", "large"], default="large")
+    p.add_argument("--preset", choices=["small", "large"], default="small")
     p.add_argument("--graph-hidden-dim", type=int, default=None)
     p.add_argument("--graph-layers", type=int, default=None)
     p.add_argument(
@@ -93,6 +92,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--buffer-size", type=int, default=100_000)
     p.add_argument("--policy-target-temperature", type=float, default=2.0)
+    p.add_argument(
+        "--adaptive-policy-target-temperature",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Adapt replay policy target temperature per position to avoid overly sharp targets.",
+    )
+    p.add_argument("--policy-target-top1-cap", type=float, default=0.7)
+    p.add_argument("--policy-target-min-temperature", type=float, default=1.0)
+    p.add_argument("--policy-target-max-temperature", type=float, default=7.0)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints_fnn_transformer")
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
     p.add_argument("--resume", type=str, default=None)
@@ -149,6 +157,10 @@ def main() -> None:
         weight_decay=args.weight_decay,
         buffer_max_size=args.buffer_size,
         policy_target_temperature=args.policy_target_temperature,
+        adaptive_policy_target_temperature=args.adaptive_policy_target_temperature,
+        policy_target_top1_cap=args.policy_target_top1_cap,
+        policy_target_min_temperature=args.policy_target_min_temperature,
+        policy_target_max_temperature=args.policy_target_max_temperature,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_keep_every=args.checkpoint_keep_every,
         expansion_mask=args.expansion_mask,

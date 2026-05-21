@@ -49,6 +49,11 @@ def _build_fnn_trainer(args: argparse.Namespace) -> FNNTrainer:
         probe_win_in_one=args.probe_win_in_one,
         probe_check_opponent_wins=args.probe_check_opponent_wins,
         probe_win_in_two=args.probe_win_in_two,
+        policy_target_temperature=args.policy_target_temperature,
+        adaptive_policy_target_temperature=args.adaptive_policy_target_temperature,
+        policy_target_top1_cap=args.policy_target_top1_cap,
+        policy_target_min_temperature=args.policy_target_min_temperature,
+        policy_target_max_temperature=args.policy_target_max_temperature,
     )
     trainer = FNNTrainer(train_cfg, FNNConfig.large())
     trainer.load_checkpoint(args.fnn_checkpoint)
@@ -77,6 +82,11 @@ def _build_hybrid_trainer(args: argparse.Namespace) -> HybridTrainer | None:
         draw_keep_rate=args.draw_keep_rate,
         graph_radius=2,
         gumbel_wave_parallel=True,
+        policy_target_temperature=args.policy_target_temperature,
+        adaptive_policy_target_temperature=args.adaptive_policy_target_temperature,
+        policy_target_top1_cap=args.policy_target_top1_cap,
+        policy_target_min_temperature=args.policy_target_min_temperature,
+        policy_target_max_temperature=args.policy_target_max_temperature,
     )
     trainer = HybridTrainer(train_cfg, HybridGNNConfig.small())
     if args.hybrid_checkpoint:
@@ -229,6 +239,21 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    p.add_argument(
+        "--policy-target-temperature",
+        type=float,
+        default=2.0,
+        help="Temperature applied only to the post-search FNN replay policy target.",
+    )
+    p.add_argument(
+        "--adaptive-policy-target-temperature",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Adapt replay policy target temperature per position to avoid overly sharp targets.",
+    )
+    p.add_argument("--policy-target-top1-cap", type=float, default=0.7)
+    p.add_argument("--policy-target-min-temperature", type=float, default=1.0)
+    p.add_argument("--policy-target-max-temperature", type=float, default=7.0)
     p.add_argument("--checkpoint-keep-every", type=int, default=1)
 
     p.add_argument("--fnn-checkpoint", required=True)

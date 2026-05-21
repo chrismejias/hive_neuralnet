@@ -114,6 +114,36 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="When the tactical probe is enabled, allow the surround-4/5 short forced-win check.",
     )
+    p.add_argument(
+        "--policy-target-temperature",
+        type=float,
+        default=2.0,
+        help="Temperature applied only to the post-search replay policy target.",
+    )
+    p.add_argument(
+        "--adaptive-policy-target-temperature",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Adapt replay policy target temperature per position to avoid overly sharp targets.",
+    )
+    p.add_argument(
+        "--policy-target-top1-cap",
+        type=float,
+        default=0.7,
+        help="Adaptive policy target aims to keep average top-1 mass at or below this cap when possible.",
+    )
+    p.add_argument(
+        "--policy-target-min-temperature",
+        type=float,
+        default=1.0,
+        help="Minimum replay policy target temperature when adaptive temperature is enabled.",
+    )
+    p.add_argument(
+        "--policy-target-max-temperature",
+        type=float,
+        default=7.0,
+        help="Maximum replay policy target temperature when adaptive temperature is enabled.",
+    )
     p.add_argument("--max-game-length", type=int, default=300)
     p.add_argument(
         "--endgame-frac",
@@ -222,6 +252,11 @@ def main() -> None:
         probe_win_in_one=args.probe_win_in_one,
         probe_check_opponent_wins=args.probe_check_opponent_wins,
         probe_win_in_two=args.probe_win_in_two,
+        policy_target_temperature=args.policy_target_temperature,
+        adaptive_policy_target_temperature=args.adaptive_policy_target_temperature,
+        policy_target_top1_cap=args.policy_target_top1_cap,
+        policy_target_min_temperature=args.policy_target_min_temperature,
+        policy_target_max_temperature=args.policy_target_max_temperature,
         endgame_frac=args.endgame_frac,
         endgame_surround=args.endgame_surround,
         endgame_mixed_pair=args.endgame_mixed_pair,

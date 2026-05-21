@@ -69,6 +69,11 @@ class FNNMCTSConfig:
     probe_win_in_one:             bool  = True
     probe_check_opponent_wins:    bool  = True
     probe_win_in_two:             bool  = True
+    policy_target_temperature:    float = 2.0
+    adaptive_policy_target_temperature: bool = True
+    policy_target_top1_cap:       float = 0.7
+    policy_target_min_temperature: float = 1.0
+    policy_target_max_temperature: float = 7.0
     # Rebase each game's tree to a fresh root after applying a move.
     # This prevents node-id growth across plies from exhausting the fixed
     # tree node pool in long games.
@@ -132,6 +137,56 @@ class FNNMCTSOrchestrator:
             cached = torch.arange(n, device="cuda").unsqueeze(0)
             self._keep_rank_cache[n] = cached
         return cached
+
+    def _build_policy_target(
+        self,
+        sampled_logits: torch.Tensor,
+        valid_slot: torch.Tensor,
+    ) -> torch.Tensor:
+        cfg = self.config
+
+        def _softmax_with_temp(temp: torch.Tensor) -> torch.Tensor:
+            probs = torch.softmax(sampled_logits / temp, dim=1)
+            probs = torch.where(valid_slot, probs, torch.zeros_like(probs))
+            return probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+        if not cfg.adaptive_policy_target_temperature:
+            target_temperature = max(float(cfg.policy_target_temperature), 1e-6)
+            return _softmax_with_temp(
+                torch.full(
+                    (sampled_logits.shape[0], 1),
+                    target_temperature,
+                    dtype=sampled_logits.dtype,
+                    device=sampled_logits.device,
+                ),
+            )
+
+        min_temp = max(float(cfg.policy_target_min_temperature), 1.0)
+        max_temp = max(float(cfg.policy_target_max_temperature), min_temp)
+        top1_cap = min(max(float(cfg.policy_target_top1_cap), 0.0), 1.0)
+
+        base_temp = torch.full(
+            (sampled_logits.shape[0], 1),
+            min_temp,
+            dtype=sampled_logits.dtype,
+            device=sampled_logits.device,
+        )
+        probs = _softmax_with_temp(base_temp)
+        need_soften = probs.max(dim=1, keepdim=True).values > top1_cap
+        if not bool(need_soften.any().item()) or max_temp <= min_temp:
+            return probs
+
+        low = base_temp.clone()
+        high = torch.full_like(base_temp, max_temp)
+        for _ in range(12):
+            mid = (low + high) * 0.5
+            mid_probs = _softmax_with_temp(mid)
+            still_sharp = mid_probs.max(dim=1, keepdim=True).values > top1_cap
+            low = torch.where(need_soften & still_sharp, mid, low)
+            high = torch.where(need_soften & ~still_sharp, mid, high)
+
+        final_temp = torch.where(need_soften, high, base_temp)
+        return _softmax_with_temp(final_temp)
 
     # ── Tree tensor management ────────────────────────────────────────
 
@@ -682,8 +737,7 @@ class FNNMCTSOrchestrator:
                     legal_logits + sigma_norm * slot_q,
                     torch.full_like(legal_logits, -1e30),
                 )
-                probs_pad = torch.softmax(sampled_logits, dim=1)
-                probs_pad = torch.where(valid_slot, probs_pad, torch.zeros_like(probs_pad))
+                probs_pad = self._build_policy_target(sampled_logits, valid_slot)
 
             if bool(has_immediate_win.any().item()):
                 slot_visits[has_immediate_win] = 0
