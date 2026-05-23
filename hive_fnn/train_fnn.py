@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--gumbel-considered", type=int, default=16)
-    p.add_argument("--queen-surround-reserve-slots", type=int, default=10)
+    p.add_argument("--queen-surround-reserve-slots", type=int, default=6)
     p.add_argument(
         "--queen-surround-reserve-immobile-only",
         action=argparse.BooleanOptionalAction,
@@ -117,7 +117,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--policy-target-temperature",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Temperature applied only to the post-search replay policy target.",
     )
     p.add_argument(
@@ -188,6 +188,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--ema-decay", type=float, default=0.999)
+    p.add_argument(
+        "--ema-arena-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--ema-arena-every", type=int, default=5)
+    p.add_argument("--ema-arena-games", type=int, default=256)
+    p.add_argument("--ema-arena-noise-scale", type=float, default=0.1)
+    p.add_argument("--ema-promotion-score", type=float, default=0.52)
     p.add_argument("--buffer-size", type=int, default=100_000)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints_fnn")
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
@@ -257,6 +267,12 @@ def main() -> None:
         policy_target_top1_cap=args.policy_target_top1_cap,
         policy_target_min_temperature=args.policy_target_min_temperature,
         policy_target_max_temperature=args.policy_target_max_temperature,
+        ema_decay=args.ema_decay,
+        ema_arena_enabled=args.ema_arena_enabled,
+        ema_arena_every=args.ema_arena_every,
+        ema_arena_games=args.ema_arena_games,
+        ema_arena_noise_scale=args.ema_arena_noise_scale,
+        ema_promotion_score=args.ema_promotion_score,
         endgame_frac=args.endgame_frac,
         endgame_surround=args.endgame_surround,
         endgame_mixed_pair=args.endgame_mixed_pair,

@@ -215,7 +215,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-game-length", type=int, default=300)
     p.add_argument("--expansion-mask", type=int, default=7)
     p.add_argument("--draw-keep-rate", type=float, default=1.0)
-    p.add_argument("--queen-surround-reserve-slots", type=int, default=10)
+    p.add_argument("--queen-surround-reserve-slots", type=int, default=6)
     p.add_argument("--no-immobile-reserve", action="store_true")
     p.add_argument("--endgame-frac", type=float, default=0.0)
     p.add_argument("--endgame-surround", type=int, default=5)
@@ -242,7 +242,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--policy-target-temperature",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Temperature applied only to the post-search FNN replay policy target.",
     )
     p.add_argument(

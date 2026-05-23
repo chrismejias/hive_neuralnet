@@ -5,6 +5,9 @@ from __future__ import annotations
 import gc
 import math
 import os
+import re
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -32,7 +35,7 @@ class HybridTrainConfig:
     mcts_simulations: int = 128
     simulation_schedule: tuple[int, ...] = ()
     max_num_considered: int = 16
-    queen_surround_reserve_slots: int = 10
+    queen_surround_reserve_slots: int = 6
     queen_surround_reserve_immobile_only: bool = True
     temperature: float = 1.0
     temperature_drop_move: int = 20
@@ -62,11 +65,17 @@ class HybridTrainConfig:
     probe_win_in_one: bool = True
     probe_check_opponent_wins: bool = True
     probe_win_in_two: bool = True
-    policy_target_temperature: float = 2.0
+    policy_target_temperature: float = 1.0
     adaptive_policy_target_temperature: bool = True
     policy_target_top1_cap: float = 0.7
     policy_target_min_temperature: float = 1.0
     policy_target_max_temperature: float = 7.0
+    ema_decay: float = 0.999
+    ema_arena_enabled: bool = True
+    ema_arena_every: int = 5
+    ema_arena_games: int = 256
+    ema_arena_noise_scale: float = 0.1
+    ema_promotion_score: float = 0.52
 
 
 def _simulations_for_iteration(
@@ -90,6 +99,8 @@ class HybridTrainer:
         self.device = get_device(self.config.device)
         self.ext = hive_gpu.load_extension()
         self.best_net = HiveHybridGNN(self.net_config).to(self.device)
+        self.ema_net = HiveHybridGNN(self.net_config).to(self.device)
+        self.champion_net = HiveHybridGNN(self.net_config).to(self.device)
         self.buffer = FNNReplayBuffer(
             self.config.buffer_max_size,
             device=self.device,
@@ -98,6 +109,7 @@ class HybridTrainer:
         )
         self.elo_tracker = EloTracker()
         self._start_iter = 1
+        self._champion_iteration = 0
         self.use_amp = (
             self.config.use_amp
             if self.config.use_amp is not None
@@ -109,12 +121,145 @@ class HybridTrainer:
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
+        self._sync_model(self.ema_net, self.best_net)
+        self._sync_model(self.champion_net, self.best_net)
 
     def _cleanup(self) -> None:
         if self.device.type == "cuda":
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
+    @staticmethod
+    def _sync_model(dst: torch.nn.Module, src: torch.nn.Module) -> None:
+        dst.load_state_dict(src.state_dict())
+
+    def _update_ema(self) -> None:
+        decay = float(self.config.ema_decay)
+        with torch.no_grad():
+            raw_state = self.best_net.state_dict()
+            ema_state = self.ema_net.state_dict()
+            for key, raw_val in raw_state.items():
+                ema_val = ema_state[key]
+                if torch.is_floating_point(raw_val):
+                    ema_val.mul_(decay).add_(raw_val, alpha=1.0 - decay)
+                else:
+                    ema_val.copy_(raw_val)
+
+    def _arena_checkpoint_payload(
+        self,
+        model: torch.nn.Module,
+        iteration: int,
+    ) -> dict:
+        return {
+            "model_state_dict": {
+                k: v.detach().cpu()
+                for k, v in model.state_dict().items()
+            },
+            "net_config": self.net_config,
+            "train_config": self.config,
+            "iteration": iteration,
+        }
+
+    def _run_ema_arena(self, iteration: int, sims: int) -> dict[str, float] | None:
+        cfg = self.config
+        if (
+            not cfg.ema_arena_enabled
+            or cfg.ema_arena_every <= 0
+            or iteration % cfg.ema_arena_every != 0
+        ):
+            return None
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        champion_path = os.path.join(cfg.checkpoint_dir, "champion_latest.pt")
+        with tempfile.TemporaryDirectory(dir=cfg.checkpoint_dir) as tmpdir:
+            ema_path = os.path.join(tmpdir, f"hybrid_gnn_checkpoint_{iteration:04d}_ema.pt")
+            champ_tmp_path = os.path.join(tmpdir, "hybrid_gnn_checkpoint_champion.pt")
+
+            model_modes = (
+                self.best_net.training,
+                self.ema_net.training,
+                self.champion_net.training,
+            )
+            try:
+                self.best_net.to("cpu")
+                self.ema_net.to("cpu")
+                self.champion_net.to("cpu")
+                self._cleanup()
+
+                torch.save(self._arena_checkpoint_payload(self.ema_net, iteration), ema_path)
+                torch.save(
+                    self._arena_checkpoint_payload(
+                        self.champion_net, self._champion_iteration,
+                    ),
+                    champ_tmp_path,
+                )
+
+                cmd = [
+                    "python3.11",
+                    "-u",
+                    "arena.py",
+                    "--white-model", "fnn_transformer",
+                    "--black-model", "fnn_transformer",
+                    "--white-checkpoint", ema_path,
+                    "--black-checkpoint", champ_tmp_path,
+                    "--games", str(cfg.ema_arena_games),
+                    "--white-sims", str(sims),
+                    "--black-sims", str(sims),
+                    "--expansion-mask", str(cfg.expansion_mask),
+                    "--alternate-colors",
+                    "--gumbel-noise-scale", str(cfg.ema_arena_noise_scale),
+                ]
+                result = subprocess.run(
+                    cmd,
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                self.best_net.to(self.device)
+                self.ema_net.to(self.device)
+                self.champion_net.to(self.device)
+                self.best_net.train(model_modes[0])
+                self.ema_net.train(model_modes[1])
+                self.champion_net.train(model_modes[2])
+
+            if result.returncode != 0:
+                stdout = result.stdout.strip()
+                stderr = result.stderr.strip()
+                print("  EMA Arena: failed")
+                if stdout:
+                    print(stdout)
+                if stderr:
+                    print(stderr)
+                return None
+
+            match = re.search(
+                r"Model A score:\s+([0-9.]+)/([0-9]+)\s+=\s+([0-9.]+)",
+                result.stdout,
+            )
+            if not match:
+                print("  EMA Arena: could not parse score")
+                return None
+
+            wins = float(match.group(1))
+            games = float(match.group(2))
+            score = float(match.group(3))
+            promoted = score >= float(cfg.ema_promotion_score)
+            if promoted:
+                self._sync_model(self.champion_net, self.ema_net)
+                self._champion_iteration = iteration
+                torch.save(
+                    self._arena_checkpoint_payload(self.champion_net, iteration),
+                    champion_path,
+                )
+            return {
+                "wins": wins,
+                "games": games,
+                "score": score,
+                "promoted": 1.0 if promoted else 0.0,
+            }
 
     def _lr(self, iteration: int) -> float:
         cfg = self.config
@@ -166,6 +311,14 @@ class HybridTrainer:
                     f"(batches={int(timing_dict.get('num_batches', 0))})"
                 )
             self._save_checkpoint(iteration)
+            arena_result = self._run_ema_arena(iteration, sims_this_iter)
+            if arena_result is not None:
+                outcome = "promoted" if arena_result["promoted"] > 0.5 else "kept champion"
+                print(
+                    "  EMA Arena: "
+                    f"{arena_result['wins']:.1f}/{arena_result['games']:.0f} "
+                    f"= {arena_result['score']:.3f} ({outcome})"
+                )
             print(f"  ELO: {elo:.0f}  Buffer: {len(self.buffer)}")
 
     def _self_play(self, iteration: int) -> tuple[list, dict]:
@@ -415,6 +568,7 @@ class HybridTrainer:
                     )
                     self.scaler.step(opt)
                     self.scaler.update()
+                    self._update_ema()
                     timing_sums["backward_step"] += time.perf_counter() - t_bwd
                 else:
                     t_fwd = time.perf_counter()
@@ -437,6 +591,7 @@ class HybridTrainer:
                         self.best_net.parameters(), cfg.max_grad_norm,
                     )
                     opt.step()
+                    self._update_ema()
                     timing_sums["backward_step"] += time.perf_counter() - t_bwd
 
                 total_loss += float(loss.item())
@@ -464,6 +619,8 @@ class HybridTrainer:
         torch.save(
             {
                 "model_state_dict": self.best_net.state_dict(),
+                "ema_state_dict": self.ema_net.state_dict(),
+                "champion_state_dict": self.champion_net.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "scaler_state_dict": (
                     self.scaler.state_dict()
@@ -473,6 +630,7 @@ class HybridTrainer:
                 "net_config": self.net_config,
                 "train_config": self.config,
                 "iteration": iteration,
+                "champion_iteration": self._champion_iteration,
             },
             path,
         )
@@ -491,12 +649,23 @@ class HybridTrainer:
                 state = dict(state)
                 state[key] = new
         self.best_net.load_state_dict(state)
+        ema_state = ckpt.get("ema_state_dict")
+        champion_state = ckpt.get("champion_state_dict")
+        if ema_state is not None:
+            self.ema_net.load_state_dict(ema_state)
+        else:
+            self._sync_model(self.ema_net, self.best_net)
+        if champion_state is not None:
+            self.champion_net.load_state_dict(champion_state)
+        else:
+            self._sync_model(self.champion_net, self.best_net)
         opt_state = ckpt.get("optimizer_state_dict")
         if opt_state is not None:
             self.optimizer.load_state_dict(opt_state)
         scaler_state = ckpt.get("scaler_state_dict")
         if scaler_state is not None and self.scaler is not None:
             self.scaler.load_state_dict(scaler_state)
+        self._champion_iteration = int(ckpt.get("champion_iteration", ckpt["iteration"]))
         self._start_iter = int(ckpt["iteration"]) + 1
         print(f"Resumed from {path} (iter {ckpt['iteration']})")
 

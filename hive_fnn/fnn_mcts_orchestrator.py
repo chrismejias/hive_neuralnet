@@ -62,14 +62,14 @@ class FNNMCTSConfig:
     dirichlet_alpha:             float = 0.3
     dirichlet_epsilon:           float = 0.25
     max_tree_nodes:              int   = 65536
-    queen_surround_reserve_slots: int  = 10
+    queen_surround_reserve_slots: int  = 6
     queen_surround_reserve_immobile_only: bool = True
     root_q_min_visits:            int   = 0
     short_forced_win_probe:       bool  = False
     probe_win_in_one:             bool  = True
     probe_check_opponent_wins:    bool  = True
     probe_win_in_two:             bool  = True
-    policy_target_temperature:    float = 2.0
+    policy_target_temperature:    float = 1.0
     adaptive_policy_target_temperature: bool = True
     policy_target_top1_cap:       float = 0.7
     policy_target_min_temperature: float = 1.0
@@ -107,6 +107,7 @@ class FNNMCTSOrchestrator:
         self._row_idx_cache: dict[int, torch.Tensor] = {}
         self._keep_rank_cache: dict[int, torch.Tensor] = {}
         self._neighbor_cells = self._build_neighbor_cells()
+        self.last_policy_temperature_stats: dict[str, float] = {}
 
     def _build_neighbor_cells(self) -> torch.Tensor:
         neigh = torch.full((_NUM_CELLS, 6), -1, dtype=torch.int64, device="cuda")
@@ -142,7 +143,7 @@ class FNNMCTSOrchestrator:
         self,
         sampled_logits: torch.Tensor,
         valid_slot: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.config
 
         def _softmax_with_temp(temp: torch.Tensor) -> torch.Tensor:
@@ -152,14 +153,13 @@ class FNNMCTSOrchestrator:
 
         if not cfg.adaptive_policy_target_temperature:
             target_temperature = max(float(cfg.policy_target_temperature), 1e-6)
-            return _softmax_with_temp(
-                torch.full(
-                    (sampled_logits.shape[0], 1),
-                    target_temperature,
-                    dtype=sampled_logits.dtype,
-                    device=sampled_logits.device,
-                ),
+            temp_tensor = torch.full(
+                (sampled_logits.shape[0], 1),
+                target_temperature,
+                dtype=sampled_logits.dtype,
+                device=sampled_logits.device,
             )
+            return _softmax_with_temp(temp_tensor), temp_tensor.squeeze(1)
 
         min_temp = max(float(cfg.policy_target_min_temperature), 1.0)
         max_temp = max(float(cfg.policy_target_max_temperature), min_temp)
@@ -174,7 +174,7 @@ class FNNMCTSOrchestrator:
         probs = _softmax_with_temp(base_temp)
         need_soften = probs.max(dim=1, keepdim=True).values > top1_cap
         if not bool(need_soften.any().item()) or max_temp <= min_temp:
-            return probs
+            return probs, base_temp.squeeze(1)
 
         low = base_temp.clone()
         high = torch.full_like(base_temp, max_temp)
@@ -186,7 +186,7 @@ class FNNMCTSOrchestrator:
             high = torch.where(need_soften & ~still_sharp, mid, high)
 
         final_temp = torch.where(need_soften, high, base_temp)
-        return _softmax_with_temp(final_temp)
+        return _softmax_with_temp(final_temp), final_temp.squeeze(1)
 
     # ── Tree tensor management ────────────────────────────────────────
 
@@ -568,6 +568,7 @@ class FNNMCTSOrchestrator:
             if start_states is not None
             else self.ext.create_initial_states(B, cfg.expansion_mask)
         )
+        self.last_policy_temperature_stats = {}
 
         tree = self._alloc_tree(B)
         self._reset_tree(tree)
@@ -575,6 +576,10 @@ class FNNMCTSOrchestrator:
         active_mask = torch.ones((B,), dtype=torch.bool, device=dev)
         move_numbers = torch.zeros((B,), dtype=torch.int64, device=dev)
         histories: list[list[tuple[np.ndarray, np.ndarray, bool]]] = [[] for _ in range(B)]
+        temp_sum = 0.0
+        temp_count = 0
+        temp_min = float("inf")
+        temp_max = 0.0
 
         while bool(active_mask.any().item()):
             legal_moves, num_legal, root_features = (
@@ -737,7 +742,14 @@ class FNNMCTSOrchestrator:
                     legal_logits + sigma_norm * slot_q,
                     torch.full_like(legal_logits, -1e30),
                 )
-                probs_pad = self._build_policy_target(sampled_logits, valid_slot)
+                probs_pad, used_temps = self._build_policy_target(sampled_logits, valid_slot)
+                search_temp_mask = search_rows & visited.any(dim=1)
+                if bool(search_temp_mask.any().item()):
+                    temps_cpu = used_temps[search_temp_mask].detach().float().cpu().numpy()
+                    temp_sum += float(temps_cpu.sum())
+                    temp_count += int(temps_cpu.shape[0])
+                    temp_min = min(temp_min, float(temps_cpu.min()))
+                    temp_max = max(temp_max, float(temps_cpu.max()))
 
             if bool(has_immediate_win.any().item()):
                 slot_visits[has_immediate_win] = 0
@@ -834,6 +846,20 @@ class FNNMCTSOrchestrator:
                     use_for_policy=bool(use_for_policy),
                     use_for_value=use_for_value,
                 ))
+        if temp_count > 0:
+            self.last_policy_temperature_stats = {
+                "mean": temp_sum / temp_count,
+                "min": temp_min,
+                "max": temp_max,
+                "count": float(temp_count),
+            }
+        else:
+            self.last_policy_temperature_stats = {
+                "mean": float(cfg.policy_target_min_temperature),
+                "min": float(cfg.policy_target_min_temperature),
+                "max": float(cfg.policy_target_min_temperature),
+                "count": 0.0,
+            }
         return examples
 
     # ── Helpers ───────────────────────────────────────────────────────

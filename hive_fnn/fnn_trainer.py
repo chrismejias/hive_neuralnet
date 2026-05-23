@@ -5,6 +5,9 @@ from __future__ import annotations
 import gc
 import math
 import os
+import re
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -62,17 +65,23 @@ class FNNTrainConfig:
     gumbel_wave_parallel: bool = True
     gumbel_wave_size: int = 4
     puct_wave_size: int = 16
-    queen_surround_reserve_slots: int = 10
+    queen_surround_reserve_slots: int = 6
     queen_surround_reserve_immobile_only: bool = True
     short_forced_win_probe: bool = False
     probe_win_in_one: bool = True
     probe_check_opponent_wins: bool = True
     probe_win_in_two: bool = True
-    policy_target_temperature: float = 2.0
+    policy_target_temperature: float = 1.0
     adaptive_policy_target_temperature: bool = True
     policy_target_top1_cap: float = 0.7
     policy_target_min_temperature: float = 1.0
     policy_target_max_temperature: float = 7.0
+    ema_decay: float = 0.999
+    ema_arena_enabled: bool = True
+    ema_arena_every: int = 5
+    ema_arena_games: int = 256
+    ema_arena_noise_scale: float = 0.1
+    ema_promotion_score: float = 0.52
 
 
 def _simulations_for_iteration(
@@ -169,6 +178,8 @@ class FNNTrainer:
         self.device = get_device(self.config.device)
         self.ext = hive_gpu.load_extension()
         self.best_net = HiveFNN(self.net_config).to(self.device)
+        self.ema_net = HiveFNN(self.net_config).to(self.device)
+        self.champion_net = HiveFNN(self.net_config).to(self.device)
         self.buffer = FNNReplayBuffer(
             self.config.buffer_max_size,
             device=self.device,
@@ -177,18 +188,153 @@ class FNNTrainer:
         )
         self.elo_tracker = EloTracker()
         self._start_iter = 1
+        self._champion_iteration = 0
         self.use_amp = (
             self.config.use_amp
             if self.config.use_amp is not None
             else self.device.type == "cuda"
         )
         self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
+        self._sync_model(self.ema_net, self.best_net)
+        self._sync_model(self.champion_net, self.best_net)
 
     def _cleanup(self) -> None:
         if self.device.type == "cuda":
             gc.collect()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
+    @staticmethod
+    def _sync_model(dst: torch.nn.Module, src: torch.nn.Module) -> None:
+        dst.load_state_dict(src.state_dict())
+
+    def _update_ema(self) -> None:
+        decay = float(self.config.ema_decay)
+        with torch.no_grad():
+            raw_state = self.best_net.state_dict()
+            ema_state = self.ema_net.state_dict()
+            for key, raw_val in raw_state.items():
+                ema_val = ema_state[key]
+                if torch.is_floating_point(raw_val):
+                    ema_val.mul_(decay).add_(raw_val, alpha=1.0 - decay)
+                else:
+                    ema_val.copy_(raw_val)
+
+    def _arena_checkpoint_payload(
+        self,
+        model: torch.nn.Module,
+        iteration: int,
+    ) -> dict:
+        return {
+            "model_state_dict": {
+                k: v.detach().cpu()
+                for k, v in model.state_dict().items()
+            },
+            "net_config": self.net_config,
+            "train_config": self.config,
+            "iteration": iteration,
+        }
+
+    def _run_ema_arena(self, iteration: int, sims: int) -> dict[str, float] | None:
+        cfg = self.config
+        if (
+            not cfg.ema_arena_enabled
+            or cfg.ema_arena_every <= 0
+            or iteration % cfg.ema_arena_every != 0
+            or cfg.use_puct
+        ):
+            return None
+
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        champion_path = os.path.join(cfg.checkpoint_dir, "champion_latest.pt")
+        with tempfile.TemporaryDirectory(dir=cfg.checkpoint_dir) as tmpdir:
+            ema_path = os.path.join(tmpdir, f"hive_fnn_checkpoint_{iteration:04d}_ema.pt")
+            champ_tmp_path = os.path.join(tmpdir, "hive_fnn_checkpoint_champion.pt")
+
+            model_modes = (
+                self.best_net.training,
+                self.ema_net.training,
+                self.champion_net.training,
+            )
+            try:
+                self.best_net.to("cpu")
+                self.ema_net.to("cpu")
+                self.champion_net.to("cpu")
+                self._cleanup()
+
+                torch.save(self._arena_checkpoint_payload(self.ema_net, iteration), ema_path)
+                torch.save(
+                    self._arena_checkpoint_payload(
+                        self.champion_net, self._champion_iteration,
+                    ),
+                    champ_tmp_path,
+                )
+
+                cmd = [
+                    "python3.11",
+                    "-u",
+                    "arena.py",
+                    "--white-model", "fnn",
+                    "--black-model", "fnn",
+                    "--white-checkpoint", ema_path,
+                    "--black-checkpoint", champ_tmp_path,
+                    "--games", str(cfg.ema_arena_games),
+                    "--white-sims", str(sims),
+                    "--black-sims", str(sims),
+                    "--expansion-mask", str(cfg.expansion_mask),
+                    "--alternate-colors",
+                    "--gumbel-noise-scale", str(cfg.ema_arena_noise_scale),
+                ]
+                result = subprocess.run(
+                    cmd,
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                self.best_net.to(self.device)
+                self.ema_net.to(self.device)
+                self.champion_net.to(self.device)
+                self.best_net.train(model_modes[0])
+                self.ema_net.train(model_modes[1])
+                self.champion_net.train(model_modes[2])
+
+            if result.returncode != 0:
+                stdout = result.stdout.strip()
+                stderr = result.stderr.strip()
+                print("  EMA Arena: failed")
+                if stdout:
+                    print(stdout)
+                if stderr:
+                    print(stderr)
+                return None
+
+            match = re.search(
+                r"Model A score:\s+([0-9.]+)/([0-9]+)\s+=\s+([0-9.]+)",
+                result.stdout,
+            )
+            if not match:
+                print("  EMA Arena: could not parse score")
+                return None
+
+            wins = float(match.group(1))
+            games = float(match.group(2))
+            score = float(match.group(3))
+            promoted = score >= float(cfg.ema_promotion_score)
+            if promoted:
+                self._sync_model(self.champion_net, self.ema_net)
+                self._champion_iteration = iteration
+                torch.save(
+                    self._arena_checkpoint_payload(self.champion_net, iteration),
+                    champion_path,
+                )
+            return {
+                "wins": wins,
+                "games": games,
+                "score": score,
+                "promoted": 1.0 if promoted else 0.0,
+            }
 
     def _lr(self, iteration: int) -> float:
         cfg = self.config
@@ -225,6 +371,14 @@ class FNNTrainer:
                 f"(W:{stats['white_wins']} B:{stats['black_wins']} D:{stats['draws']}), "
                 f"{time.time() - t0:.1f}s"
             )
+            if "policy_temp_mean" in stats:
+                print(
+                    "            target_temp: "
+                    f"mean={stats['policy_temp_mean']:.3f} "
+                    f"min={stats['policy_temp_min']:.3f} "
+                    f"max={stats['policy_temp_max']:.3f} "
+                    f"(count={int(stats['policy_temp_count'])})"
+                )
 
             t0 = time.time()
             loss, loss_dict = self._train(iteration)
@@ -234,6 +388,14 @@ class FNNTrainer:
                 f"  Training: loss={loss:.4f}, {time.time() - t0:.1f}s [{parts}]"
             )
             self._save_checkpoint(iteration)
+            arena_result = self._run_ema_arena(iteration, sims_this_iter)
+            if arena_result is not None:
+                outcome = "promoted" if arena_result["promoted"] > 0.5 else "kept champion"
+                print(
+                    "  EMA Arena: "
+                    f"{arena_result['wins']:.1f}/{arena_result['games']:.0f} "
+                    f"= {arena_result['score']:.3f} ({outcome})"
+                )
             print(f"  ELO: {elo:.0f}  Buffer: {len(self.buffer)}")
 
     def _self_play(self, iteration: int) -> tuple[list, dict]:
@@ -318,6 +480,12 @@ class FNNTrainer:
             "draws": 0,
             "endgame_games": endgame_games,
         }
+        temp_stats = getattr(orch, "last_policy_temperature_stats", None)
+        if temp_stats:
+            stats["policy_temp_mean"] = float(temp_stats.get("mean", 1.0))
+            stats["policy_temp_min"] = float(temp_stats.get("min", 1.0))
+            stats["policy_temp_max"] = float(temp_stats.get("max", 1.0))
+            stats["policy_temp_count"] = float(temp_stats.get("count", 0.0))
         for game in raw:
             if not game:
                 stats["num_games"] += 1
@@ -458,6 +626,7 @@ class FNNTrainer:
                     )
                     self.scaler.step(opt)
                     self.scaler.update()
+                    self._update_ema()
                 else:
                     action_logits, root_values = self.best_net(
                         root_feat, succ_feat, a2r, n_act,
@@ -476,6 +645,7 @@ class FNNTrainer:
                         self.best_net.parameters(), cfg.max_grad_norm,
                     )
                     opt.step()
+                    self._update_ema()
 
                 total_loss += float(loss.item())
                 n_batches += 1
@@ -497,9 +667,12 @@ class FNNTrainer:
         torch.save(
             {
                 "model_state_dict": self.best_net.state_dict(),
+                "ema_state_dict": self.ema_net.state_dict(),
+                "champion_state_dict": self.champion_net.state_dict(),
                 "net_config": self.net_config,
                 "train_config": self.config,
                 "iteration": iteration,
+                "champion_iteration": self._champion_iteration,
             },
             path,
         )
@@ -507,5 +680,16 @@ class FNNTrainer:
     def load_checkpoint(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.best_net.load_state_dict(ckpt["model_state_dict"])
+        ema_state = ckpt.get("ema_state_dict")
+        champion_state = ckpt.get("champion_state_dict")
+        if ema_state is not None:
+            self.ema_net.load_state_dict(ema_state)
+        else:
+            self._sync_model(self.ema_net, self.best_net)
+        if champion_state is not None:
+            self.champion_net.load_state_dict(champion_state)
+        else:
+            self._sync_model(self.champion_net, self.best_net)
+        self._champion_iteration = int(ckpt.get("champion_iteration", ckpt["iteration"]))
         self._start_iter = int(ckpt["iteration"]) + 1
         print(f"Resumed from {path} (iter {ckpt['iteration']})")
