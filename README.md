@@ -1,12 +1,14 @@
 # Hive Neural Network
 
-AlphaZero-style self-play training for the board game [Hive](https://en.wikipedia.org/wiki/Hive_(game)), focused on a fast recommended FNN engine, an experimental PRS transformer line, and a shared GPU-native game engine.
+AlphaZero-style self-play training for the board game [Hive](https://en.wikipedia.org/wiki/Hive_(game)), focused on a fast recommended FNN engine, an experimental FNN-transformer line, an older PRS research line, and a shared GPU-native game engine.
 
 ## Recommended Engine
 
 **FNN is the default recommended engine.** It is the strongest and most practical training path in this repository today: it is much faster, reaches strong play with far less compute, and benefits from a compact handcrafted state representation that already encodes a lot of useful Hive structure.
 
-**PRS is a work in progress research engine.** It learns a richer board representation from scratch and is therefore slower in two ways:
+**FNN Transformer is the current experimental neural direction.** It keeps the fast FNN successor-feature policy path, but adds a piece-relative transformer summary for richer policy/value evaluation. It is still slower and less stable than FNN, but is the main non-FNN line currently under active tuning.
+
+**PRS is an older work in progress research engine.** It learns a richer board representation from scratch and is therefore slower in two ways:
 
 - each search evaluation is much heavier than FNN
 - it has to spend training capacity learning useful board and legality structure that FNN already gets from engineered features
@@ -80,7 +82,7 @@ For the recommended GUI path on a machine without an NVIDIA GPU, use the CPU FNN
 cd /workspace/hive_neuralnet
 python3.11 gui.py \
   --engine fnn-cpu \
-  --checkpoint checkpoints_fnn/resume0500_24576/hive_fnn_checkpoint_0500.pt \
+  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_0905.pt \
   --simulations 256 \
   --root-workers 2
 ```
@@ -90,7 +92,7 @@ There is also a text-mode CPU player:
 ```bash
 cd /workspace/hive_neuralnet
 python3.11 play_fnn_cpu.py \
-  --checkpoint checkpoints_fnn/resume0500_24576/hive_fnn_checkpoint_0500.pt \
+  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_0905.pt \
   --mode human_vs_ai \
   --simulations 256 \
   --gumbel-root \
@@ -228,7 +230,7 @@ So the active PRS/FNN target is:
    The paper's serial schedule shrinks the amount of parallel work as halving proceeds. On GPU, that leaves batch efficiency on the table. In this project, each later round increases the number of parallel sims per surviving root move so the total batch stays roughly constant. For example, PRS uses `1,2,4,8` waves per round and FNN uses `2,4,8,16`.
 
 4. **FNN and Hybrid GNN root search reserve tactical queen-surround slots.**
-   The current FNN and Hybrid GNN training/self-play defaults reserve up to `10` root candidate slots for legal moves that increase opponent queen surround and leave that queen with no legal escape, including pillbug or mosquito throws. Those reserved moves are still ranked by policy within the tactical subset, and the remaining root slots are filled by the normal Gumbel-policy candidate selection.
+   The current FNN and Hybrid GNN training/self-play defaults reserve up to `6` root candidate slots for legal moves that increase opponent queen surround and leave that queen with no legal escape, including pillbug or mosquito throws. Those reserved moves are still ranked by policy within the tactical subset, and the remaining root slots are filled by the normal Gumbel-policy candidate selection.
    
 ## FNN (HiveGo-style Feedforward Network)
 
@@ -280,6 +282,7 @@ There is also an experimental fused FNN self-play kernel in `hive_gpu/csrc/fnn_s
 - Within the Gumbel search, inner-node selection uses standard non-root PUCT MCTS.
 - The default non-root/root PUCT exploration constant for FNN search is `c_puct = 1.25`.
 - Policy target uses the visited-only improved policy used by the strongest FNN nondeterministic checkpoints: unvisited moves receive zero policy mass.
+- The default replay target now uses **adaptive temperature softening**: it starts from `T=1.0` and only raises temperature when the visited-only search target becomes too sharp, with current defaults `top1_cap=0.7` and `T ∈ [1, 7]`.
 - **Alternative:** plain PUCT MCTS (`FNNPUCTOrchestrator`) via `--puct`
 - PUCT MCTS uses wave-parallel virtual-loss search with `--puct-wave-size` (default 16).
 - Move-cap draws are excluded from value loss and can be dropped from policy training with `--draw-keep-rate 0.0`; genuine draws are retained.
@@ -317,6 +320,32 @@ python -m hive_fnn.train_fnn \
 ```
 
 The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
+
+### EMA Champion/Challenger Training
+
+Both `train_fnn` and `train_fnn_transformer` now support an EMA-based promotion loop:
+
+- the **raw model** generates self-play and receives gradient updates
+- an **EMA model** tracks that raw model during training
+- a frozen **champion** model is kept for gating
+- every `5` iterations by default, the EMA challenger plays an arena against the champion
+- if the EMA scores at least `0.52`, it is promoted to the new champion
+
+Current defaults:
+
+- `ema_decay=0.999` (often overridden lower for faster challenger tracking)
+- `ema_arena_every=5`
+- `ema_arena_games=256`
+- `ema_arena_noise_scale=0.1`
+- `ema_promotion_score=0.52`
+
+Numbered checkpoints still store the **raw** network as `model_state_dict`, but they also include:
+
+- `ema_state_dict`
+- `champion_state_dict`
+- `champion_iteration`
+
+The latest promoted champion is also written to `champion_latest.pt` in the checkpoint directory.
 
 ### FNN Key Options
 
@@ -358,18 +387,18 @@ It changes both policy and value:
 
 Current status:
 
-- model scaffold is implemented
-- CPU `GameState` graph encoding is still kept for archived diagnostics
-- CUDA `HiveState` piece-token encoding is implemented as a padded batched tensor path for training/search integration
 - GPU-native self-play and training are implemented through `hive_fnn_transformer.train_fnn_transformer`
 - the trainer reuses the FNN raw-state replay format and rebuilds FNN features, successor features, and piece-token tensors on GPU
-- this is intended as a lighter alternative to giving both policy and value a full PRS transformer trunk
+- the root-side training/search feature path is fused on CUDA to avoid separate root token/move-feature passes
+- training uses a persistent optimizer and stores optimizer / scaler / EMA / champion state in checkpoints
+- the default CLI preset is now `small`
+- the line now supports the same adaptive policy-target softening and EMA champion/challenger loop as FNN
+- this remains a lighter alternative to giving both policy and value a full PRS transformer trunk
 
 Quick smoke test:
 
 ```bash
 python3.11 -m hive_fnn_transformer.train_fnn_transformer \
-  --preset small \
   --iterations 1 \
   --games 32 \
   --simulations 64 \
@@ -381,6 +410,20 @@ Quick parameter summary:
 
 ```bash
 python3.11 -m hive_fnn_transformer
+```
+
+Recommended current training shape:
+
+```bash
+python3.11 -m hive_fnn_transformer.train_fnn_transformer \
+  --resume checkpoints_fnn_transformer/hybrid_gnn_checkpoint_XXXX.pt \
+  --games 256 \
+  --simulations 1024 \
+  --expansion-mask -1 \
+  --epochs 1 \
+  --lr 2.5e-6 \
+  --checkpoint-keep-every 5 \
+  --checkpoint-dir checkpoints_fnn_transformer_run
 ```
 
 ---
@@ -547,57 +590,17 @@ python probe_win_in_one.py --checkpoint checkpoints/hive_gpu_checkpoint_0124.pt
 python eval_value_head.py
 ```
 
-### FNN MCTS search diagnostics
-
-Inspect FNN non-root search behavior (depth distribution, visit entropy, new-leaf rate):
-
-```bash
-python fnn_search_diagnostic_nonroot.py \
-    --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt \
-    --sims 512 --positions 8
-```
-
-### PRS MCTS search diagnostics
-
-The same comparison is available for PRS v2 checkpoints:
-
-```bash
-python prs_search_diagnostic_nonroot.py \
-    --checkpoint checkpoints_prs_v2/prs_v2_iter_0600.pt \
-    --sims 256 --positions 2
-```
-
-### PRS improved-policy mass analysis
-
-Measure how much policy mass lands on MCTS-searched vs unsampled moves, and diagnose value-head calibration relative to Q_mcts:
-
-```bash
-# Mass vs sim count (four sweep: 256/512/1024/2048)
-python prs_mass_diagnostic.py \
-    --checkpoint checkpoints_prs_v2/prs_v2_iter_0600.pt \
-    --positions 30
-```
-
 ### FNN improved-policy mass analysis
 
-Measure how much policy mass lands on MCTS-searched vs unsampled moves, and diagnose value-head calibration relative to Q_mcts:
+Measure how sharp the current visited-only replay target is after search:
 
 ```bash
-# Mass vs sim count (four sweep: 256/512/1024/2048)
 python fnn_mass_diagnostic.py \
-    --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt \
-    --positions 30
-
-# Compare three fallback strategies for unsampled moves (v_pi / child_init_q / 0.0)
-python fnn_mass_fallback_compare.py \
-    --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt \
-    --positions 50 --sims 2048
-
-# Verify the prior-anchored policy target vs old v_pi approach
-python fnn_mass_new_policy.py \
-    --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt \
-    --positions 50 --sims 2048
+    --checkpoint checkpoints_FNN/hive_fnn_checkpoint_0905.pt \
+    --positions 40 --sims 1024
 ```
+
+Most older diagnostics have been moved under `archive/diagnostics`.
 
 ## GUI
 
@@ -605,7 +608,7 @@ Play against the trained AI using pygame (local only):
 
 ```bash
 # vs AI
-python gui.py --checkpoint checkpoints_fnn/hive_fnn_checkpoint_0200.pt
+python gui.py --checkpoint checkpoints_FNN/hive_fnn_checkpoint_0905.pt
 
 # AI self-play
 python gui.py --self-play
