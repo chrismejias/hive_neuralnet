@@ -74,6 +74,8 @@ class FNNMCTSConfig:
     policy_target_top1_cap:       float = 0.7
     policy_target_min_temperature: float = 1.0
     policy_target_max_temperature: float = 7.0
+    final_value_ply_count:        int   = 3
+    final_value_weight:           float = 2.0
     # Rebase each game's tree to a fresh root after applying a move.
     # This prevents node-id growth across plies from exhausting the fixed
     # tree node pool in long games.
@@ -834,17 +836,26 @@ class FNNMCTSOrchestrator:
         for i in range(B):
             winner = final_results[i]
             use_for_value = (winner != 0)
-            for state_bytes, target_pi, use_for_policy in histories[i]:
+            weighted_from = len(histories[i]) - max(0, int(cfg.final_value_ply_count))
+            for hist_idx, (state_bytes, target_pi, use_for_policy) in enumerate(histories[i]):
                 turn = int(state_bytes[_OFF_TURN]) | (
                     int(state_bytes[_OFF_TURN + 1]) << 8
                 )
                 value = self._result_to_value(winner, turn)
+                value_weight = 1.0
+                if (
+                    use_for_value
+                    and hist_idx >= weighted_from
+                    and float(cfg.final_value_weight) != 1.0
+                ):
+                    value_weight = float(cfg.final_value_weight)
                 examples[i].append(FNNTrainingExample(
                     state_bytes=state_bytes,
                     policy_target=target_pi.astype(np.float32),
                     value_target=float(value),
                     use_for_policy=bool(use_for_policy),
                     use_for_value=use_for_value,
+                    value_weight=value_weight,
                 ))
         if temp_count > 0:
             self.last_policy_temperature_stats = {

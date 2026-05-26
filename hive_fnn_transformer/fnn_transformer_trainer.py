@@ -57,11 +57,10 @@ class HybridTrainConfig:
 
     draw_keep_rate: float = 1.0
     expansion_mask: int = 0
-    graph_radius: int = 2
     device: str | None = None
     use_amp: bool | None = None
     gumbel_wave_parallel: bool = True
-    short_forced_win_probe: bool = False
+    short_forced_win_probe: bool = True
     probe_win_in_one: bool = True
     probe_check_opponent_wins: bool = True
     probe_win_in_two: bool = True
@@ -70,12 +69,16 @@ class HybridTrainConfig:
     policy_target_top1_cap: float = 0.7
     policy_target_min_temperature: float = 1.0
     policy_target_max_temperature: float = 7.0
+    final_value_ply_count: int = 3
+    final_value_weight: float = 2.0
+    merge_opening_value_examples: bool = True
+    opening_value_merge_plies: int = 4
     ema_decay: float = 0.999
     ema_arena_enabled: bool = True
     ema_arena_every: int = 5
     ema_arena_games: int = 256
     ema_arena_noise_scale: float = 0.1
-    ema_promotion_score: float = 0.52
+    ema_promotion_score: float = 0.55
 
 
 def _simulations_for_iteration(
@@ -106,6 +109,8 @@ class HybridTrainer:
             device=self.device,
             cache_root_features=False,
             gpu_sampling=self.device.type == "cuda",
+            merge_opening_value_examples=self.config.merge_opening_value_examples,
+            opening_value_merge_plies=self.config.opening_value_merge_plies,
         )
         self.elo_tracker = EloTracker()
         self._start_iter = 1
@@ -133,6 +138,18 @@ class HybridTrainer:
     @staticmethod
     def _sync_model(dst: torch.nn.Module, src: torch.nn.Module) -> None:
         dst.load_state_dict(src.state_dict())
+
+    def _rebuild_optimizer(self) -> None:
+        self.optimizer = optim.Adam(
+            self.best_net.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=self.config.weight_decay,
+        )
+
+    def _reset_raw_to_champion(self) -> None:
+        self._sync_model(self.best_net, self.champion_net)
+        self._sync_model(self.ema_net, self.champion_net)
+        self._rebuild_optimizer()
 
     def _update_ema(self) -> None:
         decay = float(self.config.ema_decay)
@@ -254,6 +271,8 @@ class HybridTrainer:
                     self._arena_checkpoint_payload(self.champion_net, iteration),
                     champion_path,
                 )
+            else:
+                self._reset_raw_to_champion()
             return {
                 "wins": wins,
                 "games": games,
@@ -340,7 +359,6 @@ class HybridTrainer:
                 max_game_length=cfg.max_game_length,
                 expansion_mask=cfg.expansion_mask,
                 wave_parallel=cfg.gumbel_wave_parallel,
-                graph_radius=cfg.graph_radius,
                 short_forced_win_probe=cfg.short_forced_win_probe,
                 probe_win_in_one=cfg.probe_win_in_one,
                 probe_check_opponent_wins=cfg.probe_check_opponent_wins,
@@ -558,6 +576,7 @@ class HybridTrainer:
                             batch.num_actions,
                             batch.policy_mask,
                             batch.value_mask,
+                            batch.value_weights,
                         )
                     timing_sums["forward_loss"] += time.perf_counter() - t_fwd
                     t_bwd = time.perf_counter()
@@ -583,6 +602,7 @@ class HybridTrainer:
                         batch.num_actions,
                         batch.policy_mask,
                         batch.value_mask,
+                        batch.value_weights,
                     )
                     timing_sums["forward_loss"] += time.perf_counter() - t_fwd
                     t_bwd = time.perf_counter()

@@ -67,7 +67,7 @@ class FNNTrainConfig:
     puct_wave_size: int = 16
     queen_surround_reserve_slots: int = 6
     queen_surround_reserve_immobile_only: bool = True
-    short_forced_win_probe: bool = False
+    short_forced_win_probe: bool = True
     probe_win_in_one: bool = True
     probe_check_opponent_wins: bool = True
     probe_win_in_two: bool = True
@@ -76,12 +76,16 @@ class FNNTrainConfig:
     policy_target_top1_cap: float = 0.7
     policy_target_min_temperature: float = 1.0
     policy_target_max_temperature: float = 7.0
+    final_value_ply_count: int = 3
+    final_value_weight: float = 2.0
+    merge_opening_value_examples: bool = True
+    opening_value_merge_plies: int = 4
     ema_decay: float = 0.999
     ema_arena_enabled: bool = True
     ema_arena_every: int = 5
     ema_arena_games: int = 256
     ema_arena_noise_scale: float = 0.1
-    ema_promotion_score: float = 0.52
+    ema_promotion_score: float = 0.55
 
 
 def _simulations_for_iteration(
@@ -148,6 +152,7 @@ def compute_fnn_loss(
     num_actions: torch.Tensor,
     policy_mask: torch.Tensor,
     value_mask: torch.Tensor,
+    value_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Combined loss: policy cross-entropy + value MSE."""
     policy_loss = _policy_cross_entropy(
@@ -156,7 +161,15 @@ def compute_fnn_loss(
     value_diff = (root_values.squeeze(-1) - value_targets.squeeze(-1)) ** 2
     mask_1d = value_mask.squeeze(-1)
     if mask_1d.sum() > 0:
-        value_loss = (value_diff * mask_1d).sum() / mask_1d.sum()
+        if value_weights is None:
+            weighted_mask = mask_1d
+        else:
+            weighted_mask = mask_1d * value_weights.squeeze(-1)
+        denom = weighted_mask.sum()
+        if denom > 0:
+            value_loss = (value_diff * weighted_mask).sum() / denom
+        else:
+            value_loss = torch.tensor(0.0, device=root_values.device)
     else:
         value_loss = torch.tensor(0.0, device=root_values.device)
 
@@ -185,6 +198,8 @@ class FNNTrainer:
             device=self.device,
             cache_root_features=self.device.type == "cuda",
             gpu_sampling=self.device.type == "cuda",
+            merge_opening_value_examples=self.config.merge_opening_value_examples,
+            opening_value_merge_plies=self.config.opening_value_merge_plies,
         )
         self.elo_tracker = EloTracker()
         self._start_iter = 1
@@ -207,6 +222,10 @@ class FNNTrainer:
     @staticmethod
     def _sync_model(dst: torch.nn.Module, src: torch.nn.Module) -> None:
         dst.load_state_dict(src.state_dict())
+
+    def _reset_raw_to_champion(self) -> None:
+        self._sync_model(self.best_net, self.champion_net)
+        self._sync_model(self.ema_net, self.champion_net)
 
     def _update_ema(self) -> None:
         decay = float(self.config.ema_decay)
@@ -329,6 +348,8 @@ class FNNTrainer:
                     self._arena_checkpoint_payload(self.champion_net, iteration),
                     champion_path,
                 )
+            else:
+                self._reset_raw_to_champion()
             return {
                 "wins": wins,
                 "games": games,
@@ -618,6 +639,7 @@ class FNNTrainer:
                             batch.num_actions,
                             batch.policy_mask,
                             batch.value_mask,
+                            batch.value_weights,
                         )
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(opt)
@@ -639,6 +661,7 @@ class FNNTrainer:
                         batch.num_actions,
                         batch.policy_mask,
                         batch.value_mask,
+                        batch.value_weights,
                     )
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(

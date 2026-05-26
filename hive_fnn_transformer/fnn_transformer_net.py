@@ -30,13 +30,11 @@ class HybridGNNConfig:
     fnn_config: FNNConfig | None = None
     graph_hidden_dim: int = 64
     graph_layers: int = 4
-    graph_radius: int = 2
     graph_mlp_hidden: int = 96
     num_heads: int = 8
     max_piece_tokens: int = MAX_PIECE_TOKENS
     rel_coord_clip: int = 8
     rel_height_clip: int = 2
-    global_pool_bias: bool = True
     value_hidden: int = 128
     move_feat_dim: int = MOVE_FEAT_DIM
     node_feat_dim: int = NODE_FEAT_DIM
@@ -48,7 +46,6 @@ class HybridGNNConfig:
             fnn_config=FNNConfig.medium(),
             graph_hidden_dim=64,
             graph_layers=4,
-            graph_radius=2,
             graph_mlp_hidden=96,
             value_hidden=96,
         )
@@ -59,98 +56,9 @@ class HybridGNNConfig:
             fnn_config=FNNConfig.large(),
             graph_hidden_dim=96,
             graph_layers=6,
-            graph_radius=2,
             graph_mlp_hidden=96,
             value_hidden=160,
         )
-
-    @property
-    def edge_feat_dim(self) -> int:
-        return 3
-
-
-def _mean_max_pool(
-    node_h: torch.Tensor,
-    batch: torch.Tensor,
-    batch_size: int,
-) -> torch.Tensor:
-    hidden = node_h.size(1)
-    mean_pool = torch.zeros(batch_size, hidden, device=node_h.device, dtype=node_h.dtype)
-    counts = torch.zeros(batch_size, 1, device=node_h.device, dtype=node_h.dtype)
-    mean_pool.scatter_add_(0, batch.unsqueeze(1).expand_as(node_h), node_h)
-    counts.scatter_add_(
-        0,
-        batch.unsqueeze(1),
-        torch.ones(batch.size(0), 1, device=node_h.device, dtype=node_h.dtype),
-    )
-    mean_pool = mean_pool / counts.clamp_min(1.0)
-
-    max_pool = torch.full(
-        (batch_size, hidden),
-        -torch.inf,
-        device=node_h.device,
-        dtype=node_h.dtype,
-    )
-    max_pool.scatter_reduce_(
-        0,
-        batch.unsqueeze(1).expand_as(node_h),
-        node_h,
-        reduce="amax",
-        include_self=False,
-    )
-    max_pool = max_pool.masked_fill(max_pool == -torch.inf, 0.0)
-    return torch.cat([mean_pool, max_pool], dim=1)
-
-
-class HybridMessagePassingLayer(nn.Module):
-    """Legacy message-passing block retained for archived diagnostics."""
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        edge_feat_dim: int,
-        mlp_hidden: int,
-        global_pool_bias: bool,
-    ) -> None:
-        super().__init__()
-        self.message_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + edge_feat_dim, mlp_hidden),
-            nn.ReLU(),
-            nn.Linear(mlp_hidden, hidden_dim),
-        )
-        self.update_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2, mlp_hidden),
-            nn.ReLU(),
-            nn.Linear(mlp_hidden, hidden_dim),
-        )
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.global_pool_bias = bool(global_pool_bias)
-        if self.global_pool_bias:
-            self.global_proj = nn.Linear(hidden_dim * 2, hidden_dim)
-
-    def forward(
-        self,
-        node_h: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_features: torch.Tensor,
-        batch: torch.Tensor,
-        batch_size: int,
-    ) -> torch.Tensor:
-        if edge_index.numel() == 0:
-            out = self.norm(node_h)
-        else:
-            src = edge_index[0]
-            dst = edge_index[1]
-            msg_in = torch.cat([node_h[dst], node_h[src], edge_features], dim=1)
-            messages = self.message_mlp(msg_in)
-            aggregated = torch.zeros_like(node_h)
-            aggregated.scatter_add_(0, dst.unsqueeze(1).expand_as(messages), messages)
-            update = self.update_mlp(torch.cat([node_h, aggregated], dim=1))
-            out = self.norm(node_h + update)
-
-        if self.global_pool_bias:
-            out = out + self.global_proj(_mean_max_pool(out, batch, batch_size))[batch]
-        return out
 
 class RelativeSelfAttention(nn.Module):
     def __init__(self, hidden_dim: int, num_heads: int, rel_coord_clip: int, rel_height_clip: int) -> None:

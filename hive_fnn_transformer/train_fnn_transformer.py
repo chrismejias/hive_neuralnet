@@ -29,12 +29,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preset", choices=["small", "large"], default="small")
     p.add_argument("--graph-hidden-dim", type=int, default=None)
     p.add_argument("--graph-layers", type=int, default=None)
-    p.add_argument(
-        "--graph-radius",
-        type=int,
-        default=2,
-        help="Deprecated for the transformer trunk; retained for CLI compatibility.",
-    )
     p.add_argument("--graph-mlp-hidden", type=int, default=None)
     p.add_argument("--value-hidden", type=int, default=None)
     p.add_argument("--fnn-preset", choices=["small", "medium", "large"], default=None)
@@ -62,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--short-forced-win-probe",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
     p.add_argument(
         "--probe-win-in-one",
@@ -99,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ema-arena-every", type=int, default=5)
     p.add_argument("--ema-arena-games", type=int, default=256)
     p.add_argument("--ema-arena-noise-scale", type=float, default=0.1)
-    p.add_argument("--ema-promotion-score", type=float, default=0.52)
+    p.add_argument("--ema-promotion-score", type=float, default=0.55)
     p.add_argument("--buffer-size", type=int, default=100_000)
     p.add_argument("--policy-target-temperature", type=float, default=1.0)
     p.add_argument(
@@ -111,6 +105,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--policy-target-top1-cap", type=float, default=0.7)
     p.add_argument("--policy-target-min-temperature", type=float, default=1.0)
     p.add_argument("--policy-target-max-temperature", type=float, default=7.0)
+    p.add_argument("--final-value-ply-count", type=int, default=3)
+    p.add_argument("--final-value-weight", type=float, default=2.0)
+    p.add_argument(
+        "--merge-opening-value-examples",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--opening-value-merge-plies", type=int, default=4)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints_fnn_transformer")
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
     p.add_argument("--resume", type=str, default=None)
@@ -129,7 +131,6 @@ def _build_net_config(args: argparse.Namespace) -> HybridGNNConfig:
     cfg = HybridGNNConfig.large() if args.preset == "large" else HybridGNNConfig.small()
     if args.fnn_preset:
         cfg.fnn_config = getattr(FNNConfig, args.fnn_preset)()
-    cfg.graph_radius = args.graph_radius
     if args.graph_hidden_dim is not None:
         cfg.graph_hidden_dim = args.graph_hidden_dim
     if args.graph_layers is not None:
@@ -171,6 +172,10 @@ def main() -> None:
         policy_target_top1_cap=args.policy_target_top1_cap,
         policy_target_min_temperature=args.policy_target_min_temperature,
         policy_target_max_temperature=args.policy_target_max_temperature,
+        final_value_ply_count=args.final_value_ply_count,
+        final_value_weight=args.final_value_weight,
+        merge_opening_value_examples=args.merge_opening_value_examples,
+        opening_value_merge_plies=args.opening_value_merge_plies,
         ema_decay=args.ema_decay,
         ema_arena_enabled=args.ema_arena_enabled,
         ema_arena_every=args.ema_arena_every,
@@ -181,7 +186,6 @@ def main() -> None:
         checkpoint_keep_every=args.checkpoint_keep_every,
         expansion_mask=args.expansion_mask,
         draw_keep_rate=args.draw_keep_rate,
-        graph_radius=args.graph_radius,
         gumbel_wave_parallel=args.gumbel_wave_parallel,
         short_forced_win_probe=args.short_forced_win_probe,
         probe_win_in_one=args.probe_win_in_one,

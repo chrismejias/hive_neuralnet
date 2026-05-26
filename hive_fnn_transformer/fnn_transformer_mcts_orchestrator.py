@@ -19,7 +19,7 @@ from hive_fnn_transformer.fnn_transformer_net import HiveHybridGNN
 
 @dataclass
 class HybridMCTSConfig(FNNMCTSConfig):
-    graph_radius: int = 2
+    pass
 
 
 class HybridMCTSOrchestrator(FNNMCTSOrchestrator):

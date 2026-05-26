@@ -54,6 +54,10 @@ def _build_fnn_trainer(args: argparse.Namespace) -> FNNTrainer:
         policy_target_top1_cap=args.policy_target_top1_cap,
         policy_target_min_temperature=args.policy_target_min_temperature,
         policy_target_max_temperature=args.policy_target_max_temperature,
+        final_value_ply_count=args.final_value_ply_count,
+        final_value_weight=args.final_value_weight,
+        merge_opening_value_examples=args.merge_opening_value_examples,
+        opening_value_merge_plies=args.opening_value_merge_plies,
     )
     trainer = FNNTrainer(train_cfg, FNNConfig.large())
     trainer.load_checkpoint(args.fnn_checkpoint)
@@ -80,13 +84,16 @@ def _build_hybrid_trainer(args: argparse.Namespace) -> HybridTrainer | None:
         checkpoint_keep_every=args.checkpoint_keep_every,
         expansion_mask=args.expansion_mask,
         draw_keep_rate=args.draw_keep_rate,
-        graph_radius=2,
         gumbel_wave_parallel=True,
         policy_target_temperature=args.policy_target_temperature,
         adaptive_policy_target_temperature=args.adaptive_policy_target_temperature,
         policy_target_top1_cap=args.policy_target_top1_cap,
         policy_target_min_temperature=args.policy_target_min_temperature,
         policy_target_max_temperature=args.policy_target_max_temperature,
+        final_value_ply_count=args.final_value_ply_count,
+        final_value_weight=args.final_value_weight,
+        merge_opening_value_examples=args.merge_opening_value_examples,
+        opening_value_merge_plies=args.opening_value_merge_plies,
     )
     trainer = HybridTrainer(train_cfg, HybridGNNConfig.small())
     if args.hybrid_checkpoint:
@@ -222,7 +229,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--short-forced-win-probe",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
     )
     p.add_argument(
         "--probe-win-in-one",
@@ -254,6 +261,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--policy-target-top1-cap", type=float, default=0.7)
     p.add_argument("--policy-target-min-temperature", type=float, default=1.0)
     p.add_argument("--policy-target-max-temperature", type=float, default=7.0)
+    p.add_argument("--final-value-ply-count", type=int, default=3)
+    p.add_argument("--final-value-weight", type=float, default=2.0)
+    p.add_argument(
+        "--merge-opening-value-examples",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    p.add_argument("--opening-value-merge-plies", type=int, default=4)
     p.add_argument("--checkpoint-keep-every", type=int, default=1)
 
     p.add_argument("--fnn-checkpoint", required=True)

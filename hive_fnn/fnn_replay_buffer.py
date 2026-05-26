@@ -11,6 +11,8 @@ import torch
 import hive_gpu
 from hive_fnn.fnn_features import FEAT_DIM
 
+_OFF_TURN = 3412
+
 
 class FNNTrainingExample(NamedTuple):
     """Root-state training example with policy over its legal move list."""
@@ -20,6 +22,7 @@ class FNNTrainingExample(NamedTuple):
     value_target: float
     use_for_policy: bool = True
     use_for_value: bool = True
+    value_weight: float = 1.0
     surprise_weight: float = 1.0
 
 
@@ -31,6 +34,7 @@ class FNNTrainingBatch:
     value_targets: torch.Tensor
     policy_mask: torch.Tensor
     value_mask: torch.Tensor
+    value_weights: torch.Tensor
     root_features: torch.Tensor | None = None
     legal_moves: torch.Tensor | None = None
 
@@ -42,6 +46,7 @@ class FNNTrainingBatch:
             value_targets=self.value_targets.to(device, non_blocking=non_blocking),
             policy_mask=self.policy_mask.to(device, non_blocking=non_blocking),
             value_mask=self.value_mask.to(device, non_blocking=non_blocking),
+            value_weights=self.value_weights.to(device, non_blocking=non_blocking),
             root_features=(
                 None if self.root_features is None
                 else self.root_features.to(device, non_blocking=non_blocking)
@@ -63,11 +68,15 @@ class FNNReplayBuffer:
         device: torch.device | str | None = None,
         cache_root_features: bool = True,
         gpu_sampling: bool = True,
+        merge_opening_value_examples: bool = True,
+        opening_value_merge_plies: int = 4,
     ) -> None:
         self.max_size = int(max_size)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self.cache_root_features = bool(cache_root_features)
         self.gpu_sampling = bool(gpu_sampling and self.device.type == "cuda")
+        self.merge_opening_value_examples = bool(merge_opening_value_examples)
+        self.opening_value_merge_plies = max(0, int(opening_value_merge_plies))
         self.ext = hive_gpu.load_extension()
         self.max_actions = int(self.ext.MAX_LEGAL_MOVES)
         self.move_size = int(self.ext.SIZEOF_GPU_MOVE)
@@ -84,6 +93,7 @@ class FNNReplayBuffer:
         self._policy_mask_cpu: torch.Tensor | None = None
         self._value_mask_cpu: torch.Tensor | None = None
         self._weights_cpu: torch.Tensor | None = None
+        self._value_weights_cpu: torch.Tensor | None = None
         self._root_features_cpu: torch.Tensor | None = None
         self._legal_moves_cpu: torch.Tensor | None = None
 
@@ -94,6 +104,7 @@ class FNNReplayBuffer:
         self._policy_mask_gpu: torch.Tensor | None = None
         self._value_mask_gpu: torch.Tensor | None = None
         self._weights_gpu: torch.Tensor | None = None
+        self._value_weights_gpu: torch.Tensor | None = None
         self._root_features_gpu: torch.Tensor | None = None
         self._legal_moves_gpu: torch.Tensor | None = None
 
@@ -124,6 +135,9 @@ class FNNReplayBuffer:
         self._weights_cpu = torch.ones(
             (self.max_size,), dtype=torch.float32, pin_memory=pin,
         )
+        self._value_weights_cpu = torch.ones(
+            (self.max_size, 1), dtype=torch.float32, pin_memory=pin,
+        )
         if self.cache_root_features:
             self._root_features_cpu = torch.zeros(
                 (self.max_size, FEAT_DIM), dtype=torch.float16, pin_memory=pin,
@@ -145,6 +159,7 @@ class FNNReplayBuffer:
         self._policy_mask_gpu = torch.zeros((self.max_size, 1), dtype=torch.float32, device=dev)
         self._value_mask_gpu = torch.zeros((self.max_size, 1), dtype=torch.float32, device=dev)
         self._weights_gpu = torch.ones((self.max_size,), dtype=torch.float32, device=dev)
+        self._value_weights_gpu = torch.ones((self.max_size, 1), dtype=torch.float32, device=dev)
         if self.cache_root_features:
             self._root_features_gpu = torch.zeros(
                 (self.max_size, FEAT_DIM), dtype=torch.float16, device=dev,
@@ -166,6 +181,7 @@ class FNNReplayBuffer:
     def add_examples(self, examples: list[FNNTrainingExample]) -> None:
         if not examples:
             return
+        examples = self._compact_opening_value_examples(examples)
         if self.state_size is None:
             self._allocate_storage(int(examples[0].state_bytes.shape[0]))
         assert self._states_cpu is not None
@@ -179,6 +195,56 @@ class FNNReplayBuffer:
         self._next_idx = (self._next_idx + count) % self.max_size
         self._size = min(self.max_size, self._size + count)
 
+    @staticmethod
+    def _state_turn(state_bytes: np.ndarray) -> int:
+        return int(state_bytes[_OFF_TURN]) | (int(state_bytes[_OFF_TURN + 1]) << 8)
+
+    def _compact_opening_value_examples(
+        self,
+        examples: list[FNNTrainingExample],
+    ) -> list[FNNTrainingExample]:
+        if not self.merge_opening_value_examples or self.opening_value_merge_plies <= 0:
+            return examples
+
+        merged: list[FNNTrainingExample] = []
+        opening_groups: dict[bytes, list[FNNTrainingExample]] = {}
+
+        for ex in examples:
+            if (
+                not ex.use_for_value
+                or self._state_turn(ex.state_bytes) >= self.opening_value_merge_plies
+            ):
+                merged.append(ex)
+                continue
+            opening_groups.setdefault(ex.state_bytes.tobytes(), []).append(ex)
+
+        for grouped in opening_groups.values():
+            if len(grouped) == 1:
+                merged.append(grouped[0])
+                continue
+
+            for ex in grouped:
+                merged.append(ex._replace(use_for_value=False))
+
+            total_weight = sum(float(ex.value_weight) for ex in grouped)
+            if total_weight <= 0.0:
+                total_weight = float(len(grouped))
+            avg_value = sum(
+                float(ex.value_target) * float(ex.value_weight) for ex in grouped
+            ) / total_weight
+            rep = grouped[0]
+            merged.append(FNNTrainingExample(
+                state_bytes=rep.state_bytes,
+                policy_target=rep.policy_target,
+                value_target=float(avg_value),
+                use_for_policy=False,
+                use_for_value=True,
+                value_weight=float(total_weight),
+                surprise_weight=rep.surprise_weight,
+            ))
+
+        return merged
+
     def _write_chunk(self, examples: list[FNNTrainingExample], dst_lo: int) -> None:
         if not examples:
             return
@@ -190,6 +256,7 @@ class FNNReplayBuffer:
         assert self._policy_mask_cpu is not None
         assert self._value_mask_cpu is not None
         assert self._weights_cpu is not None
+        assert self._value_weights_cpu is not None
 
         states_np = np.stack([ex.state_bytes for ex in examples], axis=0).astype(np.uint8, copy=False)
         policy_np = np.zeros((B, self.max_actions), dtype=np.float16)
@@ -198,6 +265,7 @@ class FNNReplayBuffer:
         policy_mask_np = np.zeros((B, 1), dtype=np.float32)
         value_mask_np = np.zeros((B, 1), dtype=np.float32)
         weights_np = np.ones((B,), dtype=np.float32)
+        value_weights_np = np.ones((B, 1), dtype=np.float32)
         self._uniform_weights = self._uniform_weights and all(
             ex.surprise_weight == 1.0 for ex in examples
         )
@@ -210,6 +278,7 @@ class FNNReplayBuffer:
             policy_mask_np[i, 0] = float(ex.use_for_policy)
             value_mask_np[i, 0] = float(ex.use_for_value)
             weights_np[i] = ex.surprise_weight
+            value_weights_np[i, 0] = ex.value_weight
 
         dst = slice(dst_lo, dst_lo + B)
         states_cpu = torch.from_numpy(states_np)
@@ -219,6 +288,7 @@ class FNNReplayBuffer:
         policy_mask_cpu = torch.from_numpy(policy_mask_np)
         value_mask_cpu = torch.from_numpy(value_mask_np)
         weights_cpu = torch.from_numpy(weights_np)
+        value_weights_cpu = torch.from_numpy(value_weights_np)
 
         self._states_cpu[dst].copy_(states_cpu, non_blocking=False)
         self._policy_cpu[dst].copy_(policy_cpu, non_blocking=False)
@@ -227,6 +297,7 @@ class FNNReplayBuffer:
         self._policy_mask_cpu[dst].copy_(policy_mask_cpu, non_blocking=False)
         self._value_mask_cpu[dst].copy_(value_mask_cpu, non_blocking=False)
         self._weights_cpu[dst].copy_(weights_cpu, non_blocking=False)
+        self._value_weights_cpu[dst].copy_(value_weights_cpu, non_blocking=False)
 
         states_gpu = states_cpu.to(self.device, non_blocking=True) if self.device.type == "cuda" else states_cpu
         legal_moves_gpu = None
@@ -257,6 +328,7 @@ class FNNReplayBuffer:
         assert self._policy_mask_gpu is not None
         assert self._value_mask_gpu is not None
         assert self._weights_gpu is not None
+        assert self._value_weights_gpu is not None
         self._states_gpu[dst].copy_(states_gpu, non_blocking=True)
         self._policy_gpu[dst].copy_(policy_cpu.to(self.device, non_blocking=True), non_blocking=True)
         self._num_actions_gpu[dst].copy_(num_actions_cpu.to(self.device, non_blocking=True), non_blocking=True)
@@ -264,6 +336,7 @@ class FNNReplayBuffer:
         self._policy_mask_gpu[dst].copy_(policy_mask_cpu.to(self.device, non_blocking=True), non_blocking=True)
         self._value_mask_gpu[dst].copy_(value_mask_cpu.to(self.device, non_blocking=True), non_blocking=True)
         self._weights_gpu[dst].copy_(weights_cpu.to(self.device, non_blocking=True), non_blocking=True)
+        self._value_weights_gpu[dst].copy_(value_weights_cpu.to(self.device, non_blocking=True), non_blocking=True)
         if self.cache_root_features:
             assert legal_moves_gpu is not None and root_features_gpu is not None
             assert self._root_features_gpu is not None
@@ -307,6 +380,7 @@ class FNNReplayBuffer:
         assert self._values_gpu is not None
         assert self._policy_mask_gpu is not None
         assert self._value_mask_gpu is not None
+        assert self._value_weights_gpu is not None
         idx = self._sample_indices(batch_size, device)
         root_features = None
         legal_moves = None
@@ -322,6 +396,7 @@ class FNNReplayBuffer:
             value_targets=self._values_gpu.index_select(0, idx),
             policy_mask=self._policy_mask_gpu.index_select(0, idx),
             value_mask=self._value_mask_gpu.index_select(0, idx),
+            value_weights=self._value_weights_gpu.index_select(0, idx),
             root_features=root_features,
             legal_moves=legal_moves,
         )
@@ -333,6 +408,7 @@ class FNNReplayBuffer:
         assert self._values_cpu is not None
         assert self._policy_mask_cpu is not None
         assert self._value_mask_cpu is not None
+        assert self._value_weights_cpu is not None
         idx = self._sample_indices(batch_size, torch.device("cpu"))
         root_features = None
         legal_moves = None
@@ -348,6 +424,7 @@ class FNNReplayBuffer:
             value_targets=self._values_cpu.index_select(0, idx),
             policy_mask=self._policy_mask_cpu.index_select(0, idx),
             value_mask=self._value_mask_cpu.index_select(0, idx),
+            value_weights=self._value_weights_cpu.index_select(0, idx),
             root_features=root_features,
             legal_moves=legal_moves,
         )

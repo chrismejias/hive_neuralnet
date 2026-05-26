@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--short-forced-win-probe",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Enable root-only tactical probes: gated win-in-1, surround-4 forced "
             "wins in 2, and surround-5 threat conversions."
@@ -143,6 +143,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=7.0,
         help="Maximum replay policy target temperature when adaptive temperature is enabled.",
+    )
+    p.add_argument(
+        "--final-value-ply-count",
+        type=int,
+        default=3,
+        help="Upweight value loss on the final N plies of decisive games.",
+    )
+    p.add_argument(
+        "--final-value-weight",
+        type=float,
+        default=2.0,
+        help="Value-loss multiplier applied to the final weighted plies of decisive games.",
+    )
+    p.add_argument(
+        "--merge-opening-value-examples",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Merge identical opening states for value-only supervision in replay.",
+    )
+    p.add_argument(
+        "--opening-value-merge-plies",
+        type=int,
+        default=4,
+        help="Merge identical opening states only for plies before this turn count.",
     )
     p.add_argument("--max-game-length", type=int, default=300)
     p.add_argument(
@@ -197,7 +221,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ema-arena-every", type=int, default=5)
     p.add_argument("--ema-arena-games", type=int, default=256)
     p.add_argument("--ema-arena-noise-scale", type=float, default=0.1)
-    p.add_argument("--ema-promotion-score", type=float, default=0.52)
+    p.add_argument("--ema-promotion-score", type=float, default=0.55)
     p.add_argument("--buffer-size", type=int, default=100_000)
     p.add_argument("--checkpoint-dir", type=str, default="checkpoints_fnn")
     p.add_argument("--checkpoint-keep-every", type=int, default=0)
@@ -267,6 +291,10 @@ def main() -> None:
         policy_target_top1_cap=args.policy_target_top1_cap,
         policy_target_min_temperature=args.policy_target_min_temperature,
         policy_target_max_temperature=args.policy_target_max_temperature,
+        final_value_ply_count=args.final_value_ply_count,
+        final_value_weight=args.final_value_weight,
+        merge_opening_value_examples=args.merge_opening_value_examples,
+        opening_value_merge_plies=args.opening_value_merge_plies,
         ema_decay=args.ema_decay,
         ema_arena_enabled=args.ema_arena_enabled,
         ema_arena_every=args.ema_arena_every,
