@@ -12,6 +12,10 @@ import hive_gpu
 from hive_fnn.fnn_features import FEAT_DIM
 
 _OFF_TURN = 3412
+_HYBRID_NODE_FEAT_DIM = 26
+_HYBRID_GLOBAL_FEAT_DIM = 6
+_HYBRID_MAX_PIECE_TOKENS = 28
+_HYBRID_MOVE_FEAT_DIM = 25
 
 
 class FNNTrainingExample(NamedTuple):
@@ -37,6 +41,13 @@ class FNNTrainingBatch:
     value_weights: torch.Tensor
     root_features: torch.Tensor | None = None
     legal_moves: torch.Tensor | None = None
+    token_features: torch.Tensor | None = None
+    token_q: torch.Tensor | None = None
+    token_r: torch.Tensor | None = None
+    token_z: torch.Tensor | None = None
+    token_mask: torch.Tensor | None = None
+    global_features: torch.Tensor | None = None
+    move_features: torch.Tensor | None = None
 
     def to(self, device: torch.device, non_blocking: bool = False) -> FNNTrainingBatch:
         return FNNTrainingBatch(
@@ -55,6 +66,34 @@ class FNNTrainingBatch:
                 None if self.legal_moves is None
                 else self.legal_moves.to(device, non_blocking=non_blocking)
             ),
+            token_features=(
+                None if self.token_features is None
+                else self.token_features.to(device, non_blocking=non_blocking)
+            ),
+            token_q=(
+                None if self.token_q is None
+                else self.token_q.to(device, non_blocking=non_blocking)
+            ),
+            token_r=(
+                None if self.token_r is None
+                else self.token_r.to(device, non_blocking=non_blocking)
+            ),
+            token_z=(
+                None if self.token_z is None
+                else self.token_z.to(device, non_blocking=non_blocking)
+            ),
+            token_mask=(
+                None if self.token_mask is None
+                else self.token_mask.to(device, non_blocking=non_blocking)
+            ),
+            global_features=(
+                None if self.global_features is None
+                else self.global_features.to(device, non_blocking=non_blocking)
+            ),
+            move_features=(
+                None if self.move_features is None
+                else self.move_features.to(device, non_blocking=non_blocking)
+            ),
         )
 
 
@@ -67,13 +106,15 @@ class FNNReplayBuffer:
         *,
         device: torch.device | str | None = None,
         cache_root_features: bool = True,
+        cache_hybrid_root_features: bool = False,
         gpu_sampling: bool = True,
         merge_opening_value_examples: bool = True,
         opening_value_merge_plies: int = 4,
     ) -> None:
         self.max_size = int(max_size)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.cache_root_features = bool(cache_root_features)
+        self.cache_hybrid_root_features = bool(cache_hybrid_root_features)
+        self.cache_root_features = bool(cache_root_features or self.cache_hybrid_root_features)
         self.gpu_sampling = bool(gpu_sampling and self.device.type == "cuda")
         self.merge_opening_value_examples = bool(merge_opening_value_examples)
         self.opening_value_merge_plies = max(0, int(opening_value_merge_plies))
@@ -96,6 +137,13 @@ class FNNReplayBuffer:
         self._value_weights_cpu: torch.Tensor | None = None
         self._root_features_cpu: torch.Tensor | None = None
         self._legal_moves_cpu: torch.Tensor | None = None
+        self._token_features_cpu: torch.Tensor | None = None
+        self._token_q_cpu: torch.Tensor | None = None
+        self._token_r_cpu: torch.Tensor | None = None
+        self._token_z_cpu: torch.Tensor | None = None
+        self._token_mask_cpu: torch.Tensor | None = None
+        self._global_features_cpu: torch.Tensor | None = None
+        self._move_features_cpu: torch.Tensor | None = None
 
         self._states_gpu: torch.Tensor | None = None
         self._policy_gpu: torch.Tensor | None = None
@@ -107,6 +155,13 @@ class FNNReplayBuffer:
         self._value_weights_gpu: torch.Tensor | None = None
         self._root_features_gpu: torch.Tensor | None = None
         self._legal_moves_gpu: torch.Tensor | None = None
+        self._token_features_gpu: torch.Tensor | None = None
+        self._token_q_gpu: torch.Tensor | None = None
+        self._token_r_gpu: torch.Tensor | None = None
+        self._token_z_gpu: torch.Tensor | None = None
+        self._token_mask_gpu: torch.Tensor | None = None
+        self._global_features_gpu: torch.Tensor | None = None
+        self._move_features_gpu: torch.Tensor | None = None
 
     def __len__(self) -> int:
         return self._size
@@ -147,6 +202,32 @@ class FNNReplayBuffer:
                 dtype=torch.uint8,
                 pin_memory=pin,
             )
+        if self.cache_hybrid_root_features:
+            self._token_features_cpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS, _HYBRID_NODE_FEAT_DIM),
+                dtype=torch.float16,
+                pin_memory=pin,
+            )
+            self._token_q_cpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS), dtype=torch.int16, pin_memory=pin,
+            )
+            self._token_r_cpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS), dtype=torch.int16, pin_memory=pin,
+            )
+            self._token_z_cpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS), dtype=torch.int16, pin_memory=pin,
+            )
+            self._token_mask_cpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS), dtype=torch.bool, pin_memory=pin,
+            )
+            self._global_features_cpu = torch.zeros(
+                (self.max_size, _HYBRID_GLOBAL_FEAT_DIM), dtype=torch.float16, pin_memory=pin,
+            )
+            self._move_features_cpu = torch.zeros(
+                (self.max_size, self.max_actions, _HYBRID_MOVE_FEAT_DIM),
+                dtype=torch.float16,
+                pin_memory=pin,
+            )
 
         if not self.gpu_sampling:
             return
@@ -167,6 +248,32 @@ class FNNReplayBuffer:
             self._legal_moves_gpu = torch.zeros(
                 (self.max_size, self.max_actions, self.move_size),
                 dtype=torch.uint8,
+                device=dev,
+            )
+        if self.cache_hybrid_root_features:
+            self._token_features_gpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS, _HYBRID_NODE_FEAT_DIM),
+                dtype=torch.float16,
+                device=dev,
+            )
+            self._token_q_gpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS), dtype=torch.int16, device=dev,
+            )
+            self._token_r_gpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS), dtype=torch.int16, device=dev,
+            )
+            self._token_z_gpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS), dtype=torch.int16, device=dev,
+            )
+            self._token_mask_gpu = torch.zeros(
+                (self.max_size, _HYBRID_MAX_PIECE_TOKENS), dtype=torch.bool, device=dev,
+            )
+            self._global_features_gpu = torch.zeros(
+                (self.max_size, _HYBRID_GLOBAL_FEAT_DIM), dtype=torch.float16, device=dev,
+            )
+            self._move_features_gpu = torch.zeros(
+                (self.max_size, self.max_actions, _HYBRID_MOVE_FEAT_DIM),
+                dtype=torch.float16,
                 device=dev,
             )
 
@@ -302,7 +409,59 @@ class FNNReplayBuffer:
         states_gpu = states_cpu.to(self.device, non_blocking=True) if self.device.type == "cuda" else states_cpu
         legal_moves_gpu = None
         root_features_gpu = None
-        if self.cache_root_features and self.device.type == "cuda":
+        if self.cache_hybrid_root_features and self.device.type == "cuda":
+            (
+                legal_moves_gpu,
+                num_legal_gpu,
+                root_features_gpu,
+                token_features_gpu,
+                token_q_gpu,
+                token_r_gpu,
+                token_z_gpu,
+                token_mask_gpu,
+                global_features_gpu,
+                move_features_gpu,
+            ) = self.ext.generate_legal_moves_and_hybrid_root_features_batch(states_gpu, B)
+            assert self._root_features_cpu is not None
+            assert self._legal_moves_cpu is not None
+            assert self._token_features_cpu is not None
+            assert self._token_q_cpu is not None
+            assert self._token_r_cpu is not None
+            assert self._token_z_cpu is not None
+            assert self._token_mask_cpu is not None
+            assert self._global_features_cpu is not None
+            assert self._move_features_cpu is not None
+            self._root_features_cpu[dst].copy_(
+                root_features_gpu.to(dtype=torch.float16, device="cpu", non_blocking=True),
+            )
+            self._legal_moves_cpu[dst].copy_(
+                legal_moves_gpu.to(device="cpu", non_blocking=True),
+            )
+            self._token_features_cpu[dst].copy_(
+                token_features_gpu.to(dtype=torch.float16, device="cpu", non_blocking=True),
+            )
+            self._token_q_cpu[dst].copy_(
+                token_q_gpu.to(dtype=torch.int16, device="cpu", non_blocking=True),
+            )
+            self._token_r_cpu[dst].copy_(
+                token_r_gpu.to(dtype=torch.int16, device="cpu", non_blocking=True),
+            )
+            self._token_z_cpu[dst].copy_(
+                token_z_gpu.to(dtype=torch.int16, device="cpu", non_blocking=True),
+            )
+            self._token_mask_cpu[dst].copy_(
+                token_mask_gpu.to(dtype=torch.bool, device="cpu", non_blocking=True),
+            )
+            self._global_features_cpu[dst].copy_(
+                global_features_gpu.to(dtype=torch.float16, device="cpu", non_blocking=True),
+            )
+            self._move_features_cpu[dst].copy_(
+                move_features_gpu.to(dtype=torch.float16, device="cpu", non_blocking=True),
+            )
+            self._num_actions_cpu[dst].copy_(
+                num_legal_gpu.to(dtype=torch.int64, device="cpu", non_blocking=True),
+            )
+        elif self.cache_root_features and self.device.type == "cuda":
             legal_moves_gpu, num_legal_gpu, root_features_gpu = (
                 self.ext.generate_legal_moves_and_fnn_features_batch(states_gpu, B)
             )
@@ -346,6 +505,30 @@ class FNNReplayBuffer:
                 non_blocking=True,
             )
             self._legal_moves_gpu[dst].copy_(legal_moves_gpu, non_blocking=True)
+        if self.cache_hybrid_root_features:
+            assert self._token_features_gpu is not None
+            assert self._token_q_gpu is not None
+            assert self._token_r_gpu is not None
+            assert self._token_z_gpu is not None
+            assert self._token_mask_gpu is not None
+            assert self._global_features_gpu is not None
+            assert self._move_features_gpu is not None
+            self._token_features_gpu[dst].copy_(
+                token_features_gpu.to(dtype=torch.float16),
+                non_blocking=True,
+            )
+            self._token_q_gpu[dst].copy_(token_q_gpu.to(dtype=torch.int16), non_blocking=True)
+            self._token_r_gpu[dst].copy_(token_r_gpu.to(dtype=torch.int16), non_blocking=True)
+            self._token_z_gpu[dst].copy_(token_z_gpu.to(dtype=torch.int16), non_blocking=True)
+            self._token_mask_gpu[dst].copy_(token_mask_gpu.to(dtype=torch.bool), non_blocking=True)
+            self._global_features_gpu[dst].copy_(
+                global_features_gpu.to(dtype=torch.float16),
+                non_blocking=True,
+            )
+            self._move_features_gpu[dst].copy_(
+                move_features_gpu.to(dtype=torch.float16),
+                non_blocking=True,
+            )
 
     def _sample_indices(self, batch_size: int, device: torch.device) -> torch.Tensor:
         size = self._size
@@ -384,11 +567,33 @@ class FNNReplayBuffer:
         idx = self._sample_indices(batch_size, device)
         root_features = None
         legal_moves = None
+        token_features = None
+        token_q = None
+        token_r = None
+        token_z = None
+        token_mask = None
+        global_features = None
+        move_features = None
         if self.cache_root_features:
             assert self._root_features_gpu is not None
             assert self._legal_moves_gpu is not None
             root_features = self._root_features_gpu.index_select(0, idx).float()
             legal_moves = self._legal_moves_gpu.index_select(0, idx)
+        if self.cache_hybrid_root_features:
+            assert self._token_features_gpu is not None
+            assert self._token_q_gpu is not None
+            assert self._token_r_gpu is not None
+            assert self._token_z_gpu is not None
+            assert self._token_mask_gpu is not None
+            assert self._global_features_gpu is not None
+            assert self._move_features_gpu is not None
+            token_features = self._token_features_gpu.index_select(0, idx).float()
+            token_q = self._token_q_gpu.index_select(0, idx)
+            token_r = self._token_r_gpu.index_select(0, idx)
+            token_z = self._token_z_gpu.index_select(0, idx)
+            token_mask = self._token_mask_gpu.index_select(0, idx)
+            global_features = self._global_features_gpu.index_select(0, idx).float()
+            move_features = self._move_features_gpu.index_select(0, idx).float()
         return FNNTrainingBatch(
             state_bytes=self._states_gpu.index_select(0, idx),
             policy_targets=self._policy_gpu.index_select(0, idx).float(),
@@ -399,6 +604,13 @@ class FNNReplayBuffer:
             value_weights=self._value_weights_gpu.index_select(0, idx),
             root_features=root_features,
             legal_moves=legal_moves,
+            token_features=token_features,
+            token_q=token_q,
+            token_r=token_r,
+            token_z=token_z,
+            token_mask=token_mask,
+            global_features=global_features,
+            move_features=move_features,
         )
 
     def _sample_batch_cpu(self, batch_size: int) -> FNNTrainingBatch:
@@ -412,11 +624,33 @@ class FNNReplayBuffer:
         idx = self._sample_indices(batch_size, torch.device("cpu"))
         root_features = None
         legal_moves = None
+        token_features = None
+        token_q = None
+        token_r = None
+        token_z = None
+        token_mask = None
+        global_features = None
+        move_features = None
         if self.cache_root_features:
             assert self._root_features_cpu is not None
             assert self._legal_moves_cpu is not None
             root_features = self._root_features_cpu.index_select(0, idx).float()
             legal_moves = self._legal_moves_cpu.index_select(0, idx)
+        if self.cache_hybrid_root_features:
+            assert self._token_features_cpu is not None
+            assert self._token_q_cpu is not None
+            assert self._token_r_cpu is not None
+            assert self._token_z_cpu is not None
+            assert self._token_mask_cpu is not None
+            assert self._global_features_cpu is not None
+            assert self._move_features_cpu is not None
+            token_features = self._token_features_cpu.index_select(0, idx).float()
+            token_q = self._token_q_cpu.index_select(0, idx)
+            token_r = self._token_r_cpu.index_select(0, idx)
+            token_z = self._token_z_cpu.index_select(0, idx)
+            token_mask = self._token_mask_cpu.index_select(0, idx)
+            global_features = self._global_features_cpu.index_select(0, idx).float()
+            move_features = self._move_features_cpu.index_select(0, idx).float()
         return FNNTrainingBatch(
             state_bytes=self._states_cpu.index_select(0, idx),
             policy_targets=self._policy_cpu.index_select(0, idx).float(),
@@ -427,4 +661,11 @@ class FNNReplayBuffer:
             value_weights=self._value_weights_cpu.index_select(0, idx),
             root_features=root_features,
             legal_moves=legal_moves,
+            token_features=token_features,
+            token_q=token_q,
+            token_r=token_r,
+            token_z=token_z,
+            token_mask=token_mask,
+            global_features=global_features,
+            move_features=move_features,
         )

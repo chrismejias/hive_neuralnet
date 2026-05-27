@@ -108,6 +108,7 @@ class HybridTrainer:
             self.config.buffer_max_size,
             device=self.device,
             cache_root_features=False,
+            cache_hybrid_root_features=True,
             gpu_sampling=self.device.type == "cuda",
             merge_opening_value_examples=self.config.merge_opening_value_examples,
             opening_value_merge_plies=self.config.opening_value_merge_plies,
@@ -399,8 +400,41 @@ class HybridTrainer:
         num_actions: torch.Tensor | None = None,
         cached_root_features: torch.Tensor | None = None,
         cached_legal_moves: torch.Tensor | None = None,
+        cached_token_features: torch.Tensor | None = None,
+        cached_token_q: torch.Tensor | None = None,
+        cached_token_r: torch.Tensor | None = None,
+        cached_token_z: torch.Tensor | None = None,
+        cached_token_mask: torch.Tensor | None = None,
+        cached_global_features: torch.Tensor | None = None,
+        cached_move_features: torch.Tensor | None = None,
     ):
-        if self.device.type == "cuda":
+        if (
+            cached_root_features is not None
+            and cached_legal_moves is not None
+            and cached_token_features is not None
+            and cached_token_q is not None
+            and cached_token_r is not None
+            and cached_token_z is not None
+            and cached_token_mask is not None
+            and cached_global_features is not None
+            and cached_move_features is not None
+        ):
+            if num_actions is None:
+                raise ValueError("Cached hybrid features require cached action counts")
+            legal_moves = cached_legal_moves
+            root_features = cached_root_features.float()
+            num_legal = num_actions.to(torch.int64)
+            graph_batch = HybridPieceTensorBatch(
+                token_features=cached_token_features.float(),
+                token_q=cached_token_q.to(torch.int64),
+                token_r=cached_token_r.to(torch.int64),
+                token_z=cached_token_z.to(torch.int64),
+                token_mask=cached_token_mask,
+                global_features=cached_global_features.float(),
+                num_tokens=cached_token_mask.sum(dim=1, dtype=torch.int32),
+            )
+            move_features_per_legal = cached_move_features.float()
+        elif self.device.type == "cuda":
             (
                 legal_moves,
                 num_legal,
@@ -555,11 +589,18 @@ class HybridTrainer:
                 t_build = time.perf_counter()
                 root_feat, succ_feat, a2r, n_act, graph_batch, move_features = self._build_forward_batch(
                     batch.state_bytes,
-                    batch.state_bytes.shape[0],
-                    batch.num_actions,
-                    batch.root_features,
-                    batch.legal_moves,
-                )
+                batch.state_bytes.shape[0],
+                batch.num_actions,
+                batch.root_features,
+                batch.legal_moves,
+                batch.token_features,
+                batch.token_q,
+                batch.token_r,
+                batch.token_z,
+                batch.token_mask,
+                batch.global_features,
+                batch.move_features,
+            )
                 timing_sums["feature_build"] += time.perf_counter() - t_build
 
                 if self.use_amp and self.scaler is not None:
