@@ -23,7 +23,7 @@ from hive_fnn.fnn_features import FEAT_DIM
 
 @dataclass
 class FNNConfig:
-    feat_dim: int = 110  # FNN_FEAT_DIM from CUDA kernel
+    feat_dim: int = 122  # FNN_FEAT_DIM from CUDA kernel
     hidden_dim: int = 64
     embed_dim: int = 64
     action_hidden: int = 64
@@ -54,6 +54,8 @@ class HiveFNN(nn.Module):
     def __init__(self, config: FNNConfig | None = None) -> None:
         super().__init__()
         self.config = config or FNNConfig.large()
+        if self.config.feat_dim != FEAT_DIM:
+            self.config.feat_dim = FEAT_DIM
         c = self.config
 
         # ---- Shared board encoder (root & successor) ----
@@ -67,6 +69,29 @@ class HiveFNN(nn.Module):
         # ---- Action tower (scores a successor relative to root) ----
         self.action_fc1 = nn.Linear(c.embed_dim * 2, c.action_hidden)
         self.action_fc2 = nn.Linear(c.action_hidden, 1)
+
+    @staticmethod
+    def _pad_loaded_weight(
+        old: torch.Tensor,
+        new_template: torch.Tensor,
+        *,
+        noise_scale: float = 1e-3,
+    ) -> torch.Tensor:
+        new = torch.empty_like(new_template)
+        new.normal_(mean=0.0, std=noise_scale)
+        rows = min(old.shape[0], new.shape[0])
+        cols = min(old.shape[1], new.shape[1])
+        new[:rows, :cols] = old[:rows, :cols]
+        return new
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        state = dict(state_dict)
+        cur_state = self.state_dict()
+        key = "fc1.weight"
+        if key in state and key in cur_state and state[key].shape != cur_state[key].shape:
+            old = state[key]
+            state[key] = self._pad_loaded_weight(old, cur_state[key])
+        return super().load_state_dict(state, strict=strict, assign=assign)
 
     # ---- Shared encoder ----
 

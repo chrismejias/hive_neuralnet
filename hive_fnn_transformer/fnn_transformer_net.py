@@ -22,7 +22,7 @@ from hive_fnn_transformer.graph_types import (
     HybridPieceTensorBatch,
 )
 
-MOVE_FEAT_DIM = 25
+MOVE_FEAT_DIM = 31
 
 
 @dataclass
@@ -206,6 +206,8 @@ class HiveHybridGNN(nn.Module):
         super().__init__()
         self.config = config or HybridGNNConfig()
         fnn_config = self.config.fnn_config or FNNConfig.large()
+        fnn_config.feat_dim = FEAT_DIM
+        self.config.move_feat_dim = MOVE_FEAT_DIM
         if fnn_config.feat_dim != FEAT_DIM:
             raise ValueError(f"FNN feature dim must be {FEAT_DIM}, got {fnn_config.feat_dim}")
 
@@ -226,6 +228,34 @@ class HiveHybridGNN(nn.Module):
             nn.ReLU(),
             nn.Linear(self.config.value_hidden, 1),
         )
+
+    @staticmethod
+    def _pad_loaded_weight(
+        old: torch.Tensor,
+        new_template: torch.Tensor,
+        *,
+        noise_scale: float = 1e-3,
+    ) -> torch.Tensor:
+        new = torch.empty_like(new_template)
+        new.normal_(mean=0.0, std=noise_scale)
+        rows = min(old.shape[0], new.shape[0])
+        cols = min(old.shape[1], new.shape[1])
+        new[:rows, :cols] = old[:rows, :cols]
+        return new
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        state = dict(state_dict)
+        cur_state = self.state_dict()
+        for key in (
+            "fnn.fc1.weight",
+            "policy_move_proj.weight",
+            "graph_trunk.token_proj.weight",
+            "transformer_trunk.token_proj.weight",
+        ):
+            if key in state and key in cur_state and state[key].shape != cur_state[key].shape:
+                old = state[key]
+                state[key] = self._pad_loaded_weight(old, cur_state[key])
+        return super().load_state_dict(state, strict=strict, assign=assign)
 
     def forward(
         self,

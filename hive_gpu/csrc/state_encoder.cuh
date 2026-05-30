@@ -34,7 +34,7 @@ constexpr int HYBRID_MAX_EDGES = 640;
 constexpr int HYBRID_MAX_PIECE_TOKENS = 28;
 constexpr int HYBRID_NODE_FEAT_DIM = 26;
 constexpr int HYBRID_GLOBAL_FEAT_DIM = 6;
-constexpr int HYBRID_MOVE_FEAT_DIM = 25;
+constexpr int HYBRID_MOVE_FEAT_DIM = 31;
 constexpr int HYBRID_MAX_RADIUS = 2;
 constexpr int HYBRID_EDGE_FEAT_DIM = 3;
 
@@ -85,6 +85,85 @@ __device__ __forceinline__ int hex_distance_delta(int dq, int dr) {
     int ads = ds < 0 ? -ds : ds;
     int m = adq > adr ? adq : adr;
     return m > ads ? m : ads;
+}
+
+__device__ __forceinline__ bool is_neighbor_cell(int cell, int target) {
+    if (cell < 0 || target < 0 || target >= NUM_CELLS) return false;
+    for (int d = 0; d < NUM_DIRS; ++d) {
+        if (NEIGHBORS[target][d] == cell) return true;
+    }
+    return false;
+}
+
+__device__ __forceinline__ Color moved_piece_color_for_move(
+    const HiveState& s,
+    const GPUMove& mv,
+    Color mover
+) {
+    if (mv.type != MOVE_MOVE || mv.from_cell >= NUM_CELLS || s.height[mv.from_cell] == 0) {
+        return mover;
+    }
+    return cell_color(s.pieces[s.height[mv.from_cell] - 1][mv.from_cell]);
+}
+
+__device__ __forceinline__ int queen_surround_count_current(
+    const HiveState& s,
+    Color color
+) {
+    if (!is_queen_placed(s, color)) return 0;
+    int count = 0;
+    int qcell = (int)s.queen_cell[(int)color];
+    for (int d = 0; d < NUM_DIRS; ++d) {
+        int16_t nb = NEIGHBORS[qcell][d];
+        if (nb >= 0 && s.height[nb] > 0) count++;
+    }
+    return count;
+}
+
+__device__ __forceinline__ int queen_surround_count_after_move(
+    const HiveState& s,
+    const GPUMove& mv,
+    Color queen_color,
+    Color mover,
+    Color moved_color
+) {
+    bool queen_placed_before = is_queen_placed(s, queen_color);
+    bool queen_is_being_placed = (
+        mv.type == MOVE_PLACE &&
+        mv.piece_type == PT_QUEEN &&
+        mover == queen_color &&
+        mv.to_cell < NUM_CELLS
+    );
+    bool queen_is_being_moved = (
+        mv.type == MOVE_MOVE &&
+        mv.piece_type == PT_QUEEN &&
+        moved_color == queen_color &&
+        mv.to_cell < NUM_CELLS
+    );
+
+    if (!queen_placed_before && !queen_is_being_placed) return 0;
+
+    int qcell = queen_placed_before ? (int)s.queen_cell[(int)queen_color] : -1;
+    if (queen_is_being_placed || queen_is_being_moved) {
+        qcell = (int)mv.to_cell;
+    }
+    if (qcell < 0 || qcell >= NUM_CELLS) return 0;
+
+    bool has_source = (mv.type == MOVE_MOVE && mv.from_cell < NUM_CELLS);
+    int src_cell = has_source ? (int)mv.from_cell : -1;
+    int dst_cell = (mv.to_cell < NUM_CELLS) ? (int)mv.to_cell : -1;
+    bool source_stays_occupied = has_source && s.height[src_cell] > 1;
+
+    int count = 0;
+    for (int d = 0; d < NUM_DIRS; ++d) {
+        int16_t nb = NEIGHBORS[qcell][d];
+        if (nb < 0) continue;
+        bool occupied = s.height[nb] > 0;
+        if (has_source && nb == src_cell) occupied = source_stays_occupied;
+        if (dst_cell >= 0 && nb == dst_cell) occupied = true;
+        if (occupied) count++;
+    }
+    return count;
 }
 
 __global__ void hybrid_gnn_encode_states_kernel(
@@ -397,10 +476,13 @@ __device__ inline void extract_hybrid_transformer_move_features_device(
     int own_q_row = (own_q >= 0 && own_q != 0xFFFF) ? (own_q / BOARD_SIZE - HALF_BOARD) : 0;
     int opp_q_col = (opp_q >= 0 && opp_q != 0xFFFF) ? (opp_q % BOARD_SIZE - HALF_BOARD) : 0;
     int opp_q_row = (opp_q >= 0 && opp_q != 0xFFFF) ? (opp_q / BOARD_SIZE - HALF_BOARD) : 0;
+    int own_q_surround = queen_surround_count_current(s, mover);
+    int opp_q_surround = queen_surround_count_current(s, opp);
 
     for (int m = 0; m < nlegal; ++m) {
         const GPUMove& mv = my_moves[m];
         float* f = out + (int64_t)m * HYBRID_MOVE_FEAT_DIM;
+        Color moved_color = moved_piece_color_for_move(s, mv, mover);
 
         f[(int)mv.type] = 1.0f;  // 0: place, 1: move, 2: pass
         if (mv.piece_type >= PT_QUEEN && mv.piece_type <= PT_PILLBUG) {
@@ -446,6 +528,17 @@ __device__ inline void extract_hybrid_transformer_move_features_device(
         f[22] = (float)src_stack / (float)MAX_STACK;
         f[23] = (float)dst_stack / (float)MAX_STACK;
         f[24] = (float)dst_occ;
+
+        int own_after = queen_surround_count_after_move(s, mv, mover, mover, moved_color);
+        int opp_after = queen_surround_count_after_move(s, mv, opp, mover, moved_color);
+        int own_delta = own_after - own_q_surround;
+        int opp_delta = opp_after - opp_q_surround;
+        if (own_delta < -1) own_delta = -1;
+        if (own_delta > 1) own_delta = 1;
+        if (opp_delta < -1) opp_delta = -1;
+        if (opp_delta > 1) opp_delta = 1;
+        f[25 + (own_delta + 1)] = 1.0f;
+        f[28 + (opp_delta + 1)] = 1.0f;
     }
 }
 

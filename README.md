@@ -238,7 +238,7 @@ This is the **recommended engine** for current use. It is inspired by HiveGo's A
 
 ### Architecture
 
-- **Board encoder**: 110-dim features → hidden → embedding (Linear + sigmoid + LayerNorm)
+- **Board encoder**: 122-dim features → hidden → embedding (Linear + sigmoid + LayerNorm)
 - **Value head**: embedding → Linear → tanh
 - **Action scoring**: concat [root\_emb, successor\_emb] → tower → logit
 - **Small** (~1.0K params): hidden=8, embed=8, action\_hidden=8
@@ -246,7 +246,7 @@ This is the **recommended engine** for current use. It is inspired by HiveGo's A
 - **Large** (~18.8K params, current default): hidden=64, embed=64, action\_hidden=64
 - **Current search default**: Gumbel-root MCTS with non-root PUCT, visited-only policy targets, wave-parallel halving, and the queen-surround reserve described above
 
-### 110-dim Feature Vector (per state, extracted by CUDA kernel)
+### 122-dim Feature Vector (per state, extracted by CUDA kernel)
 
 For each of 8 piece types × 2 players (16 entries):
 - `count_on_board`
@@ -267,6 +267,10 @@ Additional per-color features:
 Global scalar features:
 - `moves_to_draw`
 - `move_number`
+
+Queen surround features:
+- white queen surround one-hot buckets `1..6`
+- black queen surround one-hot buckets `1..6`
 
 ### GPU-Native Self-Play
 
@@ -328,16 +332,23 @@ Both `train_fnn` and `train_fnn_transformer` now support an EMA-based promotion 
 - the **raw model** generates self-play and receives gradient updates
 - an **EMA model** tracks that raw model during training
 - a frozen **champion** model is kept for gating
-- every `5` iterations by default, the EMA challenger plays an arena against the champion
-- if the EMA scores at least `0.52`, it is promoted to the new champion
+- the EMA challenger periodically plays an arena against the champion
+- if the EMA clears the configured promotion score, it is promoted to the new champion
 
-Current defaults:
+Base defaults:
 
 - `ema_decay=0.999` (often overridden lower for faster challenger tracking)
 - `ema_arena_every=5`
-- `ema_arena_games=256`
+- `ema_arena_games=400`
 - `ema_arena_noise_scale=0.1`
-- `ema_promotion_score=0.52`
+- `ema_promotion_score=0.55`
+
+The current strongest transformer line has been using longer challenger blocks and more permissive gating, including settings such as:
+
+- `ema_decay=0.9995`
+- `ema_arena_every=20`
+- `ema_arena_games=400`
+- `ema_promotion_score=0.51`
 
 Numbered checkpoints still store the **raw** network as `model_state_dict`, but they also include:
 
@@ -373,7 +384,7 @@ The experimental FNN transformer direction lives in `hive_fnn_transformer`.
 
 The hybrid model keeps the part of FNN that has worked best:
 
-- root and successor states are encoded as `110`-dim FNN feature vectors
+- root and successor states are encoded as `122`-dim FNN feature vectors
 - policy logits compare the root FNN embedding, root transformer summary, and successor FNN embedding
 - a trained FNN checkpoint can initialize the shared FNN feature encoder, but the transformer-aware policy tower is not weight-compatible with the FNN action tower
 
@@ -384,11 +395,13 @@ It changes both policy and value:
 - the transformer sees one token per board piece, including buried stack pieces
 - attention uses relative `(q, r, z)` offsets only, with no absolute board-position embedding
 - the default trunk uses `8` heads and up to `28` piece tokens, matching the full Hive piece count
+- the FNN feature path now includes explicit queen-surround one-hot buckets for both queens
+- the move feature path now includes explicit own/opponent queen-surround delta buckets `(-1, 0, +1)` for each legal move
 
 Current status:
 
 - GPU-native self-play and training are implemented through `hive_fnn_transformer.train_fnn_transformer`
-- the trainer reuses the FNN raw-state replay format and rebuilds FNN features, successor features, and piece-token tensors on GPU
+- the trainer reuses the FNN raw-state replay format and caches the hybrid root feature bundle in replay so training can skip repeated root-side feature extraction
 - the root-side training/search feature path is fused on CUDA to avoid separate root token/move-feature passes
 - training uses a persistent optimizer and stores optimizer / scaler / EMA / champion state in checkpoints
 - the default CLI preset is now `small`
@@ -634,7 +647,7 @@ hive_common/       # Shared token batch types used by PRS + archived legacy mode
 hive_gpu/          # CUDA extension, GPU-native MCTS/Gumbel, shared kernels
   csrc/            # CUDA C++ source
     game_logic.cu      # Move gen, state apply, feature extraction, tree/search kernels
-    fnn_features.cuh   # 110-dim FNN feature extraction kernel
+    fnn_features.cuh   # 122-dim FNN feature extraction kernel
     fnn_selfplay.cuh   # Experimental fused FNN self-play kernel (not the active trainer path)
     state_encoder.cuh  # Transformer state encoding
     mcts_tree.cuh      # GPU-native MCTS tree

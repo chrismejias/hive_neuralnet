@@ -722,7 +722,10 @@ class HybridTrainer:
             self._sync_model(self.champion_net, self.best_net)
         opt_state = ckpt.get("optimizer_state_dict")
         if opt_state is not None:
-            self.optimizer.load_state_dict(opt_state)
+            try:
+                self.optimizer.load_state_dict(opt_state)
+            except ValueError:
+                self._rebuild_optimizer()
         scaler_state = ckpt.get("scaler_state_dict")
         if scaler_state is not None and self.scaler is not None:
             self.scaler.load_state_dict(scaler_state)

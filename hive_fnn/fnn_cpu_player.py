@@ -5,7 +5,7 @@ analyzing individual Hive games with the FNN model. It does not touch the
 GPU-native self-play training pipeline.
 
 Design:
-  - Recreates the 110-dim FNN feature vector from the Python ``GameState``.
+  - Recreates the 122-dim FNN feature vector from the Python ``GameState``.
   - Expands one game tree at a time using CPU PUCT.
   - Batches successor-state scoring through the existing FNN network.
 
@@ -155,7 +155,7 @@ def extract_fnn_features_cpu(
     game: GameState,
     legal_moves: list[Move] | None = None,
 ) -> np.ndarray:
-    """Recreate the 110-dim FNN feature vector on CPU."""
+    """Recreate the 122-dim FNN feature vector on CPU."""
     if legal_moves is None:
         legal_moves = game.legal_moves()
 
@@ -169,6 +169,10 @@ def extract_fnn_features_cpu(
     pillbug_capable_cells: dict[Color, list] = {
         Color.WHITE: [],
         Color.BLACK: [],
+    }
+    queen_surround_count = {
+        Color.WHITE: 0,
+        Color.BLACK: 0,
     }
 
     # count_on_board / queen_neighbors / avg_dist_to_opp_q /
@@ -187,6 +191,10 @@ def extract_fnn_features_cpu(
                 features[32 + idx] += 1.0
             dist_sum[int(top.color), top.piece_type.value] += pos.distance(opp_q)
             dist_count[int(top.color), top.piece_type.value] += 1
+
+        for queen_color, qpos in queen_pos.items():
+            if qpos is not None and any(n == qpos for n in pos.neighbors()):
+                queen_surround_count[queen_color] += 1
 
         if len(stack) == 1 and pos in ap:
             features[80 + idx] += 1.0
@@ -263,6 +271,11 @@ def extract_fnn_features_cpu(
                     features[106 + int(color)] += 1.0
                 else:
                     features[108 + int(top.color)] += 1.0
+
+    for color in (Color.WHITE, Color.BLACK):
+        surround = queen_surround_count[color]
+        if 1 <= surround <= 6:
+            features[110 + int(color) * 6 + (surround - 1)] = 1.0
 
     return features
 

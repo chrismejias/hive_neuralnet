@@ -1,10 +1,10 @@
 """
 HiveGo-style FNN feature extraction via CUDA kernel.
 
-Produces 110-dim features directly from HiveState + legal moves in a single
+Produces 122-dim features directly from HiveState + legal moves in a single
 CUDA kernel call, bypassing the full encode_states_batch pipeline.
 
-Feature layout (FEAT_DIM = 110):
+Feature layout (FEAT_DIM = 122):
   [0:16]  count_on_board     -- visible top pieces per type(8) x color(2)
   [16:32] count_in_hand      -- hand piece counts per type(8) x color(2)
   [32:48] queen_neighbors    -- pieces adjacent to opponent queen per type(8) x color(2)
@@ -27,6 +27,8 @@ Feature layout (FEAT_DIM = 110):
                                 cell (repositioning candidates), per color(2)
   [108:110] throwable_opp    -- own-color pieces adjacent to opposing
                                 pillbug-capable cell (threatened), per color(2)
+  [110:116] white_q_surround -- one-hot surround count buckets 1..6 for white queen
+  [116:122] black_q_surround -- one-hot surround count buckets 1..6 for black queen
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ import torch
 
 import hive_gpu
 
-FEAT_DIM = 110
+FEAT_DIM = 122
 
 
 class FNNFeatureEncoder:

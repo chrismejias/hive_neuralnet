@@ -5,7 +5,7 @@
  * bypassing the full encode_states_batch pipeline (no per-node features,
  * no edges, no graph construction).
  *
- * Feature layout (FNN_FEAT_DIM = 110):
+ * Feature layout (FNN_FEAT_DIM = 122):
  *   [0:16]   count_on_board    — visible top pieces per type(8) × color(2)
  *   [16:32]  count_in_hand     — hand piece counts per type(8) × color(2)
  *   [32:48]  queen_neighbors   — top pieces adjacent to opponent queen, per type(8) × color(2)
@@ -21,6 +21,8 @@
  *                                adjacent to a usable pillbug this turn, per color(2)
  *   [106:108] throwable_own    — own-color pieces adjacent to own pillbug-capable cell, per color(2)
  *   [108:110] throwable_opp    — own-color pieces adjacent to opposing pillbug-capable cell (threatened), per color(2)
+ *   [110:116] white_q_surround — one-hot surround count buckets 1..6 for white queen
+ *   [116:122] black_q_surround — one-hot surround count buckets 1..6 for black queen
  *
  * Must be included from game_logic.cu (needs NEIGHBORS constant memory).
  */
@@ -33,7 +35,7 @@
 
 namespace hive_gpu {
 
-constexpr int FNN_FEAT_DIM = 110;
+constexpr int FNN_FEAT_DIM = 122;
 // Draw is at move 200 in standard Hive
 constexpr int DRAW_MOVE_LIMIT = 200;
 
@@ -89,6 +91,7 @@ __device__ inline void extract_fnn_features_device(
     uint16_t opp_queen[2];  // opponent queen cell for each color
     opp_queen[0] = s.queen_cell[1];  // white's opponent is black's queen
     opp_queen[1] = s.queen_cell[0];  // black's opponent is white's queen
+    int queen_surround_counts[2] = {0, 0};
 
     Bitboard ap_mask = find_articulation_points(s);
 
@@ -129,6 +132,20 @@ __device__ inline void extract_fnn_features_device(
                 int16_t nb = NEIGHBORS[cell][d];
                 if (nb >= 0 && (uint16_t)nb == opp_q) {
                     f[32 + tc_idx] += 1.0f;
+                    break;
+                }
+            }
+        }
+
+        // Queen surround counts for both queens. This is fused into the main
+        // occupied-top-piece pass so we do not need a second neighborhood scan.
+        for (int qc = 0; qc < 2; qc++) {
+            uint16_t qcell = s.queen_cell[qc];
+            if (qcell == 0xFFFF) continue;
+            for (int d = 0; d < NUM_DIRS; d++) {
+                int16_t nb = NEIGHBORS[(int)qcell][d];
+                if (nb >= 0 && (uint16_t)nb == (uint16_t)cell) {
+                    queen_surround_counts[qc] += 1;
                     break;
                 }
             }
@@ -301,6 +318,14 @@ __device__ inline void extract_fnn_features_device(
                     f[108 + (int)nc] += 1.0f;
                 }
             }
+        }
+    }
+
+    // ── queen surround one-hot buckets [110:122] ────────────────
+    for (int qc = 0; qc < 2; qc++) {
+        int surround = queen_surround_counts[qc];
+        if (surround >= 1 && surround <= 6) {
+            f[110 + qc * 6 + (surround - 1)] = 1.0f;
         }
     }
 }
