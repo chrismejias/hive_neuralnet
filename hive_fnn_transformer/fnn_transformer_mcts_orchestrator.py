@@ -35,6 +35,10 @@ class HybridMCTSOrchestrator(FNNMCTSOrchestrator):
         self.net: HiveHybridGNN = net
         self.config: HybridMCTSConfig = cfg
 
+    def _slice_token_features(self, token_features: torch.Tensor) -> torch.Tensor:
+        wanted = int(self.net.config.node_feat_dim)
+        return token_features[..., :wanted]
+
     def _eval_states(
         self,
         states: torch.Tensor,
@@ -76,7 +80,7 @@ class HybridMCTSOrchestrator(FNNMCTSOrchestrator):
             num_legal = fused_num_legal
             n64 = num_legal.to(torch.int64)
             piece_batch = HybridPieceTensorBatch(
-                token_features=token_features,
+                token_features=self._slice_token_features(token_features),
                 token_q=token_q,
                 token_r=token_r,
                 token_z=token_z,
@@ -85,13 +89,28 @@ class HybridMCTSOrchestrator(FNNMCTSOrchestrator):
                 num_tokens=token_mask.sum(dim=1, dtype=torch.int32),
             )
         else:
+            (
+                token_features,
+                token_q,
+                token_r,
+                token_z,
+                token_mask,
+                global_features,
+                num_tokens,
+            ) = self.ext.hybrid_transformer_encode_with_moves_batch(
+                states,
+                legal_moves,
+                num_legal,
+                total,
+            )
             piece_batch = HybridPieceTensorBatch(
-                *self.ext.hybrid_transformer_encode_with_moves_batch(
-                    states,
-                    legal_moves,
-                    num_legal,
-                    total,
-                )
+                token_features=self._slice_token_features(token_features),
+                token_q=token_q,
+                token_r=token_r,
+                token_z=token_z,
+                token_mask=token_mask,
+                global_features=global_features,
+                num_tokens=num_tokens,
             )
             move_features_per_legal = self.ext.hybrid_transformer_move_features_batch(
                 states,

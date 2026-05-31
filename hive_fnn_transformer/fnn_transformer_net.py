@@ -16,6 +16,8 @@ import torch.nn as nn
 from hive_fnn.fnn_features import FEAT_DIM
 from hive_fnn.fnn_network import FNNConfig, HiveFNN
 from hive_fnn_transformer.graph_types import (
+    ARTICULATION_NODE_FEAT_DIM,
+    BASE_NODE_FEAT_DIM,
     GLOBAL_FEAT_DIM,
     MAX_PIECE_TOKENS,
     NODE_FEAT_DIM,
@@ -28,6 +30,7 @@ MOVE_FEAT_DIM = 31
 @dataclass
 class HybridGNNConfig:
     fnn_config: FNNConfig | None = None
+    use_articulation_token_flag: bool = False
     graph_hidden_dim: int = 64
     graph_layers: int = 4
     graph_mlp_hidden: int = 96
@@ -40,10 +43,18 @@ class HybridGNNConfig:
     node_feat_dim: int = NODE_FEAT_DIM
     global_feat_dim: int = GLOBAL_FEAT_DIM
 
+    def __post_init__(self) -> None:
+        self.node_feat_dim = (
+            ARTICULATION_NODE_FEAT_DIM
+            if self.use_articulation_token_flag
+            else BASE_NODE_FEAT_DIM
+        )
+
     @classmethod
     def small(cls) -> "HybridGNNConfig":
         return cls(
             fnn_config=FNNConfig.medium(),
+            use_articulation_token_flag=False,
             graph_hidden_dim=64,
             graph_layers=4,
             graph_mlp_hidden=96,
@@ -54,10 +65,11 @@ class HybridGNNConfig:
     def large(cls) -> "HybridGNNConfig":
         return cls(
             fnn_config=FNNConfig.large(),
-            graph_hidden_dim=96,
-            graph_layers=6,
-            graph_mlp_hidden=96,
-            value_hidden=160,
+            use_articulation_token_flag=True,
+            graph_hidden_dim=128,
+            graph_layers=8,
+            graph_mlp_hidden=192,
+            value_hidden=256,
         )
 
 class RelativeSelfAttention(nn.Module):
@@ -230,31 +242,47 @@ class HiveHybridGNN(nn.Module):
         )
 
     @staticmethod
-    def _pad_loaded_weight(
+    def _resize_loaded_tensor(
         old: torch.Tensor,
         new_template: torch.Tensor,
         *,
         noise_scale: float = 1e-3,
     ) -> torch.Tensor:
-        new = torch.empty_like(new_template)
-        new.normal_(mean=0.0, std=noise_scale)
-        rows = min(old.shape[0], new.shape[0])
-        cols = min(old.shape[1], new.shape[1])
-        new[:rows, :cols] = old[:rows, :cols]
+        """Copy the overlapping slice of a checkpoint tensor into a new shape.
+
+        This supports progressive widening/deepening such as loading a `small`
+        checkpoint into a `large` transformer.  Extra capacity keeps the live
+        model initialization, except for newly added floating-point dimensions
+        created by feature-width changes, which receive tiny random noise.
+        """
+        new = new_template.detach().clone()
+        if old.dtype.is_floating_point and new.dtype.is_floating_point:
+            # For expanded floating tensors, keep the current model init but
+            # slightly damp freshly added dimensions so feature-width upgrades
+            # do not shock resumed play.
+            if old.shape != new.shape:
+                new.normal_(mean=0.0, std=noise_scale)
+        overlap = tuple(slice(0, min(a, b)) for a, b in zip(old.shape, new.shape))
+        if overlap:
+            new[overlap] = old[overlap].to(dtype=new.dtype, device=new.device)
+        else:
+            new.copy_(old.to(dtype=new.dtype, device=new.device))
         return new
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         state = dict(state_dict)
         cur_state = self.state_dict()
-        for key in (
-            "fnn.fc1.weight",
-            "policy_move_proj.weight",
-            "graph_trunk.token_proj.weight",
-            "transformer_trunk.token_proj.weight",
-        ):
-            if key in state and key in cur_state and state[key].shape != cur_state[key].shape:
-                old = state[key]
-                state[key] = self._pad_loaded_weight(old, cur_state[key])
+        # Drop unknown legacy keys and seed any missing new-model tensors from
+        # the live initialization so strict loads can still succeed.
+        for key in list(state.keys()):
+            if key not in cur_state:
+                state.pop(key)
+        for key, cur_tensor in cur_state.items():
+            if key not in state:
+                state[key] = cur_tensor
+                continue
+            if state[key].shape != cur_tensor.shape:
+                state[key] = self._resize_loaded_tensor(state[key], cur_tensor)
         return super().load_state_dict(state, strict=strict, assign=assign)
 
     def forward(

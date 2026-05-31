@@ -1,7 +1,7 @@
 /**
  * state_encoder.cuh — CUDA kernel for encoding HiveState into NN input features.
  *
- * Produces per-piece 25-dim feature vectors compatible with both GNN and Transformer
+ * Produces per-piece feature vectors compatible with both GNN and Transformer
  * encoders, plus edge data for GNN graph construction.
  *
  * Must be included from a .cu file that has access to NEIGHBORS constant memory
@@ -32,7 +32,7 @@ constexpr int ENC_HALF = 8;
 constexpr int HYBRID_MAX_NODES = 48;
 constexpr int HYBRID_MAX_EDGES = 640;
 constexpr int HYBRID_MAX_PIECE_TOKENS = 28;
-constexpr int HYBRID_NODE_FEAT_DIM = 26;
+constexpr int HYBRID_NODE_FEAT_DIM = 27;
 constexpr int HYBRID_GLOBAL_FEAT_DIM = 6;
 constexpr int HYBRID_MOVE_FEAT_DIM = 31;
 constexpr int HYBRID_MAX_RADIUS = 2;
@@ -209,6 +209,7 @@ __global__ void hybrid_gnn_encode_states_kernel(
     for (int i = 0; i < HYBRID_GLOBAL_FEAT_DIM; ++i) gf[i] = 0.0f;
 
     float queen_surround[2] = {0.0f, 0.0f};
+    Bitboard ap_mask = find_articulation_points(s);
     for (int c = 0; c < 2; ++c) {
         uint16_t qc = s.queen_cell[c];
         if (qc != 0xFFFF) {
@@ -263,8 +264,10 @@ __global__ void hybrid_gnn_encode_states_kernel(
                     if (!occ_flags[d]) f[16 + d] = 1.0f;
                 }
                 top_node_at[cell] = (int16_t)node_count;
+                f[26] = ap_mask.get(cell) ? 1.0f : 0.0f;
             }
             f[24] = level * 0.25f;
+            f[25] = is_stunned_cell(s, cell) ? 1.0f : 0.0f;
             nm[node_count] = true;
             node_count++;
         }
@@ -386,6 +389,7 @@ __device__ inline void extract_hybrid_transformer_tokens_device(
     for (int i = 0; i < HYBRID_GLOBAL_FEAT_DIM; ++i) gf[i] = 0.0f;
 
     float queen_surround[2] = {0.0f, 0.0f};
+    Bitboard ap_mask = find_articulation_points(s);
     for (int c = 0; c < 2; ++c) {
         uint16_t qc = s.queen_cell[c];
         if (qc != 0xFFFF) {
@@ -436,6 +440,9 @@ __device__ inline void extract_hybrid_transformer_tokens_device(
             }
             f[24] = level * 0.25f;
             f[25] = is_stunned_cell(s, cell) ? 1.0f : 0.0f;
+            if (is_top) {
+                f[26] = ap_mask.get(cell) ? 1.0f : 0.0f;
+            }
 
             tq[token_count] = col;
             tr[token_count] = row;

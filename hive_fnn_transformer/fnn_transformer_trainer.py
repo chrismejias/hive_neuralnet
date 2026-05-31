@@ -130,6 +130,10 @@ class HybridTrainer:
         self._sync_model(self.ema_net, self.best_net)
         self._sync_model(self.champion_net, self.best_net)
 
+    def _slice_token_features(self, token_features: torch.Tensor) -> torch.Tensor:
+        wanted = int(self.net_config.node_feat_dim)
+        return token_features[..., :wanted]
+
     def _cleanup(self) -> None:
         if self.device.type == "cuda":
             gc.collect()
@@ -425,7 +429,7 @@ class HybridTrainer:
             root_features = cached_root_features.float()
             num_legal = num_actions.to(torch.int64)
             graph_batch = HybridPieceTensorBatch(
-                token_features=cached_token_features.float(),
+                token_features=self._slice_token_features(cached_token_features.float()),
                 token_q=cached_token_q.to(torch.int64),
                 token_r=cached_token_r.to(torch.int64),
                 token_z=cached_token_z.to(torch.int64),
@@ -450,7 +454,7 @@ class HybridTrainer:
                 state_bytes, batch_size,
             )
             graph_batch = HybridPieceTensorBatch(
-                token_features=token_features,
+                token_features=self._slice_token_features(token_features),
                 token_q=token_q,
                 token_r=token_r,
                 token_z=token_z,
@@ -486,7 +490,7 @@ class HybridTrainer:
                 batch_size,
             )
             graph_batch = HybridPieceTensorBatch(
-                token_features=token_features,
+                token_features=self._slice_token_features(token_features),
                 token_q=token_q,
                 token_r=token_r,
                 token_z=token_z,
