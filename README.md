@@ -1,27 +1,23 @@
 # Hive Neural Network
 
-AlphaZero-style self-play training for the board game [Hive](https://en.wikipedia.org/wiki/Hive_(game)), focused on a fast recommended FNN engine, an experimental FNN-transformer line, an older PRS research line, and a shared GPU-native game engine.
+AlphaZero-style self-play training for the board game [Hive](https://en.wikipedia.org/wiki/Hive_(game)), focused on a recommended small FNN-transformer engine, a compact FNN baseline, archived PRS / graph-based research lines, and a shared GPU-native game engine.
 
 ## Recommended Engine
 
-**FNN is the default recommended engine.** It is the strongest and most practical training path in this repository today: it is much faster, reaches strong play with far less compute, and benefits from a compact handcrafted state representation that already encodes a lot of useful Hive structure.
+**Small FNN Transformer is the default recommended engine.** It is the strongest practical model in the repository today. It keeps the fast handcrafted FNN successor-feature policy path, but adds a small relative transformer trunk that improves tactical and positional strength enough to outperform the current FNN line in direct arenas.
 
-**FNN Transformer is the current experimental neural direction.** It keeps the fast FNN successor-feature policy path, but adds a piece-relative transformer summary for richer policy/value evaluation. It is still slower and less stable than FNN, but is the main non-FNN line currently under active tuning.
+**FNN remains the recommended compact baseline.** It is still faster, simpler, and easier to train than the transformer line, and remains useful as a reference engine and a low-cost training path.
 
-**PRS is an older work in progress research engine.** It learns a richer board representation from scratch and is therefore slower in two ways:
-
-- each search evaluation is much heavier than FNN
-- it has to spend training capacity learning useful board and legality structure that FNN already gets from engineered features
-
-That makes PRS interesting architecturally, but it currently needs much more wall-clock time to approach the same strength.
+**PRS and the older graph-based hybrids are no longer recommended active paths.** They remain in the repository for reference and experiments, but the current training effort is focused on the FNN and especially the small FNN-transformer line.
 
 ## Architecture Overview
 
-| Model | Package | Params | Self-play |
-|-------|---------|--------|-----------|
-| FNN (recommended default) | `hive_fnn` | 1.0K – 18.8K | Gumbel-root MCTS / PUCT MCTS |
-| FNN Transformer (experimental) | `hive_fnn_transformer` | 166K+ | FNN successor features + piece-only relative-transformer policy/value |
-| PRS Transformer (research path) | `hive_prs` | 1.7M / 9.8M | Gumbel-root MCTS (v3 default trunk) |
+| Model | Package | Params | Status |
+|-------|---------|--------|--------|
+| Small FNN Transformer | `hive_fnn_transformer` | ~146K | Recommended |
+| FNN | `hive_fnn` | ~1K – 22K | Strong baseline |
+| Large FNN Transformer | `hive_fnn_transformer` | ~1.03M | Experimental |
+| PRS Transformer | `hive_prs` | 1.7M / 9.8M | Archived research path |
 
 All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels for move generation, state encoding, and legal move lookup.
 
@@ -238,15 +234,15 @@ This is the **recommended engine** for current use. It is inspired by HiveGo's A
 
 ### Architecture
 
-- **Board encoder**: 122-dim features → hidden → embedding (Linear + sigmoid + LayerNorm)
+- **Board encoder**: 124-dim features → hidden → embedding (Linear + sigmoid + LayerNorm)
 - **Value head**: embedding → Linear → tanh
 - **Action scoring**: concat [root\_emb, successor\_emb] → tower → logit
 - **Small** (~1.0K params): hidden=8, embed=8, action\_hidden=8
 - **Medium** (~6.3K params): hidden=32, embed=32, action\_hidden=32
-- **Large** (~18.8K params, current default): hidden=64, embed=64, action\_hidden=64
+- **Large** (~22K params, current default): hidden=64, embed=64, action\_hidden=64
 - **Current search default**: Gumbel-root MCTS with non-root PUCT, visited-only policy targets, wave-parallel halving, and the queen-surround reserve described above
 
-### 122-dim Feature Vector (per state, extracted by CUDA kernel)
+### 124-dim Feature Vector (per state, extracted by CUDA kernel)
 
 For each of 8 piece types × 2 players (16 entries):
 - `count_on_board`
@@ -271,6 +267,10 @@ Global scalar features:
 Queen surround features:
 - white queen surround one-hot buckets `1..6`
 - black queen surround one-hot buckets `1..6`
+
+Additional structural features:
+- white own-queen-throwable-by-own-pillbug bit
+- black own-queen-throwable-by-own-pillbug bit
 
 ### GPU-Native Self-Play
 
@@ -378,13 +378,13 @@ The latest promoted champion is also written to `champion_latest.pt` in the chec
 
 ---
 
-## FNN Transformer (experimental FNN successor features + relative transformer policy/value)
+## FNN Transformer (recommended small model)
 
-The experimental FNN transformer direction lives in `hive_fnn_transformer`.
+The active FNN-transformer direction lives in `hive_fnn_transformer`.
 
 The hybrid model keeps the part of FNN that has worked best:
 
-- root and successor states are encoded as `122`-dim FNN feature vectors
+- root and successor states are encoded as `124`-dim FNN feature vectors
 - policy logits compare the root FNN embedding, root transformer summary, and successor FNN embedding
 - a trained FNN checkpoint can initialize the shared FNN feature encoder, but the transformer-aware policy tower is not weight-compatible with the FNN action tower
 
@@ -395,8 +395,13 @@ It changes both policy and value:
 - the transformer sees one token per board piece, including buried stack pieces
 - attention uses relative `(q, r, z)` offsets only, with no absolute board-position embedding
 - the default trunk uses `8` heads and up to `28` piece tokens, matching the full Hive piece count
-- the FNN feature path now includes explicit queen-surround one-hot buckets for both queens
-- the move feature path now includes explicit own/opponent queen-surround delta buckets `(-1, 0, +1)` for each legal move
+- the shared FNN path includes explicit queen-surround one-hot buckets for both queens plus own-queen-throwable bits
+- the move feature path includes explicit own/opponent queen-surround delta buckets `(-1, 0, +1)` for each legal move
+- the small transformer line now supports two optional token/global bundles that have been useful in practice:
+  - articulation-point token flag
+  - queen-threat features:
+    - per-token `queen_threatening` bit
+    - per-side `0 / 1 / 2+` queen-threat tally globals
 
 Current status:
 
@@ -404,9 +409,24 @@ Current status:
 - the trainer reuses the FNN raw-state replay format and caches the hybrid root feature bundle in replay so training can skip repeated root-side feature extraction
 - the root-side training/search feature path is fused on CUDA to avoid separate root token/move-feature passes
 - training uses a persistent optimizer and stores optimizer / scaler / EMA / champion state in checkpoints
-- the default CLI preset is now `small`
+- the default CLI preset is now `small`, and this is the recommended model to train and play
 - the line now supports the same adaptive policy-target softening and EMA champion/challenger loop as FNN
-- this remains a lighter alternative to giving both policy and value a full PRS transformer trunk
+- this remains a lighter and faster alternative to a full PRS-style transformer trunk
+
+### Current Small Preset
+
+The current small preset is the mainline model:
+
+- shared FNN encoder: `124 -> 32 -> 32`
+- policy tower: `128 -> 32 -> 1`
+- transformer trunk: `hidden=64`, `layers=4`, `heads=8`
+- max piece tokens: `28`
+- current active feature set on the strongest line:
+  - articulation token flag
+  - queen-threat token/global bundle
+  - explicit queen-surround features in the shared FNN path
+
+This configuration is about `146,532` parameters with the current articulation + queen-threat bundle enabled.
 
 Quick smoke test:
 
@@ -425,19 +445,74 @@ Quick parameter summary:
 python3.11 -m hive_fnn_transformer
 ```
 
-Recommended current training shape:
+### Current Recommended Training Shape
+
+The current strongest small-transformer runs have used:
 
 ```bash
 python3.11 -m hive_fnn_transformer.train_fnn_transformer \
-  --resume checkpoints_fnn_transformer/hybrid_gnn_checkpoint_XXXX.pt \
-  --games 256 \
+  --preset small \
+  --articulation-token-flag \
+  --queen-threat-features \
+  --resume checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2620.pt \
+  --games 400 \
   --simulations 1024 \
   --expansion-mask -1 \
-  --epochs 1 \
-  --lr 2.5e-6 \
-  --checkpoint-keep-every 5 \
+  --batch-size 128 \
+  --epochs 2 \
+  --lr 2e-6 \
+  --ema-decay 0.9995 \
+  --ema-arena-every 20 \
+  --ema-arena-games 400 \
+  --ema-promotion-score 0.51 \
+  --short-forced-win-probe \
+  --probe-win-in-one \
+  --probe-check-opponent-wins \
+  --probe-win-in-two \
+  --checkpoint-keep-every 20 \
   --checkpoint-dir checkpoints_fnn_transformer_run
 ```
+
+Other important current defaults:
+
+- adaptive replay-target temperature:
+  - `top1_cap=0.7`
+  - temperature range `1..7`
+- early opening move sampling:
+  - first `6` plies
+  - top-1 cap `0.4`
+  - temperature range `1..9`
+- final-ply value amplification:
+  - last `1` ply
+  - weight `2.0`
+- opening value merge:
+  - first `4` plies
+
+## Discarded / Archived Directions
+
+### PRS Transformer
+
+PRS remains interesting architecturally, but it is not a practical active training path here.
+
+Why it was deprioritized:
+
+- the action space is large and awkward
+- the model had to spend too much capacity learning legality and board structure that the FNN-family models already get from engineered features
+- wall-clock training was much slower, and strength gain lagged badly behind the FNN-transformer small line
+
+In short: the PRS transformer was expressive, but the policy/action formulation was unwieldy enough that the model struggled to learn it efficiently.
+
+### Older Graph-Based Hybrids
+
+The earlier graph/message-passing hybrids have also been retired as active paths.
+
+Why:
+
+- small graph kernels were poorly optimized on NVIDIA GPUs compared to dense transformer-style matmuls
+- the graph path was slower in practice
+- the relative transformer trunk was both more expressive and easier to optimize efficiently on the target hardware
+
+In practice this meant the transformer hybrids trained faster and reached stronger play, so the older graph-network stack is now archived rather than actively developed.
 
 ---
 
