@@ -76,6 +76,11 @@ class FNNTrainConfig:
     policy_target_top1_cap: float = 0.7
     policy_target_min_temperature: float = 1.0
     policy_target_max_temperature: float = 7.0
+    early_move_sampling: bool = True
+    early_move_sampling_plies: int = 6
+    early_move_top1_cap: float = 0.4
+    early_move_min_temperature: float = 1.0
+    early_move_max_temperature: float = 9.0
     final_value_ply_count: int = 3
     final_value_weight: float = 2.0
     merge_opening_value_examples: bool = True
@@ -459,14 +464,19 @@ class FNNTrainer:
                     short_forced_win_probe=cfg.short_forced_win_probe,
                     probe_win_in_one=cfg.probe_win_in_one,
                     probe_check_opponent_wins=cfg.probe_check_opponent_wins,
-                    probe_win_in_two=cfg.probe_win_in_two,
-                    policy_target_temperature=cfg.policy_target_temperature,
-                    adaptive_policy_target_temperature=cfg.adaptive_policy_target_temperature,
-                    policy_target_top1_cap=cfg.policy_target_top1_cap,
-                    policy_target_min_temperature=cfg.policy_target_min_temperature,
-                    policy_target_max_temperature=cfg.policy_target_max_temperature,
-                ),
-            )
+                probe_win_in_two=cfg.probe_win_in_two,
+                policy_target_temperature=cfg.policy_target_temperature,
+                adaptive_policy_target_temperature=cfg.adaptive_policy_target_temperature,
+                policy_target_top1_cap=cfg.policy_target_top1_cap,
+                policy_target_min_temperature=cfg.policy_target_min_temperature,
+                policy_target_max_temperature=cfg.policy_target_max_temperature,
+                early_move_sampling=cfg.early_move_sampling,
+                early_move_sampling_plies=cfg.early_move_sampling_plies,
+                early_move_top1_cap=cfg.early_move_top1_cap,
+                early_move_min_temperature=cfg.early_move_min_temperature,
+                early_move_max_temperature=cfg.early_move_max_temperature,
+            ),
+        )
         start_states_t = None
         endgame_games = 0
         if cfg.endgame_frac > 0.0:

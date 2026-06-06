@@ -74,6 +74,11 @@ class FNNMCTSConfig:
     policy_target_top1_cap:       float = 0.7
     policy_target_min_temperature: float = 1.0
     policy_target_max_temperature: float = 7.0
+    early_move_sampling:          bool  = True
+    early_move_sampling_plies:    int   = 6
+    early_move_top1_cap:          float = 0.4
+    early_move_min_temperature:   float = 1.0
+    early_move_max_temperature:   float = 9.0
     final_value_ply_count:        int   = 3
     final_value_weight:           float = 2.0
     # Rebase each game's tree to a fresh root after applying a move.
@@ -147,31 +152,52 @@ class FNNMCTSOrchestrator:
         valid_slot: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.config
+        return self._build_capped_softmax(
+            sampled_logits,
+            valid_slot,
+            min_temp=cfg.policy_target_min_temperature,
+            max_temp=cfg.policy_target_max_temperature,
+            top1_cap=cfg.policy_target_top1_cap,
+            adaptive=cfg.adaptive_policy_target_temperature,
+            fixed_temp=cfg.policy_target_temperature,
+        )
+
+    def _build_capped_softmax(
+        self,
+        logits: torch.Tensor,
+        valid_slot: torch.Tensor,
+        *,
+        min_temp: float,
+        max_temp: float,
+        top1_cap: float,
+        adaptive: bool,
+        fixed_temp: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
 
         def _softmax_with_temp(temp: torch.Tensor) -> torch.Tensor:
-            probs = torch.softmax(sampled_logits / temp, dim=1)
+            probs = torch.softmax(logits / temp, dim=1)
             probs = torch.where(valid_slot, probs, torch.zeros_like(probs))
             return probs / probs.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
-        if not cfg.adaptive_policy_target_temperature:
-            target_temperature = max(float(cfg.policy_target_temperature), 1e-6)
+        if not adaptive:
+            target_temperature = max(float(fixed_temp if fixed_temp is not None else min_temp), 1e-6)
             temp_tensor = torch.full(
-                (sampled_logits.shape[0], 1),
+                (logits.shape[0], 1),
                 target_temperature,
-                dtype=sampled_logits.dtype,
-                device=sampled_logits.device,
+                dtype=logits.dtype,
+                device=logits.device,
             )
             return _softmax_with_temp(temp_tensor), temp_tensor.squeeze(1)
 
-        min_temp = max(float(cfg.policy_target_min_temperature), 1.0)
-        max_temp = max(float(cfg.policy_target_max_temperature), min_temp)
-        top1_cap = min(max(float(cfg.policy_target_top1_cap), 0.0), 1.0)
+        min_temp = max(float(min_temp), 1.0)
+        max_temp = max(float(max_temp), min_temp)
+        top1_cap = min(max(float(top1_cap), 0.0), 1.0)
 
         base_temp = torch.full(
-            (sampled_logits.shape[0], 1),
+            (logits.shape[0], 1),
             min_temp,
-            dtype=sampled_logits.dtype,
-            device=sampled_logits.device,
+            dtype=logits.dtype,
+            device=logits.device,
         )
         probs = _softmax_with_temp(base_temp)
         need_soften = probs.max(dim=1, keepdim=True).values > top1_cap
@@ -297,8 +323,12 @@ class FNNMCTSOrchestrator:
             # Per-child value from child's perspective; negate for parent's perspective
             child_values = self.net.value_head(succ_emb).squeeze(-1).float()  # (N_total,)
             gathered_root = root_emb[action_to_root]
+            gathered_root_features = root_features[action_to_root]
             action_logits = self.net.score_actions(
-                gathered_root, succ_emb,
+                gathered_root,
+                succ_emb,
+                gathered_root_features,
+                succ_features,
             ).float()                                  # (N_total,)
 
         legal_logits = torch.full(
@@ -726,6 +756,21 @@ class FNNMCTSOrchestrator:
                     torch.full_like(final_cand_sigma, -1e30),
                 )
                 chosen_pos = torch.argmax(final_cand_sigma, dim=1)
+                if cfg.early_move_sampling:
+                    early_sample_rows = search_rows & (
+                        move_numbers < int(cfg.early_move_sampling_plies)
+                    ) & candidate_valid.any(dim=1)
+                    if bool(early_sample_rows.any().item()):
+                        sample_probs, _ = self._build_capped_softmax(
+                            final_cand_sigma,
+                            candidate_valid,
+                            min_temp=cfg.early_move_min_temperature,
+                            max_temp=cfg.early_move_max_temperature,
+                            top1_cap=cfg.early_move_top1_cap,
+                            adaptive=True,
+                        )
+                        sampled_pos = torch.multinomial(sample_probs, num_samples=1).squeeze(1)
+                        chosen_pos = torch.where(early_sample_rows, sampled_pos, chosen_pos)
                 chosen_slot = torch.gather(
                     candidate_slots, 1, chosen_pos.unsqueeze(1),
                 ).squeeze(1).clamp(min=0).to(torch.long)

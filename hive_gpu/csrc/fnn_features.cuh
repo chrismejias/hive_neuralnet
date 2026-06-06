@@ -5,7 +5,7 @@
  * bypassing the full encode_states_batch pipeline (no per-node features,
  * no edges, no graph construction).
  *
- * Feature layout (FNN_FEAT_DIM = 122):
+ * Feature layout (FNN_FEAT_DIM = 124):
  *   [0:16]   count_on_board    — visible top pieces per type(8) × color(2)
  *   [16:32]  count_in_hand     — hand piece counts per type(8) × color(2)
  *   [32:48]  queen_neighbors   — top pieces adjacent to opponent queen, per type(8) × color(2)
@@ -23,6 +23,9 @@
  *   [108:110] throwable_opp    — own-color pieces adjacent to opposing pillbug-capable cell (threatened), per color(2)
  *   [110:116] white_q_surround — one-hot surround count buckets 1..6 for white queen
  *   [116:122] black_q_surround — one-hot surround count buckets 1..6 for black queen
+ *   [122:124] own_q_throwable  — own queen could be legally thrown by own
+ *                                pillbug/mosquito actor if it were that
+ *                                color's turn, per color(2)
  *
  * Must be included from game_logic.cu (needs NEIGHBORS constant memory).
  */
@@ -32,14 +35,64 @@
 #include "hex_grid.cuh"
 #include "hive_state.cuh"
 #include "articulation.cuh"
+#include "move_gen.cuh"
 
 namespace hive_gpu {
 
-constexpr int FNN_FEAT_DIM = 122;
+constexpr int FNN_FEAT_DIM = 124;
 // Draw is at move 200 in standard Hive
 constexpr int DRAW_MOVE_LIMIT = 200;
 
 #ifdef __CUDACC__
+
+__device__ inline bool can_be_thrown_by_color(
+    const HiveState& s, int cell,
+    const Bitboard& ap_mask, Color thrower
+) {
+    if (s.height[cell] != 1) return false;
+    if (is_pinned(s, ap_mask, cell)) return false;
+    if (is_stunned_cell(s, cell)) return false;
+
+    for (int d = 0; d < NUM_DIRS; d++) {
+        int16_t pb_cell = NEIGHBORS[cell][d];
+        if (pb_cell < 0 || !s.occupied.get(pb_cell)) continue;
+
+        Color top_c = top_piece_color_at(s, pb_cell);
+        if (top_c != thrower) continue;
+
+        PieceType pb_pt = top_piece_type_at(s, pb_cell);
+        bool is_pillbug_actor = false;
+        if (pb_pt == PT_PILLBUG) {
+            is_pillbug_actor = true;
+        } else if (pb_pt == PT_MOSQUITO && s.height[pb_cell] == 1) {
+            for (int d2 = 0; d2 < NUM_DIRS; d2++) {
+                int16_t nb2 = NEIGHBORS[pb_cell][d2];
+                if (nb2 >= 0 && s.occupied.get(nb2) &&
+                    top_piece_type_at(s, nb2) == PT_PILLBUG) {
+                    is_pillbug_actor = true;
+                    break;
+                }
+            }
+        }
+        if (!is_pillbug_actor) continue;
+
+        int pb_height = s.height[pb_cell];
+        int lift_h = max(s.height[cell] - 1, pb_height);
+        int opp_d = find_direction(cell, pb_cell);
+        if (opp_d < 0) continue;
+        if (elevated_gate_blocked(s, cell, opp_d, lift_h)) continue;
+
+        for (int dd = 0; dd < NUM_DIRS; dd++) {
+            int16_t dest = NEIGHBORS[pb_cell][dd];
+            if (dest < 0 || dest == cell || s.occupied.get(dest)) continue;
+            int drop_h = max(pb_height, 0);
+            if (!elevated_gate_blocked(s, pb_cell, dd, drop_h)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 __device__ __forceinline__ int hex_distance(int cell_a, int cell_b) {
     // Axial coordinates
@@ -318,6 +371,17 @@ __device__ inline void extract_fnn_features_device(
                     f[108 + (int)nc] += 1.0f;
                 }
             }
+        }
+    }
+
+    // ── own_q_throwable [122:124] ─────────────────────────────
+    MovegenStateCache throw_cache;
+    init_movegen_state_cache(s, throw_cache);
+    for (int c = 0; c < 2; c++) {
+        uint16_t qcell = s.queen_cell[c];
+        if (qcell == 0xFFFF) continue;
+        if (can_be_thrown_by_color(s, (int)qcell, ap_mask, (Color)c)) {
+            f[122 + c] = 1.0f;
         }
     }
 

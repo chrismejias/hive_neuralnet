@@ -554,7 +554,13 @@ class FNNCPUPlayer:
                 succ_t = torch.from_numpy(np.stack(succ_features, axis=0))
                 succ_emb = self.net.encode(succ_t)
                 root_rep = root_emb.expand(succ_emb.shape[0], -1)
-                logits = self.net.score_actions(root_rep, succ_emb)
+                root_feat_rep = root_t.expand(succ_t.shape[0], -1)
+                logits = self.net.score_actions(
+                    root_rep,
+                    succ_emb,
+                    root_feat_rep,
+                    succ_t,
+                )
                 priors = torch.softmax(logits, dim=0).cpu().numpy()
             else:
                 priors = np.zeros((0,), dtype=np.float32)

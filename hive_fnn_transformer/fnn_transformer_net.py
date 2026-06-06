@@ -16,10 +16,12 @@ import torch.nn as nn
 from hive_fnn.fnn_features import FEAT_DIM
 from hive_fnn.fnn_network import FNNConfig, HiveFNN
 from hive_fnn_transformer.graph_types import (
-    ARTICULATION_NODE_FEAT_DIM,
     BASE_NODE_FEAT_DIM,
+    BASE_GLOBAL_FEAT_DIM,
     GLOBAL_FEAT_DIM,
     MAX_PIECE_TOKENS,
+    MAX_GLOBAL_FEAT_DIM,
+    MAX_NODE_FEAT_DIM,
     NODE_FEAT_DIM,
     HybridPieceTensorBatch,
 )
@@ -31,6 +33,7 @@ MOVE_FEAT_DIM = 31
 class HybridGNNConfig:
     fnn_config: FNNConfig | None = None
     use_articulation_token_flag: bool = False
+    use_queen_threat_features: bool = False
     graph_hidden_dim: int = 64
     graph_layers: int = 4
     graph_mlp_hidden: int = 96
@@ -45,9 +48,13 @@ class HybridGNNConfig:
 
     def __post_init__(self) -> None:
         self.node_feat_dim = (
-            ARTICULATION_NODE_FEAT_DIM
-            if self.use_articulation_token_flag
-            else BASE_NODE_FEAT_DIM
+            BASE_NODE_FEAT_DIM
+            + int(bool(self.use_articulation_token_flag))
+            + int(bool(self.use_queen_threat_features))
+        )
+        self.global_feat_dim = (
+            BASE_GLOBAL_FEAT_DIM
+            + (6 if self.use_queen_threat_features else 0)
         )
 
     @classmethod
@@ -55,6 +62,7 @@ class HybridGNNConfig:
         return cls(
             fnn_config=FNNConfig.medium(),
             use_articulation_token_flag=False,
+            use_queen_threat_features=False,
             graph_hidden_dim=64,
             graph_layers=4,
             graph_mlp_hidden=96,
@@ -66,6 +74,7 @@ class HybridGNNConfig:
         return cls(
             fnn_config=FNNConfig.large(),
             use_articulation_token_flag=True,
+            use_queen_threat_features=False,
             graph_hidden_dim=128,
             graph_layers=8,
             graph_mlp_hidden=192,

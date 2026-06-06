@@ -21,9 +21,18 @@ import torch.nn as nn
 from hive_fnn.fnn_features import FEAT_DIM
 
 
+_WHITE_MOVE_SLICE = slice(64, 72)
+_BLACK_MOVE_SLICE = slice(72, 80)
+_WHITE_PLACE_IDX = 100
+_BLACK_PLACE_IDX = 101
+_WHITE_SURROUND_SLICE = slice(110, 116)
+_BLACK_SURROUND_SLICE = slice(116, 122)
+_ACTION_SURROUND_ABS_DIM = 24
+
+
 @dataclass
 class FNNConfig:
-    feat_dim: int = 122  # FNN_FEAT_DIM from CUDA kernel
+    feat_dim: int = 124  # FNN_FEAT_DIM from CUDA kernel
     hidden_dim: int = 64
     embed_dim: int = 64
     action_hidden: int = 64
@@ -67,7 +76,7 @@ class HiveFNN(nn.Module):
         self.value_fc = nn.Linear(c.embed_dim, 1)
 
         # ---- Action tower (scores a successor relative to root) ----
-        self.action_fc1 = nn.Linear(c.embed_dim * 2, c.action_hidden)
+        self.action_fc1 = nn.Linear(c.embed_dim * 2 + _ACTION_SURROUND_ABS_DIM, c.action_hidden)
         self.action_fc2 = nn.Linear(c.action_hidden, 1)
 
     @staticmethod
@@ -87,11 +96,56 @@ class HiveFNN(nn.Module):
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         state = dict(state_dict)
         cur_state = self.state_dict()
-        key = "fc1.weight"
-        if key in state and key in cur_state and state[key].shape != cur_state[key].shape:
-            old = state[key]
-            state[key] = self._pad_loaded_weight(old, cur_state[key])
+        for key in ("fc1.weight", "action_fc1.weight"):
+            if key in state and key in cur_state and state[key].shape != cur_state[key].shape:
+                old = state[key]
+                state[key] = self._pad_loaded_weight(old, cur_state[key])
         return super().load_state_dict(state, strict=strict, assign=assign)
+
+    @staticmethod
+    def _infer_current_player_is_white(features: torch.Tensor) -> torch.Tensor:
+        white_activity = (
+            features[:, _WHITE_MOVE_SLICE].sum(dim=1) + features[:, _WHITE_PLACE_IDX]
+        )
+        black_activity = (
+            features[:, _BLACK_MOVE_SLICE].sum(dim=1) + features[:, _BLACK_PLACE_IDX]
+        )
+        return white_activity >= black_activity
+
+    def _action_surround_features(
+        self,
+        root_features: torch.Tensor,
+        successor_features: torch.Tensor,
+    ) -> torch.Tensor:
+        root_is_white = self._infer_current_player_is_white(root_features)
+        succ_is_white = self._infer_current_player_is_white(successor_features)
+        ambiguous = (
+            (root_features[:, _WHITE_MOVE_SLICE].sum(dim=1) + root_features[:, _WHITE_PLACE_IDX])
+            == (root_features[:, _BLACK_MOVE_SLICE].sum(dim=1) + root_features[:, _BLACK_PLACE_IDX])
+        )
+        root_is_white = torch.where(ambiguous, ~succ_is_white, root_is_white)
+
+        root_own = torch.where(
+            root_is_white.unsqueeze(1),
+            root_features[:, _WHITE_SURROUND_SLICE],
+            root_features[:, _BLACK_SURROUND_SLICE],
+        )
+        root_opp = torch.where(
+            root_is_white.unsqueeze(1),
+            root_features[:, _BLACK_SURROUND_SLICE],
+            root_features[:, _WHITE_SURROUND_SLICE],
+        )
+        succ_own = torch.where(
+            root_is_white.unsqueeze(1),
+            successor_features[:, _WHITE_SURROUND_SLICE],
+            successor_features[:, _BLACK_SURROUND_SLICE],
+        )
+        succ_opp = torch.where(
+            root_is_white.unsqueeze(1),
+            successor_features[:, _BLACK_SURROUND_SLICE],
+            successor_features[:, _WHITE_SURROUND_SLICE],
+        )
+        return torch.cat([root_own, root_opp, succ_own, succ_opp], dim=1)
 
     # ---- Shared encoder ----
 
@@ -128,6 +182,8 @@ class HiveFNN(nn.Module):
         self,
         root_embed: torch.Tensor,
         successor_embed: torch.Tensor,
+        root_features: torch.Tensor,
+        successor_features: torch.Tensor,
     ) -> torch.Tensor:
         """Score successor states relative to the root.
 
@@ -138,7 +194,11 @@ class HiveFNN(nn.Module):
         Returns:
             (N_actions,) logits
         """
-        combined = torch.cat([root_embed, successor_embed], dim=1)
+        surround_features = self._action_surround_features(
+            root_features,
+            successor_features,
+        )
+        combined = torch.cat([root_embed, successor_embed, surround_features], dim=1)
         x = torch.sigmoid(self.action_fc1(combined))
         return self.action_fc2(x).squeeze(-1)
 
@@ -172,7 +232,13 @@ class HiveFNN(nn.Module):
 
         succ_emb = self.encode(successor_features)           # (N, embed_dim)
         gathered_root = root_emb[action_to_root]             # (N, embed_dim)
-        action_logits = self.score_actions(gathered_root, succ_emb)  # (N,)
+        gathered_root_features = root_features[action_to_root]
+        action_logits = self.score_actions(
+            gathered_root,
+            succ_emb,
+            gathered_root_features,
+            successor_features,
+        )  # (N,)
         return action_logits, root_values
 
     def count_parameters(self) -> int:

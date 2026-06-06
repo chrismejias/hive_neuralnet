@@ -39,6 +39,10 @@ class HybridMCTSOrchestrator(FNNMCTSOrchestrator):
         wanted = int(self.net.config.node_feat_dim)
         return token_features[..., :wanted]
 
+    def _slice_global_features(self, global_features: torch.Tensor) -> torch.Tensor:
+        wanted = int(self.net.config.global_feat_dim)
+        return global_features[..., :wanted]
+
     def _eval_states(
         self,
         states: torch.Tensor,
@@ -85,7 +89,7 @@ class HybridMCTSOrchestrator(FNNMCTSOrchestrator):
                 token_r=token_r,
                 token_z=token_z,
                 token_mask=token_mask,
-                global_features=global_features,
+                global_features=self._slice_global_features(global_features),
                 num_tokens=token_mask.sum(dim=1, dtype=torch.int32),
             )
         else:
@@ -109,7 +113,7 @@ class HybridMCTSOrchestrator(FNNMCTSOrchestrator):
                 token_r=token_r,
                 token_z=token_z,
                 token_mask=token_mask,
-                global_features=global_features,
+                global_features=self._slice_global_features(global_features),
                 num_tokens=num_tokens,
             )
             move_features_per_legal = self.ext.hybrid_transformer_move_features_batch(

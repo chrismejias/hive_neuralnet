@@ -37,6 +37,9 @@ class HybridTrainConfig:
     max_num_considered: int = 16
     queen_surround_reserve_slots: int = 6
     queen_surround_reserve_immobile_only: bool = True
+    endgame_frac: float = 0.0
+    endgame_surround: int = 5
+    endgame_randomize_side_to_move: bool = True
     temperature: float = 1.0
     temperature_drop_move: int = 20
     max_game_length: int = 300
@@ -69,6 +72,11 @@ class HybridTrainConfig:
     policy_target_top1_cap: float = 0.7
     policy_target_min_temperature: float = 1.0
     policy_target_max_temperature: float = 7.0
+    early_move_sampling: bool = True
+    early_move_sampling_plies: int = 6
+    early_move_top1_cap: float = 0.4
+    early_move_min_temperature: float = 1.0
+    early_move_max_temperature: float = 9.0
     final_value_ply_count: int = 3
     final_value_weight: float = 2.0
     merge_opening_value_examples: bool = True
@@ -79,6 +87,7 @@ class HybridTrainConfig:
     ema_arena_games: int = 256
     ema_arena_noise_scale: float = 0.1
     ema_promotion_score: float = 0.55
+    queen_surround_only_tuning: bool = False
 
 
 def _simulations_for_iteration(
@@ -122,17 +131,23 @@ class HybridTrainer:
             else self.device.type == "cuda"
         )
         self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
+        self._gradient_hooks: list[torch.utils.hooks.RemovableHandle] = []
         self.optimizer = optim.Adam(
             self.best_net.parameters(),
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
+        self._apply_trainable_masks()
         self._sync_model(self.ema_net, self.best_net)
         self._sync_model(self.champion_net, self.best_net)
 
     def _slice_token_features(self, token_features: torch.Tensor) -> torch.Tensor:
         wanted = int(self.net_config.node_feat_dim)
         return token_features[..., :wanted]
+
+    def _slice_global_features(self, global_features: torch.Tensor) -> torch.Tensor:
+        wanted = int(self.net_config.global_feat_dim)
+        return global_features[..., :wanted]
 
     def _cleanup(self) -> None:
         if self.device.type == "cuda":
@@ -146,14 +161,48 @@ class HybridTrainer:
 
     def _rebuild_optimizer(self) -> None:
         self.optimizer = optim.Adam(
-            self.best_net.parameters(),
+            [p for p in self.best_net.parameters() if p.requires_grad],
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
 
+    def _clear_gradient_hooks(self) -> None:
+        for handle in self._gradient_hooks:
+            handle.remove()
+        self._gradient_hooks.clear()
+
+    def _register_mask_hook(self, param: torch.nn.Parameter, mask: torch.Tensor) -> None:
+        mask = mask.to(device=param.device, dtype=param.dtype)
+        handle = param.register_hook(lambda grad, m=mask: grad * m)
+        self._gradient_hooks.append(handle)
+
+    def _apply_trainable_masks(self) -> None:
+        self._clear_gradient_hooks()
+        for param in self.best_net.parameters():
+            param.requires_grad_(True)
+
+        if not self.config.queen_surround_only_tuning:
+            return
+
+        for name, param in self.best_net.named_parameters():
+            param.requires_grad_(False)
+
+        fc1 = self.best_net.fnn.fc1.weight
+        fc1.requires_grad_(True)
+        fc1_mask = torch.zeros_like(fc1)
+        fc1_mask[:, 110:122] = 1.0
+        self._register_mask_hook(fc1, fc1_mask)
+
+        move_proj = self.best_net.policy_move_proj.weight
+        move_proj.requires_grad_(True)
+        move_proj_mask = torch.zeros_like(move_proj)
+        move_proj_mask[:, -6:] = 1.0
+        self._register_mask_hook(move_proj, move_proj_mask)
+
     def _reset_raw_to_champion(self) -> None:
         self._sync_model(self.best_net, self.champion_net)
         self._sync_model(self.ema_net, self.champion_net)
+        self._apply_trainable_masks()
         self._rebuild_optimizer()
 
     def _update_ema(self) -> None:
@@ -373,11 +422,52 @@ class HybridTrainer:
                 policy_target_top1_cap=cfg.policy_target_top1_cap,
                 policy_target_min_temperature=cfg.policy_target_min_temperature,
                 policy_target_max_temperature=cfg.policy_target_max_temperature,
+                early_move_sampling=cfg.early_move_sampling,
+                early_move_sampling_plies=cfg.early_move_sampling_plies,
+                early_move_top1_cap=cfg.early_move_top1_cap,
+                early_move_min_temperature=cfg.early_move_min_temperature,
+                early_move_max_temperature=cfg.early_move_max_temperature,
             ),
         )
-        raw = orch.self_play_batch()
+        start_states_t = None
+        endgame_games = 0
+        if cfg.endgame_frac > 0.0:
+            from hive_gpu.endgame_generator import (
+                generate_endgame_positions,
+                positions_to_tensor,
+                rebalance_side_to_move,
+            )
+
+            n_endgame = max(1, int(cfg.games_per_batch * cfg.endgame_frac))
+            endgame_pool = generate_endgame_positions(
+                n_positions=n_endgame,
+                expansion_mask=cfg.expansion_mask,
+                min_surround=cfg.endgame_surround,
+                max_surround=cfg.endgame_surround,
+                gpu_batch=min(cfg.games_per_batch, 256),
+                mixed_pair=False,
+            )
+            if cfg.endgame_randomize_side_to_move and endgame_pool:
+                endgame_pool = rebalance_side_to_move(endgame_pool)
+            endgame_games = len(endgame_pool)
+            tensors = []
+            if endgame_pool:
+                tensors.append(positions_to_tensor(endgame_pool, device="cuda"))
+            n_fresh = cfg.games_per_batch - len(endgame_pool)
+            if n_fresh > 0:
+                tensors.append(orch.ext.create_initial_states(n_fresh, cfg.expansion_mask))
+            if tensors:
+                start_states_t = torch.cat(tensors, dim=0)
+
+        raw = orch.self_play_batch(start_states=start_states_t)
         flat = []
-        stats = {"num_games": 0, "white_wins": 0, "black_wins": 0, "draws": 0}
+        stats = {
+            "num_games": 0,
+            "white_wins": 0,
+            "black_wins": 0,
+            "draws": 0,
+            "endgame_games": endgame_games,
+        }
         for game in raw:
             if not game:
                 stats["num_games"] += 1
@@ -434,7 +524,7 @@ class HybridTrainer:
                 token_r=cached_token_r.to(torch.int64),
                 token_z=cached_token_z.to(torch.int64),
                 token_mask=cached_token_mask,
-                global_features=cached_global_features.float(),
+                global_features=self._slice_global_features(cached_global_features.float()),
                 num_tokens=cached_token_mask.sum(dim=1, dtype=torch.int32),
             )
             move_features_per_legal = cached_move_features.float()
@@ -459,7 +549,7 @@ class HybridTrainer:
                 token_r=token_r,
                 token_z=token_z,
                 token_mask=token_mask,
-                global_features=global_features,
+                global_features=self._slice_global_features(global_features),
                 num_tokens=token_mask.sum(dim=1, dtype=torch.int32),
             )
         else:
@@ -495,7 +585,7 @@ class HybridTrainer:
                 token_r=token_r,
                 token_z=token_z,
                 token_mask=token_mask,
-                global_features=global_features,
+                global_features=self._slice_global_features(global_features),
                 num_tokens=num_tokens,
             )
             move_features_per_legal = self.ext.hybrid_transformer_move_features_batch(
@@ -714,6 +804,7 @@ class HybridTrainer:
                 state = dict(state)
                 state[key] = new
         self.best_net.load_state_dict(state)
+        self._apply_trainable_masks()
         ema_state = ckpt.get("ema_state_dict")
         champion_state = ckpt.get("champion_state_dict")
         if ema_state is not None:
@@ -725,7 +816,9 @@ class HybridTrainer:
         else:
             self._sync_model(self.champion_net, self.best_net)
         opt_state = ckpt.get("optimizer_state_dict")
-        if opt_state is not None:
+        if self.config.queen_surround_only_tuning:
+            self._rebuild_optimizer()
+        elif opt_state is not None:
             try:
                 self.optimizer.load_state_dict(opt_state)
             except ValueError:

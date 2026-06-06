@@ -32,6 +32,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--graph-mlp-hidden", type=int, default=None)
     p.add_argument("--value-hidden", type=int, default=None)
     p.add_argument("--fnn-preset", choices=["small", "medium", "large"], default=None)
+    p.add_argument(
+        "--articulation-token-flag",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override whether the transformer token features include the "
+            "articulation-point flag. Defaults to the selected preset."
+        ),
+    )
+    p.add_argument(
+        "--queen-threat-features",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override whether the transformer token/global features include "
+            "queen-threat indicators and per-side 0/1/2+ threat tallies. "
+            "Defaults to the selected preset."
+        ),
+    )
 
     p.add_argument("--iterations", type=int, default=1500)
     p.add_argument("--games", type=int, default=128)
@@ -75,6 +94,30 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--max-game-length", type=int, default=300)
     p.add_argument(
+        "--endgame-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of self-play games to start from random endgame positions "
+            "where both queens have the exact surround count."
+        ),
+    )
+    p.add_argument(
+        "--endgame-surround",
+        type=int,
+        default=5,
+        help="Exact queen surround target for both queens in endgame seed positions.",
+    )
+    p.add_argument(
+        "--endgame-randomize-side-to-move",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After generating endgame seed positions, rebalance turn parity so "
+            "White and Black get an equal number of first moves from them."
+        ),
+    )
+    p.add_argument(
         "--gumbel-wave-parallel",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -105,6 +148,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--policy-target-top1-cap", type=float, default=0.7)
     p.add_argument("--policy-target-min-temperature", type=float, default=1.0)
     p.add_argument("--policy-target-max-temperature", type=float, default=7.0)
+    p.add_argument(
+        "--early-move-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="For the first few plies of self-play, sample from a temperature-flattened softmax over final search scores instead of taking the top move.",
+    )
+    p.add_argument("--early-move-sampling-plies", type=int, default=6)
+    p.add_argument("--early-move-top1-cap", type=float, default=0.4)
+    p.add_argument("--early-move-min-temperature", type=float, default=1.0)
+    p.add_argument("--early-move-max-temperature", type=float, default=9.0)
     p.add_argument("--final-value-ply-count", type=int, default=3)
     p.add_argument("--final-value-weight", type=float, default=2.0)
     p.add_argument(
@@ -124,11 +177,25 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--expansion-mask", type=int, default=0)
     p.add_argument("--draw-keep-rate", type=float, default=1.0)
+    p.add_argument(
+        "--queen-surround-only-tuning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Freeze all weights except the input-side queen-surround columns in "
+            "fnn.fc1 and the explicit move-side surround columns in policy_move_proj."
+        ),
+    )
     return p.parse_args()
 
 
 def _build_net_config(args: argparse.Namespace) -> HybridGNNConfig:
     cfg = HybridGNNConfig.large() if args.preset == "large" else HybridGNNConfig.small()
+    if args.articulation_token_flag is not None:
+        cfg.use_articulation_token_flag = bool(args.articulation_token_flag)
+    if args.queen_threat_features is not None:
+        cfg.use_queen_threat_features = bool(args.queen_threat_features)
+    cfg.__post_init__()
     if args.fnn_preset:
         cfg.fnn_config = getattr(FNNConfig, args.fnn_preset)()
     if args.graph_hidden_dim is not None:
@@ -161,6 +228,9 @@ def main() -> None:
         max_num_considered=args.gumbel_considered,
         queen_surround_reserve_slots=args.queen_surround_reserve_slots,
         queen_surround_reserve_immobile_only=args.queen_surround_reserve_immobile_only,
+        endgame_frac=args.endgame_frac,
+        endgame_surround=args.endgame_surround,
+        endgame_randomize_side_to_move=args.endgame_randomize_side_to_move,
         max_game_length=args.max_game_length,
         batch_size=args.batch_size,
         num_epochs=args.epochs,
@@ -172,6 +242,11 @@ def main() -> None:
         policy_target_top1_cap=args.policy_target_top1_cap,
         policy_target_min_temperature=args.policy_target_min_temperature,
         policy_target_max_temperature=args.policy_target_max_temperature,
+        early_move_sampling=args.early_move_sampling,
+        early_move_sampling_plies=args.early_move_sampling_plies,
+        early_move_top1_cap=args.early_move_top1_cap,
+        early_move_min_temperature=args.early_move_min_temperature,
+        early_move_max_temperature=args.early_move_max_temperature,
         final_value_ply_count=args.final_value_ply_count,
         final_value_weight=args.final_value_weight,
         merge_opening_value_examples=args.merge_opening_value_examples,
@@ -191,6 +266,7 @@ def main() -> None:
         probe_win_in_one=args.probe_win_in_one,
         probe_check_opponent_wins=args.probe_check_opponent_wins,
         probe_win_in_two=args.probe_win_in_two,
+        queen_surround_only_tuning=args.queen_surround_only_tuning,
     )
 
     net = HiveHybridGNN(net_config)
@@ -219,6 +295,13 @@ def main() -> None:
             f"{train_config.queen_surround_reserve_slots} surround slots "
             f"(immobile_only={train_config.queen_surround_reserve_immobile_only})"
         )
+    if train_config.endgame_frac > 0.0:
+        print(
+            "  Endgame seeds: "
+            f"{train_config.endgame_frac:.0%} games from surround "
+            f"{train_config.endgame_surround}/{train_config.endgame_surround} "
+            f"(rebalance_side_to_move={train_config.endgame_randomize_side_to_move})"
+        )
     if train_config.short_forced_win_probe:
         print(
             "  Tactical probe:"
@@ -226,6 +309,8 @@ def main() -> None:
             f" oppwin={train_config.probe_check_opponent_wins}"
             f" win2={train_config.probe_win_in_two}"
         )
+    if train_config.queen_surround_only_tuning:
+        print("  Trainable weights: queen-surround input slices only")
     del net
 
     trainer = HybridTrainer(train_config, net_config)

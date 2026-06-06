@@ -193,6 +193,38 @@ def positions_to_tensor(
     return torch.from_numpy(arr).to(device)
 
 
+def rebalance_side_to_move(
+    positions: list[bytes],
+    rng: Optional[random.Random] = None,
+) -> list[bytes]:
+    """Return copies of positions with an exactly balanced side to move.
+
+    The board geometry/colors stay unchanged; only the turn parity is adjusted so
+    half the positions are White-to-move and half Black-to-move (difference at
+    most one when the count is odd). This is useful for endgame curriculum pools
+    where the generator otherwise inherits a biased active-player distribution
+    from random rollouts.
+    """
+    n = len(positions)
+    if n <= 1:
+        return positions
+
+    rnd = rng or random
+    out = [bytearray(p) for p in positions]
+    order = list(range(n))
+    rnd.shuffle(order)
+    n_white = (n + 1) // 2
+    for rank, idx in enumerate(order):
+        desired_white_to_move = rank < n_white
+        turn = struct.unpack_from("<H", out[idx], _OFF_TURN)[0]
+        if desired_white_to_move:
+            turn &= 0xFFFE  # even turn => White to move
+        else:
+            turn |= 0x0001  # odd turn => Black to move
+        struct.pack_into("<H", out[idx], _OFF_TURN, turn)
+    return [bytes(p) for p in out]
+
+
 # ── Hex neighbour table (precomputed once at import time) ─────────────────
 
 def _build_neighbor_table() -> np.ndarray:

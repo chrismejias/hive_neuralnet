@@ -13,6 +13,7 @@
 #include "hex_grid.cuh"
 #include "hive_state.cuh"
 #include "articulation.cuh"
+#include "move_gen.cuh"
 
 namespace hive_gpu {
 
@@ -32,8 +33,8 @@ constexpr int ENC_HALF = 8;
 constexpr int HYBRID_MAX_NODES = 48;
 constexpr int HYBRID_MAX_EDGES = 640;
 constexpr int HYBRID_MAX_PIECE_TOKENS = 28;
-constexpr int HYBRID_NODE_FEAT_DIM = 27;
-constexpr int HYBRID_GLOBAL_FEAT_DIM = 6;
+constexpr int HYBRID_NODE_FEAT_DIM = 28;
+constexpr int HYBRID_GLOBAL_FEAT_DIM = 12;
 constexpr int HYBRID_MOVE_FEAT_DIM = 31;
 constexpr int HYBRID_MAX_RADIUS = 2;
 constexpr int HYBRID_EDGE_FEAT_DIM = 3;
@@ -166,6 +167,92 @@ __device__ __forceinline__ int queen_surround_count_after_move(
     return count;
 }
 
+__device__ __forceinline__ bool piece_can_threaten_enemy_queen(
+    const HiveState& s,
+    int cell,
+    PieceType pt,
+    Color pc,
+    const Bitboard& ap_mask
+) {
+    Color opp = (pc == WHITE) ? BLACK : WHITE;
+    if (!is_queen_placed(s, pc) || !is_queen_placed(s, opp)) return false;
+    int opp_qcell = (int)s.queen_cell[(int)opp];
+
+    bool is_pillbug_actor = false;
+    if (pt == PT_PILLBUG && !is_stunned_cell(s, cell)) {
+        is_pillbug_actor = true;
+    } else if (pt == PT_MOSQUITO && s.height[cell] == 1 && !is_stunned_cell(s, cell)) {
+        for (int d = 0; d < NUM_DIRS; ++d) {
+            int16_t nb = NEIGHBORS[cell][d];
+            if (nb >= 0 && s.height[nb] > 0 && top_piece_type_at(s, nb) == PT_PILLBUG) {
+                is_pillbug_actor = true;
+                break;
+            }
+        }
+    }
+    if (is_pillbug_actor) {
+        MovegenStateCache cache;
+        init_movegen_state_cache(s, cache);
+        for (int dt = 0; dt < NUM_DIRS; ++dt) {
+            int16_t target_cell = NEIGHBORS[cell][dt];
+            if (target_cell < 0 || !s.occupied.get(target_cell)) continue;
+            int pb_height = s.height[cell];
+            if (s.height[target_cell] != 1) continue;
+            if (is_stunned_cell(s, target_cell)) continue;
+            if (is_pinned(cache, target_cell)) continue;
+            int lift_h = max(s.height[target_cell] - 1, pb_height);
+            int opp_dt = find_direction(target_cell, cell);
+            if (opp_dt < 0) continue;
+            if (elevated_gate_blocked(s, target_cell, opp_dt, lift_h)) continue;
+            for (int dd = 0; dd < NUM_DIRS; ++dd) {
+                int16_t dest_cell = NEIGHBORS[cell][dd];
+                if (dest_cell < 0 || dest_cell == target_cell || s.occupied.get(dest_cell)) continue;
+                int drop_h = max(pb_height, 0);
+                if (elevated_gate_blocked(s, cell, dd, drop_h)) continue;
+                if (is_neighbor_cell(dest_cell, opp_qcell)) return true;
+            }
+        }
+    }
+
+    if (is_neighbor_cell(cell, opp_qcell)) return false;
+    if (is_pinned(s, ap_mask, cell)) return false;
+
+    uint16_t dests[MAX_ANT_DESTS];
+    int ndests = 0;
+    switch (pt) {
+        case PT_QUEEN:
+            ndests = gen_queen_moves(s, cell, dests);
+            break;
+        case PT_ANT:
+            ndests = gen_ant_moves(s, cell, dests);
+            break;
+        case PT_GRASSHOPPER:
+            ndests = gen_grasshopper_moves(s, cell, dests);
+            break;
+        case PT_SPIDER:
+            ndests = gen_spider_moves(s, cell, dests);
+            break;
+        case PT_BEETLE:
+            ndests = gen_beetle_moves(s, cell, dests);
+            break;
+        case PT_MOSQUITO:
+            ndests = gen_mosquito_moves(s, cell, dests);
+            break;
+        case PT_LADYBUG:
+            ndests = gen_ladybug_moves(s, cell, dests);
+            break;
+        case PT_PILLBUG:
+            ndests = gen_pillbug_moves(s, cell, dests);
+            break;
+        default:
+            break;
+    }
+    for (int i = 0; i < ndests; ++i) {
+        if (is_neighbor_cell((int)dests[i], opp_qcell)) return true;
+    }
+    return false;
+}
+
 __global__ void hybrid_gnn_encode_states_kernel(
     const HiveState* states,
     const GPUMove* legal_moves,     // [B, MAX_LEGAL_MOVES] or nullptr
@@ -210,6 +297,7 @@ __global__ void hybrid_gnn_encode_states_kernel(
 
     float queen_surround[2] = {0.0f, 0.0f};
     Bitboard ap_mask = find_articulation_points(s);
+    int queen_threat_count[2] = {0, 0};
     for (int c = 0; c < 2; ++c) {
         uint16_t qc = s.queen_cell[c];
         if (qc != 0xFFFF) {
@@ -241,6 +329,18 @@ __global__ void hybrid_gnn_encode_states_kernel(
             occ_flags[d] = (nb >= 0 && s.height[nb] > 0) ? 1 : 0;
             occ_count += occ_flags[d];
         }
+        bool top_is_queen_threat = false;
+        if (h > 0) {
+            uint8_t top_packed = s.pieces[h - 1][cell];
+            PieceType top_pt = cell_piece_type(top_packed);
+            Color top_pc = cell_color(top_packed);
+            top_is_queen_threat = piece_can_threaten_enemy_queen(
+                s, cell, top_pt, top_pc, ap_mask
+            );
+            if (top_is_queen_threat && queen_threat_count[(int)top_pc] < 2) {
+                queen_threat_count[(int)top_pc] += 1;
+            }
+        }
 
         first_node_at[cell] = (int16_t)node_count;
         for (int level = 0; level < h; ++level) {
@@ -265,6 +365,7 @@ __global__ void hybrid_gnn_encode_states_kernel(
                 }
                 top_node_at[cell] = (int16_t)node_count;
                 f[26] = ap_mask.get(cell) ? 1.0f : 0.0f;
+                f[27] = top_is_queen_threat ? 1.0f : 0.0f;
             }
             f[24] = level * 0.25f;
             f[25] = is_stunned_cell(s, cell) ? 1.0f : 0.0f;
@@ -364,6 +465,8 @@ __global__ void hybrid_gnn_encode_states_kernel(
     }
     gf[4] = white_hand / 14.0f;
     gf[5] = black_hand / 14.0f;
+    gf[6 + queen_threat_count[WHITE]] = 1.0f;
+    gf[9 + queen_threat_count[BLACK]] = 1.0f;
 
     num_nodes_out[idx] = node_count;
     num_edges_out[idx] = edge_count;
@@ -390,6 +493,7 @@ __device__ inline void extract_hybrid_transformer_tokens_device(
 
     float queen_surround[2] = {0.0f, 0.0f};
     Bitboard ap_mask = find_articulation_points(s);
+    int queen_threat_count[2] = {0, 0};
     for (int c = 0; c < 2; ++c) {
         uint16_t qc = s.queen_cell[c];
         if (qc != 0xFFFF) {
@@ -413,6 +517,18 @@ __device__ inline void extract_hybrid_transformer_tokens_device(
             int16_t nb = NEIGHBORS[cell][d];
             occ_flags[d] = (nb >= 0 && s.height[nb] > 0) ? 1 : 0;
             occ_count += occ_flags[d];
+        }
+        bool top_is_queen_threat = false;
+        if (h > 0) {
+            uint8_t top_packed = s.pieces[h - 1][cell];
+            PieceType top_pt = cell_piece_type(top_packed);
+            Color top_pc = cell_color(top_packed);
+            top_is_queen_threat = piece_can_threaten_enemy_queen(
+                s, cell, top_pt, top_pc, ap_mask
+            );
+            if (top_is_queen_threat && queen_threat_count[(int)top_pc] < 2) {
+                queen_threat_count[(int)top_pc] += 1;
+            }
         }
 
         int col = cell % BOARD_SIZE;
@@ -442,6 +558,7 @@ __device__ inline void extract_hybrid_transformer_tokens_device(
             f[25] = is_stunned_cell(s, cell) ? 1.0f : 0.0f;
             if (is_top) {
                 f[26] = ap_mask.get(cell) ? 1.0f : 0.0f;
+                f[27] = top_is_queen_threat ? 1.0f : 0.0f;
             }
 
             tq[token_count] = col;
@@ -465,6 +582,8 @@ __device__ inline void extract_hybrid_transformer_tokens_device(
     }
     gf[4] = white_hand / 14.0f;
     gf[5] = black_hand / 14.0f;
+    gf[6 + queen_threat_count[WHITE]] = 1.0f;
+    gf[9 + queen_threat_count[BLACK]] = 1.0f;
 }
 
 __device__ inline void extract_hybrid_transformer_move_features_device(

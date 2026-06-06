@@ -145,6 +145,16 @@ def parse_args() -> argparse.Namespace:
         help="Maximum replay policy target temperature when adaptive temperature is enabled.",
     )
     p.add_argument(
+        "--early-move-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="For the first few plies of self-play, sample from a temperature-flattened softmax over final search scores instead of taking the top move.",
+    )
+    p.add_argument("--early-move-sampling-plies", type=int, default=6)
+    p.add_argument("--early-move-top1-cap", type=float, default=0.4)
+    p.add_argument("--early-move-min-temperature", type=float, default=1.0)
+    p.add_argument("--early-move-max-temperature", type=float, default=9.0)
+    p.add_argument(
         "--final-value-ply-count",
         type=int,
         default=3,
@@ -291,6 +301,11 @@ def main() -> None:
         policy_target_top1_cap=args.policy_target_top1_cap,
         policy_target_min_temperature=args.policy_target_min_temperature,
         policy_target_max_temperature=args.policy_target_max_temperature,
+        early_move_sampling=args.early_move_sampling,
+        early_move_sampling_plies=args.early_move_sampling_plies,
+        early_move_top1_cap=args.early_move_top1_cap,
+        early_move_min_temperature=args.early_move_min_temperature,
+        early_move_max_temperature=args.early_move_max_temperature,
         final_value_ply_count=args.final_value_ply_count,
         final_value_weight=args.final_value_weight,
         merge_opening_value_examples=args.merge_opening_value_examples,
