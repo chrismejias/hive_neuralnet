@@ -27,7 +27,7 @@ All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels fo
 - PyTorch 2.4+ (tested with 2.10.0+cu128)
 - CUDA 12.4+ / driver supporting CUDA 12.8
 
-If you do not have an NVIDIA GPU, the repository also includes a **single-game CPU FNN fallback** for play and analysis. It is much slower than the GPU engine and is not used for self-play training, but it does let you play against the recommended FNN model on CPU-only machines.
+If you do not have an NVIDIA GPU, the repository also includes a **single-game CPU FNN fallback** for play and analysis. It is much slower than the GPU engine and is not used for self-play training, but it does let you play against a compact FNN model on CPU-only machines.
 
 ## Setup
 
@@ -72,14 +72,36 @@ Or if a prebuilt `.pyd`/`.so` is already present in `hive_gpu/`, it loads automa
 
 ## Playing Against The Engine
 
-For the recommended GUI path on a machine without an NVIDIA GPU, use the CPU FNN fallback:
+On a CUDA machine, use the GPU path with the recommended small FNN-transformer checkpoint:
+
+```bash
+cd /workspace/hive_neuralnet
+python3.11 gui.py \
+  --engine legacy \
+  --checkpoint checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2620.pt \
+  --simulations 8192 \
+  --expansion MLP
+```
+
+For the compact FNN baseline on GPU:
+
+```bash
+cd /workspace/hive_neuralnet
+python3.11 gui.py \
+  --engine legacy \
+  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_1080.pt \
+  --simulations 16384 \
+  --expansion MLP
+```
+
+On a machine without an NVIDIA GPU, use the CPU FNN fallback:
 
 ```bash
 cd /workspace/hive_neuralnet
 python3.11 gui.py \
   --engine fnn-cpu \
-  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_0905.pt \
-  --simulations 256 \
+  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_1080.pt \
+  --simulations 1024 \
   --root-workers 2
 ```
 
@@ -88,14 +110,14 @@ There is also a text-mode CPU player:
 ```bash
 cd /workspace/hive_neuralnet
 python3.11 play_fnn_cpu.py \
-  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_0905.pt \
+  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_1080.pt \
   --mode human_vs_ai \
-  --simulations 256 \
+  --simulations 1024 \
   --gumbel-root \
   --root-workers 2
 ```
 
-The old `gui.py --engine legacy` path is still available for the archived GNN / NNUE / transformer checkpoints, but the FNN CPU option is the recommended fallback when CUDA is unavailable.
+The `gui.py --engine legacy` path is the GPU route for FNN-transformer and FNN checkpoints. The CPU FNN option is only the fallback when CUDA is unavailable.
 
 ## Long-Running Background Training
 
@@ -114,7 +136,7 @@ nohup python3.11 -u -m hive_fnn.train_fnn \
   --preset large \
   --iterations 1000 \
   --games 512 \
-  --simulations 4096 \
+  --simulations 16384 \
   --gumbel-considered 16 \
   --checkpoint-dir checkpoints_fnn \
   --checkpoint-keep-every 50 \
@@ -184,7 +206,7 @@ Based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). 
 
 Each round gets an equal fraction of the total simulation budget. For example, with `256` simulations total, each round gets `64` simulations, so each of the first `16` candidates receives `4` simulations in round 1, each of the remaining `8` receives `8` in round 2, and so on.
 
-In the original paper, non-root search is deterministic and tries to preserve the root policy improvement semantics as closely as possible. In this codebase, the active FNN, Hybrid GNN, and PRS paths instead use non-root **PUCT MCTS** because it produced stronger play empirically. The inner-node exploration score is:
+In the original paper, non-root search is deterministic and tries to preserve the root policy improvement semantics as closely as possible. In this codebase, the active FNN, FNN-transformer, and PRS paths instead use non-root **PUCT MCTS** because it produced stronger play empirically. The inner-node exploration score is:
 
 `Q + c_puct * P * sqrt(N_parent) / (1 + N_child)`
 
@@ -207,12 +229,12 @@ Finally, the training policy target is derived from these improved logits rather
 The current project makes four deliberate changes relative to the original paper:
 
 1. **Non-root nodes use PUCT MCTS instead of pure policy-preserving sampling.**
-   The paper's non-root rule is closer to direct policy improvement. In this codebase, the active FNN, Hybrid GNN, and PRS search paths use non-root PUCT MCTS because it was empirically stronger than pure policy sampling.
+   The paper's non-root rule is closer to direct policy improvement. In this codebase, the active FNN, FNN-transformer, and PRS search paths use non-root PUCT MCTS because it was empirically stronger than pure policy sampling.
 
-2. **The active PRS and FNN trainers use a visited-only Gumbel policy target.**
-   For PRS and FNN self-play, legal moves outside the searched Gumbel candidate set receive zero target mass instead of keeping their raw prior. This outperformed the prior-preserving variant empirically.
+2. **The active PRS and FNN-family trainers use a visited-only Gumbel policy target.**
+   For PRS, FNN, and FNN-transformer self-play, legal moves outside the searched Gumbel candidate set receive zero target mass instead of keeping their raw prior. This outperformed the prior-preserving variant empirically.
 
-So the active PRS/FNN target is:
+So the active PRS/FNN-family target is:
 
 - **Visited/searched moves**
   ```
@@ -225,12 +247,12 @@ So the active PRS/FNN target is:
 3. **Non-root nodes are explored in an escalating wave-parallel fashion.**
    The paper's serial schedule shrinks the amount of parallel work as halving proceeds. On GPU, that leaves batch efficiency on the table. In this project, each later round increases the number of parallel sims per surviving root move so the total batch stays roughly constant. For example, PRS uses `1,2,4,8` waves per round and FNN uses `2,4,8,16`.
 
-4. **FNN and Hybrid GNN root search reserve tactical queen-surround slots.**
-   The current FNN and Hybrid GNN training/self-play defaults reserve up to `6` root candidate slots for legal moves that increase opponent queen surround and leave that queen with no legal escape, including pillbug or mosquito throws. Those reserved moves are still ranked by policy within the tactical subset, and the remaining root slots are filled by the normal Gumbel-policy candidate selection.
+4. **FNN and FNN-transformer root search reserve tactical queen-surround slots.**
+   The current FNN and FNN-transformer training/self-play defaults reserve up to `6` root candidate slots for legal moves that increase opponent queen surround and leave that queen with no legal escape, including pillbug or mosquito throws. Those reserved moves are still ranked by policy within the tactical subset, and the remaining root slots are filled by the normal Gumbel-policy candidate selection.
    
 ## FNN (HiveGo-style Feedforward Network)
 
-This is the **recommended engine** for current use. It is inspired by HiveGo's AlphaZeroFNN. The key idea is to encode root + successor states independently, then score each action as `f(root_emb ‖ successor_emb)`. The network never sees the raw board directly; instead it operates on a compact engineered feature set. That keeps the network tiny, the search fast, and the training signal much more sample-efficient than PRS.
+This is the compact baseline engine. It is inspired by HiveGo's AlphaZeroFNN. The key idea is to encode root + successor states independently, then score each action as `f(root_emb ‖ successor_emb)`. The network never sees the raw board directly; instead it operates on a compact engineered feature set. That keeps the network tiny, the search fast, and the training signal much more sample-efficient than PRS.
 
 ### Architecture
 
@@ -302,16 +324,16 @@ python -m hive_fnn.train_fnn \
 # Full training run (large model)
 python -m hive_fnn.train_fnn \
   --preset large \
-  --games 128 --simulations 1024 --gumbel-considered 16 \
+  --games 512 --simulations 16384 --gumbel-considered 16 \
   --iterations 1500 \
   --checkpoint-dir checkpoints_fnn
 
 # Large model with default Gumbel-root + non-root PUCT MCTS
 python -m hive_fnn.train_fnn \
   --preset large \
-  --games 512 --simulations 2048 --gumbel-considered 16 \
+  --games 512 --simulations 16384 --gumbel-considered 16 \
   --gumbel-wave-parallel \
-  --buffer-size 200000 \
+  --buffer-size 100000 \
   --iterations 1000 \
   --checkpoint-dir checkpoints_fnn
 
@@ -368,10 +390,10 @@ The latest promoted champion is also written to `champion_latest.pt` in the chec
 | `--action-hidden` | 64 | Action tower hidden dimension |
 | `--iterations` | 1500 | Training iterations |
 | `--games` | 128 | Parallel self-play games per iteration |
-| `--simulations` | 128 | Gumbel simulation budget per move |
+| `--simulations` | 128 | Gumbel simulation budget per move; current FNN play/eval default is `16384` |
 | `--gumbel-considered` | 16 | Root actions considered (k) |
 | `--gumbel-wave-parallel` / `--no-gumbel-wave-parallel` | on | Enable/disable FNN Gumbel per-round MCTS wave schedule (`2,4,8,16`) |
-| `--buffer-size` | 100000 | Replay buffer capacity (200000 recommended for better generalization) |
+| `--buffer-size` | 100000 | Replay buffer capacity |
 | `--puct-wave-size` | 16 | Parallel MCTS simulations per wave for plain PUCT |
 | `--puct` | off | Use plain PUCT MCTS root policy instead of Gumbel root halving |
 | `--checkpoint-dir` | checkpoints\_fnn | Checkpoint output directory |
@@ -475,6 +497,9 @@ python3.11 -m hive_fnn_transformer.train_fnn_transformer \
 
 Other important current defaults:
 
+- recommended play/evaluation simulation budget:
+  - FNN-transformer: `8192`
+  - FNN: `16384`
 - adaptive replay-target temperature:
   - `top1_cap=0.7`
   - temperature range `1..7`
@@ -518,11 +543,11 @@ In practice this meant the transformer hybrids trained faster and reached strong
 
 ## PRS Transformer (Piece-Relative Space, current default trunk: v3)
 
-PRS is the experimental line in this repository. Its goal is to learn a richer
+PRS is an archived research line in this repository. Its goal was to learn a richer
 board representation than the FNN, but in practice that means much slower
 self-play and training, and much slower strength gain. The PRS policy/value
 stack has to discover legality, geometry, and tactical structure from the board
-tokens themselves, while FNN already starts from handcrafted features that encode a lot of that structure cheaply. Based on current trends, this model will likely require months worth of RTX 4090 equievlent compute to equal the FNN. It remains to be seen whether it would eventually surpass the FNN.
+tokens themselves, while FNN-family models already start from handcrafted features that encode a lot of that structure cheaply.
 
 The active PRS policy head is still the structured **813-slot legal-masked**
 head introduced in v2. **PRS v3** keeps that same tokenization, value head,
@@ -684,7 +709,7 @@ Measure how sharp the current visited-only replay target is after search:
 
 ```bash
 python fnn_mass_diagnostic.py \
-    --checkpoint checkpoints_FNN/hive_fnn_checkpoint_0905.pt \
+    --checkpoint checkpoints_FNN/hive_fnn_checkpoint_1080.pt \
     --positions 40 --sims 1024
 ```
 
@@ -696,7 +721,10 @@ Play against the trained AI using pygame (local only):
 
 ```bash
 # vs AI
-python gui.py --checkpoint checkpoints_FNN/hive_fnn_checkpoint_0905.pt
+python gui.py \
+  --engine legacy \
+  --checkpoint checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2620.pt \
+  --simulations 8192
 
 # AI self-play
 python gui.py --self-play
@@ -722,7 +750,7 @@ hive_common/       # Shared token batch types used by PRS + archived legacy mode
 hive_gpu/          # CUDA extension, GPU-native MCTS/Gumbel, shared kernels
   csrc/            # CUDA C++ source
     game_logic.cu      # Move gen, state apply, feature extraction, tree/search kernels
-    fnn_features.cuh   # 122-dim FNN feature extraction kernel
+    fnn_features.cuh   # 124-dim FNN feature extraction kernel
     fnn_selfplay.cuh   # Experimental fused FNN self-play kernel (not the active trainer path)
     state_encoder.cuh  # Transformer state encoding
     mcts_tree.cuh      # GPU-native MCTS tree
@@ -738,7 +766,7 @@ hive_fnn/          # HiveGo-style FNN with multiple search paths
   fnn_puct_orchestrator.py  # Plain PUCT MCTS tree search
   fnn_trainer.py       # FNNTrainer training loop
   train_fnn.py         # CLI entry point
-hive_fnn_transformer/  # Experimental FNN policy + relative-transformer value model
+hive_fnn_transformer/  # Recommended small FNN policy + relative-transformer model
   fnn_transformer_net.py          # FNN + relative piece-transformer trunk
   fnn_transformer_trainer.py      # Training loop
   fnn_transformer_mcts_orchestrator.py  # Search orchestration
