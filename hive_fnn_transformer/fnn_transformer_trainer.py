@@ -166,6 +166,19 @@ class HybridTrainer:
             weight_decay=self.config.weight_decay,
         )
 
+    def _optimizer_state_matches_parameters(self) -> bool:
+        for group in self.optimizer.param_groups:
+            for param in group["params"]:
+                state = self.optimizer.state.get(param)
+                if not state:
+                    continue
+                for value in state.values():
+                    if not torch.is_tensor(value) or value.ndim == 0:
+                        continue
+                    if value.shape != param.shape:
+                        return False
+        return True
+
     def _clear_gradient_hooks(self) -> None:
         for handle in self._gradient_hooks:
             handle.remove()
@@ -821,6 +834,8 @@ class HybridTrainer:
         elif opt_state is not None:
             try:
                 self.optimizer.load_state_dict(opt_state)
+                if not self._optimizer_state_matches_parameters():
+                    self._rebuild_optimizer()
             except ValueError:
                 self._rebuild_optimizer()
         scaler_state = ckpt.get("scaler_state_dict")
