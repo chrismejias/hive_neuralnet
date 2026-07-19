@@ -124,6 +124,19 @@ fnn_selfplay_batch(
     float c_visit, float c_scale,
     int temperature_drop_move, int expansion_mask,
     int64_t rng_seed);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+fnn_alphabeta_batch(
+    torch::Tensor states, torch::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    torch::Tensor search_config, int node_budget, int max_depth);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor>
+fnn_alphabeta_teacher_batch(
+    torch::Tensor states, torch::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    torch::Tensor search_config, int node_budget, int max_depth,
+    int root_exact_count);
 
 // GPU-native MCTS
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
@@ -373,6 +386,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("max_considered"), py::arg("c_visit"), py::arg("c_scale"),
           py::arg("temperature_drop_move"), py::arg("expansion_mask"),
           py::arg("rng_seed"));
+    m.def("fnn_alphabeta_batch", &hive_gpu::fnn_alphabeta_batch,
+          "GPU-native iterative-deepening FNN alpha-beta baseline",
+          py::arg("states"), py::arg("weights"), py::arg("hidden_dim"),
+          py::arg("embed_dim"), py::arg("action_hidden"),
+          py::arg("search_config"), py::arg("node_budget"),
+          py::arg("max_depth"));
+    m.def("fnn_alphabeta_teacher_batch",
+          &hive_gpu::fnn_alphabeta_teacher_batch,
+          "Alpha-beta search plus deepest-completed root records and PV",
+          py::arg("states"), py::arg("weights"), py::arg("hidden_dim"),
+          py::arg("embed_dim"), py::arg("action_hidden"),
+          py::arg("search_config"), py::arg("node_budget"),
+          py::arg("max_depth"),
+          py::arg("root_exact_count") = 1);
 
     // ── GPU-native MCTS ────────────────────────────────────────────
     m.def("mcts_select_batch", &hive_gpu::mcts_select_batch,

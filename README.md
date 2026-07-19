@@ -347,6 +347,40 @@ python -m hive_fnn.train_fnn \
 
 The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 
+### Alpha-Beta Training And Search Tuning
+
+The separate alpha-beta trainer learns a move-ordering policy and calibrated
+value from completed iterative-deepening searches. Move-cap games are omitted
+from replay, and the default replay capacity is 75,000 records.
+
+```bash
+# Tune search with paired openings and color swaps.
+python tune_fnn_alphabeta.py \
+  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
+  --iterations 100 --pairs 32 --nodes 2000 \
+  --output-dir alphabeta_spsa
+
+# Resume tuning exactly.
+python tune_fnn_alphabeta.py \
+  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
+  --resume alphabeta_spsa/spsa_state_latest.json \
+  --iterations 200 --pairs 32 --nodes 2000 \
+  --output-dir alphabeta_spsa
+
+# Train self-play with the current tuned search configuration.
+python -m hive_fnn.train_fnn_alphabeta \
+  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
+  --search-config alphabeta_spsa/spsa_state_latest.json \
+  --games 256 --game-nodes 1000 --teacher-nodes 6000
+```
+
+SPSA jointly tunes aspiration width, LMR thresholds, quiescence depth and
+budget share, tactical extensions, policy/tactical move ordering, branching
+node allocation, and mate early stopping. Arena fitness can penalize additional
+nodes per move with `--node-cost-penalty`. Full trainer continuation uses
+`--resume checkpoints_fnn_alphabeta/alpha_beta_training_state_latest.pt`;
+the tuned search configuration is preserved automatically.
+
 ### EMA Champion/Challenger Training
 
 Both `train_fnn` and `train_fnn_transformer` now support an EMA-based promotion loop:

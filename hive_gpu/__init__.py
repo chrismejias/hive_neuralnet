@@ -40,6 +40,18 @@ if os.name == "nt":
         os.add_dll_directory(_cuda_bin)
 
 _extension = None
+_JIT_EXTENSION_NAME = "hive_gpu_ext_jit_131"
+_EXPECTED_FNN_FEATURE_DIM = 124
+
+
+def _extension_is_compatible(ext) -> bool:
+    """Reject stale binaries whose FNN or alpha-beta ABI predates this source."""
+    teacher = getattr(ext, "fnn_alphabeta_teacher_batch", None)
+    return (
+        int(getattr(ext, "FNN_FEAT_DIM", -1)) == _EXPECTED_FNN_FEATURE_DIM
+        and teacher is not None
+        and "search_config" in (getattr(teacher, "__doc__", "") or "")
+    )
 
 
 def load_extension():
@@ -59,12 +71,23 @@ def load_extension():
 
     try:
         import hive_gpu_ext as _ext
-        _extension = _ext
+        if _extension_is_compatible(_ext):
+            _extension = _ext
+        else:
+            warnings.warn(
+                "Ignoring an incompatible pre-built hive_gpu extension; "
+                "rebuilding the current alpha-beta ABI with JIT.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     except ImportError:
-        # Fall back to JIT compilation
+        pass
+
+    if _extension is None:
+        # Fall back to JIT compilation.
         csrc_dir = os.path.join(pkg_dir, "csrc")
         _extension = load(
-            name="hive_gpu_ext",
+            name=_JIT_EXTENSION_NAME,
             sources=[
                 os.path.join(csrc_dir, "game_logic.cu"),
                 os.path.join(csrc_dir, "bindings.cpp"),
