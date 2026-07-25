@@ -129,6 +129,11 @@ fnn_alphabeta_batch(
     torch::Tensor states, torch::Tensor weights,
     int hidden_dim, int embed_dim, int action_hidden,
     torch::Tensor search_config, int node_budget, int max_depth);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+fnn_alphabeta_resumable_batch(
+    torch::Tensor states, torch::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    torch::Tensor search_config, int node_budget, int max_depth);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            torch::Tensor, torch::Tensor, torch::Tensor>
@@ -387,7 +392,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("temperature_drop_move"), py::arg("expansion_mask"),
           py::arg("rng_seed"));
     m.def("fnn_alphabeta_batch", &hive_gpu::fnn_alphabeta_batch,
-          "GPU-native iterative-deepening FNN alpha-beta baseline",
+          "GPU-native packed recursive iterative-deepening FNN alpha-beta",
+          py::arg("states"), py::arg("weights"), py::arg("hidden_dim"),
+          py::arg("embed_dim"), py::arg("action_hidden"),
+          py::arg("search_config"), py::arg("node_budget"),
+          py::arg("max_depth"));
+    m.def("fnn_alphabeta_resumable_batch",
+          &hive_gpu::fnn_alphabeta_resumable_batch,
+          "Experimental exact resumable-stack FNN alpha-beta path",
           py::arg("states"), py::arg("weights"), py::arg("hidden_dim"),
           py::arg("embed_dim"), py::arg("action_hidden"),
           py::arg("search_config"), py::arg("node_budget"),
@@ -500,4 +512,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("DEFAULT_MAX_TREE_NODES") = hive_gpu::DEFAULT_MAX_TREE_NODES;
     m.attr("MAX_TREE_DEPTH") = hive_gpu::MAX_TREE_DEPTH;
     m.attr("FNN_FEAT_DIM") = hive_gpu::FNN_FEAT_DIM;
+    m.attr("FNN_ACTION_SURROUND_DIM") = 24;
+    m.attr("FNN_FEATURE_IMPL_VERSION") = 9;
 }

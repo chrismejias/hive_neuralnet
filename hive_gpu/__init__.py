@@ -40,8 +40,10 @@ if os.name == "nt":
         os.add_dll_directory(_cuda_bin)
 
 _extension = None
-_JIT_EXTENSION_NAME = "hive_gpu_ext_jit_131"
-_EXPECTED_FNN_FEATURE_DIM = 124
+_JIT_EXTENSION_NAME = "hive_gpu_ext_jit_135"
+_EXPECTED_FNN_FEATURE_DIM = 140
+_EXPECTED_FNN_ACTION_SURROUND_DIM = 24
+_EXPECTED_FNN_FEATURE_IMPL_VERSION = 9
 
 
 def _extension_is_compatible(ext) -> bool:
@@ -49,6 +51,10 @@ def _extension_is_compatible(ext) -> bool:
     teacher = getattr(ext, "fnn_alphabeta_teacher_batch", None)
     return (
         int(getattr(ext, "FNN_FEAT_DIM", -1)) == _EXPECTED_FNN_FEATURE_DIM
+        and int(getattr(ext, "FNN_ACTION_SURROUND_DIM", -1))
+        == _EXPECTED_FNN_ACTION_SURROUND_DIM
+        and int(getattr(ext, "FNN_FEATURE_IMPL_VERSION", -1))
+        == _EXPECTED_FNN_FEATURE_IMPL_VERSION
         and teacher is not None
         and "search_config" in (getattr(teacher, "__doc__", "") or "")
     )

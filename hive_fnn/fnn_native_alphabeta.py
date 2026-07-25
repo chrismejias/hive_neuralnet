@@ -26,8 +26,8 @@ class AlphaBetaSearchConfig:
     lmr_min_depth: int = 4
     lmr_min_move: int = 4
     lmr_reduction: int = 1
-    quiescence_plies: int = 2
-    quiescence_budget_fraction: float = 0.5
+    quiescence_plies: int = 1
+    quiescence_budget_fraction: float = 0.2
     force_win_probes: bool = True
     tactical_immobilization: bool = True
     tactical_opponent_surround: bool = True
@@ -105,7 +105,9 @@ def search_batch(
     """Return moves, values, and search counters.
 
     Counters are [depth, nodes, cutoffs, tt_hits, pvs_researches,
-    lmr_reductions, qnodes, forced_win_probes, tactical_moves].
+    lmr_reductions, q_probes, forced_win_probes, tactical_moves]. Quiescence
+    charges every candidate it applies, including candidates later rejected
+    as quiet, so its configured budget bounds actual tactical work.
     """
 
     if states.device.type != "cuda" or states.dtype != torch.uint8:
@@ -116,6 +118,29 @@ def search_batch(
     ext = hive_gpu.load_extension()
     native_config = (search_config or AlphaBetaSearchConfig()).packed(states.device)
     return ext.fnn_alphabeta_batch(
+        states.contiguous(), pack_fnn_weights(net), cfg.hidden_dim, cfg.embed_dim,
+        cfg.action_hidden, native_config, int(node_budget), int(max_depth),
+    )
+
+
+def search_batch_resumable(
+    net: HiveFNN,
+    states: torch.Tensor,
+    *,
+    node_budget: int,
+    max_depth: int = 32,
+    search_config: AlphaBetaSearchConfig | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the exact experimental cross-game resumable traversal."""
+
+    if states.device.type != "cuda" or states.dtype != torch.uint8:
+        raise ValueError("states must be CUDA uint8 packed HiveState rows")
+    cfg = net.config
+    if max(cfg.hidden_dim, cfg.embed_dim, cfg.action_hidden) > 64:
+        raise ValueError("native alpha-beta supports FNN dimensions up to 64")
+    ext = hive_gpu.load_extension()
+    native_config = (search_config or AlphaBetaSearchConfig()).packed(states.device)
+    return ext.fnn_alphabeta_resumable_batch(
         states.contiguous(), pack_fnn_weights(net), cfg.hidden_dim, cfg.embed_dim,
         cfg.action_hidden, native_config, int(node_budget), int(max_depth),
     )

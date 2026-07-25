@@ -18,20 +18,13 @@ import torch
 
 import hive_gpu
 from hive_gpu.gumbel_mcts import GumbelAlphaZeroOrchestrator, GumbelConfig
-from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig, HiveTransformer
 
 
 def load_net(path: str, device: torch.device):
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    net_config = ckpt["net_config"]
-    net = HiveTransformer(net_config)
-    net.load_state_dict(ckpt["model_state_dict"])
-    net = net.to(device)
-    net.eval()
-    iteration = ckpt.get("iteration", "?")
-    arch = f"Transformer(d={net_config.d_model}, layers={net_config.num_layers})"
-    params = sum(p.numel() for p in net.parameters())
-    return net, iteration, arch, params
+    raise RuntimeError(
+        "gumbel_match.py relied on the retired legacy transformer model, "
+        "which has been removed from this repository."
+    )
 
 
 def _apply_sub_batch(

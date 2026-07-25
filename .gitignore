@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.torch_extensions/
 *.egg
 
 # Virtual environments
@@ -28,8 +29,16 @@ ENV/
 
 # Pytest
 .pytest_cache/
+pytest-cache-files-*/
 .coverage
 htmlcov/
+
+# Local agent and benchmark scratch
+.codex_worktrees/
+.codex_research/
+benchtmp/
+.alpha_beta_arena*.txt
+.gpu*arena*.txt
 
 # Training artifacts
 checkpoints/

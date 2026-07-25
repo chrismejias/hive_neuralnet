@@ -5,7 +5,7 @@ analyzing individual Hive games with the FNN model. It does not touch the
 GPU-native self-play training pipeline.
 
 Design:
-  - Recreates the 122-dim FNN feature vector from the Python ``GameState``.
+  - Recreates the 140-dim FNN feature vector from the Python ``GameState``.
   - Expands one game tree at a time using CPU PUCT.
   - Batches successor-state scoring through the existing FNN network.
 
@@ -155,7 +155,7 @@ def extract_fnn_features_cpu(
     game: GameState,
     legal_moves: list[Move] | None = None,
 ) -> np.ndarray:
-    """Recreate the 122-dim FNN feature vector on CPU."""
+    """Recreate the 140-dim FNN feature vector on CPU."""
     if legal_moves is None:
         legal_moves = game.legal_moves()
 
@@ -204,15 +204,23 @@ def extract_fnn_features_cpu(
                 if below.piece_type == PieceType.QUEEN:
                     features[98 + int(below.color)] = 1.0
 
-        is_capable = top.piece_type == PieceType.PILLBUG
+        is_capable = (
+            top.piece_type == PieceType.PILLBUG
+            and pos != game._pillbug_stunned_pos
+        )
         if (
             not is_capable
             and top.piece_type == PieceType.MOSQUITO
             and len(stack) == 1
+            and pos != game._pillbug_stunned_pos
         ):
             for n in pos.neighbors():
                 n_top = board.top_piece_at(n)
-                if n_top is not None and n_top.piece_type == PieceType.PILLBUG:
+                if (
+                    n_top is not None
+                    and n_top.piece_type == PieceType.PILLBUG
+                    and n != game._pillbug_stunned_pos
+                ):
                     is_capable = True
                     break
         if is_capable:
@@ -276,6 +284,120 @@ def extract_fnn_features_cpu(
         surround = queen_surround_count[color]
         if 1 <= surround <= 6:
             features[110 + int(color) * 6 + (surround - 1)] = 1.0
+
+    sufficient_sources: dict[Color, set[Piece]] = {
+        Color.WHITE: set(),
+        Color.BLACK: set(),
+    }
+    ring_access_sources: dict[Color, set[Piece]] = {
+        Color.WHITE: set(),
+        Color.BLACK: set(),
+    }
+    candidate_moves: dict[Color, list[Move]] = {
+        Color.WHITE: [],
+        Color.BLACK: [],
+    }
+
+    # Generate each visible piece's normal destinations once. This mirrors the
+    # CUDA extractor and deliberately excludes pillbug throws until the actor
+    # loop below, allowing sufficient material to deduplicate the two cases.
+    for color in (Color.WHITE, Color.BLACK):
+        if game.result != GameResult.IN_PROGRESS or not game._queen_placed[color]:
+            continue
+        enemy_queen = queen_pos[color.other()]
+        enemy_ring = (
+            set(enemy_queen.neighbors()) if enemy_queen is not None else set()
+        )
+        for piece in board.pieces_of_color(color):
+            pos = board.position_of(piece)
+            if (
+                pos is None
+                or pos == game._pillbug_stunned_pos
+                or not board.is_on_top(piece)
+                or (pos in ap and board.stack_height(pos) == 1)
+            ):
+                continue
+            if piece.piece_type == PieceType.ANT:
+                destinations = game._move_gen_cache.get_ant_moves(board, pos)
+            elif piece.piece_type == PieceType.SPIDER:
+                destinations = game._move_gen_cache.get_spider_moves(board, pos)
+            else:
+                destinations = board.generate_piece_moves(piece)
+
+            free_attacker = (
+                enemy_queen is not None
+                and pos not in enemy_ring
+            )
+            if destinations and free_attacker:
+                sufficient_sources[color].add(piece)
+            for destination in destinations:
+                candidate_moves[color].append(
+                    Move(MoveType.MOVE, piece, destination, from_pos=pos)
+                )
+                if (
+                    free_attacker
+                    and destination not in board.grid
+                    and destination in enemy_ring
+                ):
+                    ring_access_sources[color].add(piece)
+
+        for actor in pillbug_capable_cells[color]:
+            throws = board.generate_pillbug_throws(
+                actor,
+                ap,
+                stunned_pos=game._pillbug_stunned_pos,
+            )
+            actor_near_enemy_queen = (
+                enemy_queen is not None
+                and 1 <= actor.distance(enemy_queen) <= 2
+            )
+            for target, destination in throws:
+                source = board.position_of(target)
+                if source is None:
+                    continue
+                candidate_moves[color].append(
+                    Move(MoveType.MOVE, target, destination, from_pos=source)
+                )
+                free_owned_target = (
+                    target.color == color
+                    and enemy_queen is not None
+                    and source not in enemy_ring
+                )
+                if free_owned_target and actor_near_enemy_queen:
+                    sufficient_sources[color].add(target)
+                if (
+                    free_owned_target
+                    and destination in enemy_ring
+                ):
+                    ring_access_sources[color].add(target)
+
+    for color in (Color.WHITE, Color.BLACK):
+        enemy = color.other()
+        if queen_pos[enemy] is not None:
+            vacancies = 6 - queen_surround_count[enemy]
+            material = len(sufficient_sources[color])
+            bucket = 0 if material < vacancies else (1 if material == vacancies else 2)
+            features[122 + int(color) * 3 + bucket] = 1.0
+
+        if queen_pos[color] is not None:
+            baseline = queen_surround_count[color]
+            max_relief = 0
+            for move in candidate_moves[color]:
+                child = game.copy()
+                child.turn = (child.turn & ~1) | int(color)
+                child._legal_moves_cache = None
+                child.apply_move(move)
+                max_relief = max(
+                    max_relief,
+                    baseline - child.queen_surrounded_count(color),
+                )
+            bucket = 0 if max_relief <= 0 else (1 if max_relief == 1 else 2)
+            features[128 + int(color) * 3 + bucket] = 1.0
+
+        if queen_pos[enemy] is not None:
+            access = len(ring_access_sources[color])
+            bucket = 0 if access == 0 else (1 if access == 1 else 2)
+            features[134 + int(color) * 3 + bucket] = 1.0
 
     return features
 

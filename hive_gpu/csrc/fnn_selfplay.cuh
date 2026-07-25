@@ -65,11 +65,11 @@ struct SelfPlayRNG {
 
 struct FNNWeights {
     int H, E, AH;           // hidden, embed, action_hidden dims
-    int fc1_w, fc1_b;       // Linear(88, H)
+    int fc1_w, fc1_b;       // Linear(FNN_FEAT_DIM, H)
     int ln1_w, ln1_b;       // LayerNorm(H)
     int fc2_w, fc2_b;       // Linear(H, E)
     int val_w, val_b;       // Linear(E, 1)
-    int act1_w, act1_b;     // Linear(2E, AH)
+    int act1_w, act1_b;     // Linear(2E + 24, AH)
     int act2_w, act2_b;     // Linear(AH, 1)
 };
 
@@ -85,7 +85,7 @@ __device__ FNNWeights make_fnn_weights(int H, int E, int AH) {
     w.fc2_b = o; o += E;
     w.val_w = o; o += E;
     w.val_b = o; o += 1;
-    w.act1_w = o; o += 2 * E * AH;
+    w.act1_w = o; o += (2 * E + 24) * AH;
     w.act1_b = o; o += AH;
     w.act2_w = o; o += AH;
     w.act2_b = o; o += 1;
@@ -158,16 +158,40 @@ __device__ inline float fnn_value(
 __device__ inline float fnn_score_action(
     const float* root_embed,
     const float* succ_embed,
+    const float* root_features,
+    const float* succ_features,
     const float* __restrict__ params,
     const FNNWeights& w
 ) {
-    float combined[FNN_MAX_EMBED * 2];
+    float combined[FNN_MAX_EMBED * 2 + 24];
     for (int i = 0; i < w.E; i++) combined[i] = root_embed[i];
     for (int i = 0; i < w.E; i++) combined[w.E + i] = succ_embed[i];
 
+    // Match HiveFNN._action_surround_features: orient both states from the
+    // root player's perspective, then append own/opponent surround buckets.
+    float white_activity = root_features[100];
+    float black_activity = root_features[101];
+    for (int i = 64; i < 72; i++) white_activity += root_features[i];
+    for (int i = 72; i < 80; i++) black_activity += root_features[i];
+    bool root_is_white = white_activity >= black_activity;
+    if (white_activity == black_activity) {
+        float succ_white = succ_features[100];
+        float succ_black = succ_features[101];
+        for (int i = 64; i < 72; i++) succ_white += succ_features[i];
+        for (int i = 72; i < 80; i++) succ_black += succ_features[i];
+        root_is_white = !(succ_white >= succ_black);
+    }
+    const int own_base = root_is_white ? 110 : 116;
+    const int opp_base = root_is_white ? 116 : 110;
+    int off = 2 * w.E;
+    for (int i = 0; i < 6; i++) combined[off + i] = root_features[own_base + i];
+    for (int i = 0; i < 6; i++) combined[off + 6 + i] = root_features[opp_base + i];
+    for (int i = 0; i < 6; i++) combined[off + 12 + i] = succ_features[own_base + i];
+    for (int i = 0; i < 6; i++) combined[off + 18 + i] = succ_features[opp_base + i];
+
     float ah[FNN_MAX_ACTION_HIDDEN];
     fnn_linear(params + w.act1_w, params + w.act1_b,
-               combined, ah, 2 * w.E, w.AH);
+               combined, ah, 2 * w.E + 24, w.AH);
     for (int i = 0; i < w.AH; i++)
         ah[i] = 1.0f / (1.0f + expf(-ah[i]));
 
@@ -181,6 +205,7 @@ __device__ inline float fnn_score_action(
 
 struct SelfPlayShared {
     HiveState state;
+    MovegenStateCache root_cache;
     GPUMove legal_moves[MAX_LEGAL_MOVES];
     float root_features[FNN_FEAT_DIM];
     float root_embed[FNN_MAX_EMBED];
@@ -238,7 +263,8 @@ __global__ void fnn_selfplay_kernel(
 
         // ── Step 1: Thread 0 generates legal moves ──
         if (tid == 0) {
-            sh.num_legal = generate_legal_moves(sh.state, sh.legal_moves);
+            sh.num_legal = generate_legal_moves_with_cache(
+                sh.state, sh.legal_moves, sh.root_cache);
             if (sh.num_legal == 0) {
                 sh.game_done = 1;
             }
@@ -250,8 +276,9 @@ __global__ void fnn_selfplay_kernel(
 
         // ── Step 2: Thread 0 extracts root features + encodes ──
         if (tid == 0) {
-            extract_fnn_features_device(
-                sh.state, sh.legal_moves, nl, sh.root_features);
+            extract_fnn_features_with_ap_device(
+                sh.state, sh.legal_moves, nl, sh.root_cache.ap_mask,
+                sh.root_features);
             fnn_encode(sh.root_features, sh.root_embed, params, wt);
         }
         __syncthreads();
@@ -262,20 +289,24 @@ __global__ void fnn_selfplay_kernel(
             HiveState temp = sh.state;
             apply_move(temp, sh.legal_moves[i]);
 
-            // Generate successor's legal moves (needed for feature extraction)
+            // Generate only the move summary needed by the FNN features.
             GPUMove temp_legal[MAX_LEGAL_MOVES];
-            int temp_nl = generate_legal_moves(temp, temp_legal);
+            MovegenStateCache temp_cache;
+            int temp_nl = generate_fnn_feature_moves_with_cache(
+                temp, temp_legal, temp_cache);
 
             // Extract features
             float feat[FNN_FEAT_DIM];
-            extract_fnn_features_device(temp, temp_legal, temp_nl, feat);
+            extract_fnn_features_with_ap_device(
+                temp, temp_legal, temp_nl, temp_cache.ap_mask, feat);
 
             // Encode successor
             float emb[FNN_MAX_EMBED];
             fnn_encode(feat, emb, params, wt);
 
             // Score action + get successor value
-            sh.action_logits[i] = fnn_score_action(sh.root_embed, emb, params, wt);
+            sh.action_logits[i] = fnn_score_action(
+                sh.root_embed, emb, sh.root_features, feat, params, wt);
             sh.succ_values[i] = fnn_value(emb, params, wt);
         }
         __syncthreads();

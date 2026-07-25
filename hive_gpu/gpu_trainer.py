@@ -6,9 +6,9 @@ train → arena → promote pipeline as hive_engine/trainer.py.
 
 Usage:
     from hive_gpu.gpu_trainer import GPUTrainer, GPUTrainConfig
-    from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig, HiveTransformer
+    # Legacy transformer support has been retired.
 
-    trainer = GPUTrainer(GPUTrainConfig(), TransformerConfig.small(), HiveTransformer)
+    trainer = GPUTrainer(...)
     trainer.run()
 """
 
@@ -746,8 +746,10 @@ class GPUTrainer:
         self.best_net.eval()
 
         if self.config.encoder_type == "transformer":
-            from archive.legacy_transformer.hive_transformer.transformer_encoder import TransformerEncoder
-            encoder = TransformerEncoder()
+            raise RuntimeError(
+                "The legacy transformer arena has been retired; "
+                "use hive_fnn_transformer instead"
+            )
         else:
             encoder = GNNEncoder()
         mcts_config = MCTSConfig(

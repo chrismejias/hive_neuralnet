@@ -78,7 +78,7 @@ On a CUDA machine, use the GPU path with the recommended small FNN-transformer c
 cd /workspace/hive_neuralnet
 python3.11 gui.py \
   --engine legacy \
-  --checkpoint checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2620.pt \
+  --checkpoint checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2440.pt \
   --simulations 8192 \
   --expansion MLP
 ```
@@ -89,7 +89,7 @@ For the compact FNN baseline on GPU:
 cd /workspace/hive_neuralnet
 python3.11 gui.py \
   --engine legacy \
-  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_1080.pt \
+  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
   --simulations 16384 \
   --expansion MLP
 ```
@@ -100,7 +100,7 @@ On a machine without an NVIDIA GPU, use the CPU FNN fallback:
 cd /workspace/hive_neuralnet
 python3.11 gui.py \
   --engine fnn-cpu \
-  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_1080.pt \
+  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
   --simulations 1024 \
   --root-workers 2
 ```
@@ -110,7 +110,7 @@ There is also a text-mode CPU player:
 ```bash
 cd /workspace/hive_neuralnet
 python3.11 play_fnn_cpu.py \
-  --checkpoint checkpoints_FNN/hive_fnn_checkpoint_1080.pt \
+  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
   --mode human_vs_ai \
   --simulations 1024 \
   --gumbel-root \
@@ -256,7 +256,7 @@ This is the compact baseline engine. It is inspired by HiveGo's AlphaZeroFNN. Th
 
 ### Architecture
 
-- **Board encoder**: 124-dim features → hidden → embedding (Linear + sigmoid + LayerNorm)
+- **Board encoder**: 140-dim features → hidden → embedding (Linear + sigmoid + LayerNorm)
 - **Value head**: embedding → Linear → tanh
 - **Action scoring**: concat [root\_emb, successor\_emb] → tower → logit
 - **Small** (~1.0K params): hidden=8, embed=8, action\_hidden=8
@@ -264,7 +264,7 @@ This is the compact baseline engine. It is inspired by HiveGo's AlphaZeroFNN. Th
 - **Large** (~22K params, current default): hidden=64, embed=64, action\_hidden=64
 - **Current search default**: Gumbel-root MCTS with non-root PUCT, visited-only policy targets, wave-parallel halving, and the queen-surround reserve described above
 
-### 124-dim Feature Vector (per state, extracted by CUDA kernel)
+### 140-dim Feature Vector (per state, extracted by CUDA kernel)
 
 For each of 8 piece types × 2 players (16 entries):
 - `count_on_board`
@@ -290,9 +290,22 @@ Queen surround features:
 - white queen surround one-hot buckets `1..6`
 - black queen surround one-hot buckets `1..6`
 
-Additional structural features:
-- white own-queen-throwable-by-own-pillbug bit
-- black own-queen-throwable-by-own-pillbug bit
+Tactical material features, represented as three-way one-hot buckets per color:
+- sufficient free material to fill the opposing queen's remaining ring:
+  insufficient / exact / surplus
+- maximum immediate reduction of the player's own queen surround:
+  none / exactly one / at least two
+- distinct free pieces with immediate access to an empty opposing queen-ring cell:
+  zero / one / multiple
+
+Free material counts distinct on-board pieces that are not already on the
+opposing queen's ring and can move normally. It also includes pieces that can
+be legally thrown by a friendly pillbug-capable actor within two cells of the
+opposing queen, without double-counting pieces that satisfy both conditions.
+Queen-ring access uses the same exclusion: it asks whether a free piece that
+is not already surrounding the opposing queen can immediately enter one of
+that queen's currently empty surrounding cells. A piece is counted once even
+if it can enter multiple cells or qualify through both movement and a throw.
 
 ### GPU-Native Self-Play
 
@@ -351,31 +364,67 @@ The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 
 The separate alpha-beta trainer learns a move-ordering policy and calibrated
 value from completed iterative-deepening searches. Move-cap games are omitted
-from replay, and the default replay capacity is 75,000 records.
+from replay, and the default replay capacity is 75,000 records. Its initial
+weights are stored in
+`checkpoints_fnn_alphabeta/alpha_beta_checkpoint_1.pt`, a byte-identical copy
+of FNN checkpoint 1080.
+
+The CUDA search evaluates the FNN policy once at the root. Deeper nodes use
+transposition/PV moves, killer moves, history scores, and inexpensive Hive move
+geometry for ordering, while incremental hashing and make/unmake avoid copying
+the full state at every node. Quiescence is deliberately limited to one legal
+reply at leaf nodes: immediate queen surrounds, queen threats, own-queen escapes
+(including pillbug throws), and moves that immobilize a previously mobile ant,
+beetle, or queen. Its default node allowance is 20% of the search budget.
+Every applied tactical probe is charged to that allowance, including moves
+later rejected as quiet. Value-only leaves use an exact compact legal-move
+summary, and move generation shares its articulation result with FNN feature
+extraction rather than calculating it twice.
+
+TT entries, killer tables, and explicit-stack moves use a 32-bit encoding.
+Production per-ply move lists retain the native move structure because CUDA
+spilled more local memory when converting them, but they are ordered in place
+without a separate selected mask.
+Public root moves remain in `GPUMove` format for GUI and training compatibility.
+
+An exact experimental resumable traversal is also available through
+`search_batch_resumable()`. It keeps each game's search serial while grouping
+independent games into warps and reconverging around leaf evaluation. On the
+RTX 2070 benchmark this was substantially slower because divergent alpha-beta
+lanes and global frame traffic outweighed leaf batching, so the packed
+recursive traversal remains the production default. Root branches are never
+parallelized in either path.
+
+On a same-position 64-game, 1,000-node RTX 2070 benchmark, the current
+140-feature production path reached about 156k nodes/second versus 204k for
+the older 124-feature ABI. The added tactical extraction costs about 23% of
+end-to-end search throughput. The exact resumable path reached about 20k
+nodes/second and is therefore kept for architectural experiments rather than
+training.
 
 ```bash
 # Tune search with paired openings and color swaps.
 python tune_fnn_alphabeta.py \
-  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
+  --checkpoint checkpoints_fnn_alphabeta/alpha_beta_checkpoint_1.pt \
   --iterations 100 --pairs 32 --nodes 2000 \
   --output-dir alphabeta_spsa
 
 # Resume tuning exactly.
 python tune_fnn_alphabeta.py \
-  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
+  --checkpoint checkpoints_fnn_alphabeta/alpha_beta_checkpoint_1.pt \
   --resume alphabeta_spsa/spsa_state_latest.json \
   --iterations 200 --pairs 32 --nodes 2000 \
   --output-dir alphabeta_spsa
 
 # Train self-play with the current tuned search configuration.
 python -m hive_fnn.train_fnn_alphabeta \
-  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
+  --checkpoint checkpoints_fnn_alphabeta/alpha_beta_checkpoint_1.pt \
   --search-config alphabeta_spsa/spsa_state_latest.json \
   --games 256 --game-nodes 1000 --teacher-nodes 6000
 ```
 
-SPSA jointly tunes aspiration width, LMR thresholds, quiescence depth and
-budget share, tactical extensions, policy/tactical move ordering, branching
+SPSA jointly tunes aspiration width, LMR thresholds, one-ply quiescence and
+its budget share, tactical extensions, policy/tactical move ordering, branching
 node allocation, and mate early stopping. Arena fitness can penalize additional
 nodes per move with `--node-cost-penalty`. Full trainer continuation uses
 `--resume checkpoints_fnn_alphabeta/alpha_beta_training_state_latest.pt`;
@@ -440,7 +489,7 @@ The active FNN-transformer direction lives in `hive_fnn_transformer`.
 
 The hybrid model keeps the part of FNN that has worked best:
 
-- root and successor states are encoded as `124`-dim FNN feature vectors
+- root and successor states are encoded as `140`-dim FNN feature vectors
 - policy logits compare the root FNN embedding, root transformer summary, and successor FNN embedding
 - a trained FNN checkpoint can initialize the shared FNN feature encoder, but the transformer-aware policy tower is not weight-compatible with the FNN action tower
 
@@ -451,7 +500,7 @@ It changes both policy and value:
 - the transformer sees one token per board piece, including buried stack pieces
 - attention uses relative `(q, r, z)` offsets only, with no absolute board-position embedding
 - the default trunk uses `8` heads and up to `28` piece tokens, matching the full Hive piece count
-- the shared FNN path includes explicit queen-surround one-hot buckets for both queens plus own-queen-throwable bits
+- the shared FNN path includes explicit queen-surround, sufficient-material, queen-escape, and immediate queen-ring-access buckets for both players
 - the move feature path includes explicit own/opponent queen-surround delta buckets `(-1, 0, +1)` for each legal move
 - the small transformer line now supports two optional token/global bundles that have been useful in practice:
   - articulation-point token flag
@@ -473,7 +522,7 @@ Current status:
 
 The current small preset is the mainline model:
 
-- shared FNN encoder: `124 -> 32 -> 32`
+- shared FNN encoder: `140 -> 32 -> 32`
 - policy tower: `128 -> 32 -> 1`
 - transformer trunk: `hidden=64`, `layers=4`, `heads=8`
 - max piece tokens: `28`
@@ -510,7 +559,7 @@ python3.11 -m hive_fnn_transformer.train_fnn_transformer \
   --preset small \
   --articulation-token-flag \
   --queen-threat-features \
-  --resume checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2620.pt \
+  --resume checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2440.pt \
   --games 400 \
   --simulations 1024 \
   --expansion-mask -1 \
@@ -737,18 +786,6 @@ python probe_win_in_one.py --checkpoint checkpoints/hive_gpu_checkpoint_0124.pt
 python eval_value_head.py
 ```
 
-### FNN improved-policy mass analysis
-
-Measure how sharp the current visited-only replay target is after search:
-
-```bash
-python fnn_mass_diagnostic.py \
-    --checkpoint checkpoints_FNN/hive_fnn_checkpoint_1080.pt \
-    --positions 40 --sims 1024
-```
-
-Most older diagnostics have been moved under `archive/diagnostics`.
-
 ## GUI
 
 Play against the trained AI using pygame (local only):
@@ -757,7 +794,7 @@ Play against the trained AI using pygame (local only):
 # vs AI
 python gui.py \
   --engine legacy \
-  --checkpoint checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2620.pt \
+  --checkpoint checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2440.pt \
   --simulations 8192
 
 # AI self-play
@@ -780,11 +817,11 @@ Test coverage includes the game engine, PRS/FNN paths, and GPU move generation v
 
 ```
 hive_engine/       # Core game rules (board, pieces, game state, hex grid)
-hive_common/       # Shared token batch types used by PRS + archived legacy models
+hive_common/       # Shared token batch types
 hive_gpu/          # CUDA extension, GPU-native MCTS/Gumbel, shared kernels
   csrc/            # CUDA C++ source
     game_logic.cu      # Move gen, state apply, feature extraction, tree/search kernels
-    fnn_features.cuh   # 124-dim FNN feature extraction kernel
+    fnn_features.cuh   # 140-dim FNN feature extraction kernel
     fnn_selfplay.cuh   # Experimental fused FNN self-play kernel (not the active trainer path)
     state_encoder.cuh  # Transformer state encoding
     mcts_tree.cuh      # GPU-native MCTS tree
@@ -798,15 +835,16 @@ hive_fnn/          # HiveGo-style FNN with multiple search paths
   fnn_network.py       # HiveFNN: shared encoder + value head + action tower
   fnn_mcts_orchestrator.py  # Gumbel-root MCTS tree search
   fnn_puct_orchestrator.py  # Plain PUCT MCTS tree search
+  fnn_native_alphabeta.py   # CUDA-native iterative-deepening alpha-beta
+  fnn_alphabeta_training.py # Alpha-beta replay records and training losses
+  train_fnn_alphabeta.py    # Alpha-beta self-play trainer
   fnn_trainer.py       # FNNTrainer training loop
   train_fnn.py         # CLI entry point
 hive_fnn_transformer/  # Recommended small FNN policy + relative-transformer model
   fnn_transformer_net.py          # FNN + relative piece-transformer trunk
   fnn_transformer_trainer.py      # Training loop
   fnn_transformer_mcts_orchestrator.py  # Search orchestration
-tests/             # Test suite (250+ tests)
-archive/           # Archived legacy models, diagnostics, and old CPU training code
-  legacy_transformer/  # Old transformer implementation kept for reference/tests
-  legacy_mc/           # Old move-conditioned model kept for reference/tests
+tests/             # Test suite
+archive/           # Retained diagnostics and old CPU/research code
 Dockerfile         # Container for cloud/RunPod deployment
 ```

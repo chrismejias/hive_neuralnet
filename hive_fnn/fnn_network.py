@@ -32,7 +32,7 @@ _ACTION_SURROUND_ABS_DIM = 24
 
 @dataclass
 class FNNConfig:
-    feat_dim: int = 124  # FNN_FEAT_DIM from CUDA kernel
+    feat_dim: int = 140  # FNN_FEAT_DIM from CUDA kernel
     hidden_dim: int = 64
     embed_dim: int = 64
     action_hidden: int = 64
@@ -90,6 +90,11 @@ class HiveFNN(nn.Module):
         new.normal_(mean=0.0, std=noise_scale)
         rows = min(old.shape[0], new.shape[0])
         cols = min(old.shape[1], new.shape[1])
+        # The old 124-input layout ended with two own-queen-throwable bits.
+        # They were removed rather than reinterpreted as the first new feature
+        # buckets, so migrate only the 122 unchanged columns.
+        if old.shape[1] == 124 and new.shape[1] == 140:
+            cols = 122
         new[:rows, :cols] = old[:rows, :cols]
         return new
 

@@ -11,6 +11,7 @@ constexpr float AB_INF = 1000.0f;
 constexpr float AB_MATE = 10.0f;
 constexpr float AB_PVS_EPSILON = 1e-4f;
 constexpr int AB_MAX_PV = 64;
+constexpr int AB_HISTORY_SIZE = 1024;
 
 enum ABTTBound : uint8_t {
     AB_TT_EMPTY = 0,
@@ -24,7 +25,7 @@ struct ABTT {
     float* values;
     int16_t* depths;
     uint8_t* bounds;
-    GPUMove* moves;
+    uint32_t* moves;
     int mask;
 };
 
@@ -68,7 +69,9 @@ __device__ inline ABSearchConfig ab_make_search_config(const float* values) {
     config.lmr_min_depth = max(1, (int)values[1]);
     config.lmr_min_move = max(1, (int)values[2]);
     config.lmr_reduction = max(0, (int)values[3]);
-    config.quiescence_plies = max(0, (int)values[4]);
+    // Quiescence is intentionally capped at one tactical reply. Deeper
+    // tactical sequences belong in the regular alpha-beta tree.
+    config.quiescence_plies = min(1, max(0, (int)values[4]));
     config.quiescence_budget_fraction =
         min(0.95f, max(0.0f, values[5]));
     config.force_win_probes = values[6] >= 0.5f;
@@ -87,15 +90,187 @@ __device__ inline bool ab_move_equal(const GPUMove& a, const GPUMove& b) {
            a.from_cell == b.from_cell && a.to_cell == b.to_cell;
 }
 
-__device__ inline uint64_t ab_hash_state(const HiveState& state) {
-    const uint8_t* data = reinterpret_cast<const uint8_t*>(&state);
-    uint64_t hash = 1469598103934665603ULL;
-    for (int i = 0; i < (int)sizeof(HiveState); ++i) {
-        hash ^= (uint64_t)data[i];
-        hash *= 1099511628211ULL;
+using ABPackedMove = uint32_t;
+constexpr ABPackedMove AB_NO_MOVE = 0xFFFFFFFFU;
+
+__device__ __host__ __forceinline__ ABPackedMove ab_pack_move(
+    const GPUMove& move
+) {
+    uint32_t from = move.from_cell < NUM_CELLS ? move.from_cell : 0x3FFU;
+    uint32_t to = move.to_cell < NUM_CELLS ? move.to_cell : 0x3FFU;
+    return ((uint32_t)move.type & 0x3U) |
+        (((uint32_t)move.piece_type & 0xFU) << 2) |
+        (from << 6) | (to << 16);
+}
+
+__device__ __host__ __forceinline__ GPUMove ab_unpack_move(
+    ABPackedMove packed
+) {
+    GPUMove move = {};
+    move.type = (MoveType)(packed & 0x3U);
+    move.piece_type = (PieceType)((packed >> 2) & 0xFU);
+    uint16_t from = (uint16_t)((packed >> 6) & 0x3FFU);
+    uint16_t to = (uint16_t)((packed >> 16) & 0x3FFU);
+    move.from_cell = from == 0x3FFU ? 0xFFFF : from;
+    move.to_cell = to == 0x3FFU ? 0xFFFF : to;
+    return move;
+}
+
+__device__ __forceinline__ uint64_t ab_mix64(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+__device__ inline uint64_t ab_cell_hash(const HiveState& state, int cell) {
+    if (cell < 0 || cell >= NUM_CELLS) return 0;
+    uint64_t hash = ab_mix64(0x100000ULL + (uint64_t)cell * 17ULL + state.height[cell]);
+    for (int level = 0; level < state.height[cell]; ++level) {
+        uint64_t key = (uint64_t)cell | ((uint64_t)level << 10) |
+            ((uint64_t)state.pieces[level][cell] << 16);
+        hash ^= ab_mix64(key);
     }
-    // Zero denotes an unused TT slot.
+    return hash;
+}
+
+__device__ inline uint64_t ab_metadata_hash(const HiveState& state) {
+    uint64_t hash = ab_mix64(0x200000ULL + state.turn);
+    hash ^= ab_mix64(0x210000ULL + state.stunned_cell);
+    hash ^= ab_mix64(0x220000ULL + (uint64_t)state.result);
+    for (int color = 0; color < 2; ++color) {
+        for (int type = 0; type < NUM_PIECE_TYPES; ++type) {
+            uint64_t key = 0x300000ULL + (uint64_t)(color * NUM_PIECE_TYPES + type) * 16ULL +
+                state.hands[color][type];
+            hash ^= ab_mix64(key);
+        }
+    }
+    return hash;
+}
+
+__device__ inline uint64_t ab_hash_state(const HiveState& state) {
+    uint64_t hash = ab_metadata_hash(state);
+    for (int cell = 0; cell < NUM_CELLS; ++cell) {
+        if (state.height[cell] > 0) hash ^= ab_cell_hash(state, cell);
+    }
     return hash == 0 ? 1ULL : hash;
+}
+
+struct ABUndo {
+    uint16_t from_cell;
+    uint16_t to_cell;
+    uint16_t turn;
+    uint16_t stunned_cell;
+    uint16_t queen_cell[2];
+    uint8_t queen_placed;
+    uint8_t result;
+    uint8_t hand_color;
+    uint8_t hand_type;
+    uint8_t hand_count;
+    uint8_t from_height;
+    uint8_t to_height;
+    uint8_t from_pieces[MAX_STACK];
+    uint8_t to_pieces[MAX_STACK];
+    uint8_t cell_flags[2];
+};
+
+__device__ __forceinline__ uint8_t ab_cell_flags(const HiveState& state, int cell) {
+    if (cell < 0 || cell >= NUM_CELLS) return 0;
+    return (state.occupied.get(cell) ? 1 : 0) |
+        (state.white_top.get(cell) ? 2 : 0) |
+        (state.black_top.get(cell) ? 4 : 0);
+}
+
+__device__ __forceinline__ void ab_restore_cell_flags(
+    HiveState& state, int cell, uint8_t flags
+) {
+    if (cell < 0 || cell >= NUM_CELLS) return;
+    if (flags & 1) state.occupied.set(cell); else state.occupied.clr(cell);
+    if (flags & 2) state.white_top.set(cell); else state.white_top.clr(cell);
+    if (flags & 4) state.black_top.set(cell); else state.black_top.clr(cell);
+}
+
+__device__ inline void ab_capture_undo(
+    const HiveState& state, const GPUMove& move, ABUndo& undo
+) {
+    undo.from_cell = move.type == MOVE_MOVE ? move.from_cell : 0xFFFF;
+    undo.to_cell = move.type == MOVE_PASS ? 0xFFFF : move.to_cell;
+    undo.turn = state.turn;
+    undo.stunned_cell = state.stunned_cell;
+    undo.queen_cell[0] = state.queen_cell[0];
+    undo.queen_cell[1] = state.queen_cell[1];
+    undo.queen_placed = state.queen_placed;
+    undo.result = (uint8_t)state.result;
+    undo.hand_color = 0xFF;
+    undo.hand_type = 0xFF;
+    undo.hand_count = 0;
+    if (move.type == MOVE_PLACE) {
+        undo.hand_color = (uint8_t)current_player(state);
+        undo.hand_type = (uint8_t)((int)move.piece_type - 1);
+        undo.hand_count = state.hands[undo.hand_color][undo.hand_type];
+    }
+    undo.from_height = undo.from_cell != 0xFFFF ? state.height[undo.from_cell] : 0;
+    undo.to_height = undo.to_cell != 0xFFFF ? state.height[undo.to_cell] : 0;
+    undo.cell_flags[0] = ab_cell_flags(state, undo.from_cell);
+    undo.cell_flags[1] = ab_cell_flags(state, undo.to_cell);
+    for (int level = 0; level < MAX_STACK; ++level) {
+        undo.from_pieces[level] = undo.from_cell != 0xFFFF ?
+            state.pieces[level][undo.from_cell] : 0;
+        undo.to_pieces[level] = undo.to_cell != 0xFFFF ?
+            state.pieces[level][undo.to_cell] : 0;
+    }
+
+}
+
+__device__ inline uint64_t ab_make_move(
+    HiveState& state, const GPUMove& move, uint64_t hash, ABUndo& undo
+) {
+    ab_capture_undo(state, move, undo);
+    uint64_t next_hash = hash ^ ab_metadata_hash(state);
+    if (undo.from_cell != 0xFFFF) next_hash ^= ab_cell_hash(state, undo.from_cell);
+    if (undo.to_cell != 0xFFFF && undo.to_cell != undo.from_cell) {
+        next_hash ^= ab_cell_hash(state, undo.to_cell);
+    }
+    apply_move(state, move);
+    next_hash ^= ab_metadata_hash(state);
+    if (undo.from_cell != 0xFFFF) next_hash ^= ab_cell_hash(state, undo.from_cell);
+    if (undo.to_cell != 0xFFFF && undo.to_cell != undo.from_cell) {
+        next_hash ^= ab_cell_hash(state, undo.to_cell);
+    }
+    return next_hash == 0 ? 1ULL : next_hash;
+}
+
+__device__ inline void ab_make_move_unhashed(
+    HiveState& state, const GPUMove& move, ABUndo& undo
+) {
+    ab_capture_undo(state, move, undo);
+    apply_move(state, move);
+}
+
+__device__ inline void ab_unmake_move(HiveState& state, const ABUndo& undo) {
+    state.turn = undo.turn;
+    state.stunned_cell = undo.stunned_cell;
+    state.queen_cell[0] = undo.queen_cell[0];
+    state.queen_cell[1] = undo.queen_cell[1];
+    state.queen_placed = undo.queen_placed;
+    state.result = (GameResult)undo.result;
+    if (undo.hand_color < 2 && undo.hand_type < NUM_PIECE_TYPES) {
+        state.hands[undo.hand_color][undo.hand_type] = undo.hand_count;
+    }
+    if (undo.from_cell != 0xFFFF) {
+        state.height[undo.from_cell] = undo.from_height;
+        for (int level = 0; level < MAX_STACK; ++level) {
+            state.pieces[level][undo.from_cell] = undo.from_pieces[level];
+        }
+        ab_restore_cell_flags(state, undo.from_cell, undo.cell_flags[0]);
+    }
+    if (undo.to_cell != 0xFFFF && undo.to_cell != undo.from_cell) {
+        state.height[undo.to_cell] = undo.to_height;
+        for (int level = 0; level < MAX_STACK; ++level) {
+            state.pieces[level][undo.to_cell] = undo.to_pieces[level];
+        }
+        ab_restore_cell_flags(state, undo.to_cell, undo.cell_flags[1]);
+    }
 }
 
 __device__ inline float ab_terminal_value(const HiveState& state, int ply) {
@@ -106,16 +281,26 @@ __device__ inline float ab_terminal_value(const HiveState& state, int ply) {
     return (side_won ? 1.0f : -1.0f) * (AB_MATE - min(ply, 100) * 0.01f);
 }
 
+__device__ inline float ab_evaluate_with_moves_and_ap(
+    const HiveState& state, const GPUMove* moves, int n,
+    const Bitboard& ap_mask, const float* params, const FNNWeights& weights
+) {
+    float features[FNN_FEAT_DIM];
+    float embed[FNN_MAX_EMBED];
+    extract_fnn_features_with_ap_device(
+        state, moves, n, ap_mask, features);
+    fnn_encode(features, embed, params, weights);
+    return fnn_value(embed, params, weights);
+}
+
 __device__ inline float ab_evaluate(
     const HiveState& state, const float* params, const FNNWeights& weights
 ) {
     GPUMove moves[MAX_LEGAL_MOVES];
-    int n = generate_legal_moves(state, moves);
-    float features[FNN_FEAT_DIM];
-    float embed[FNN_MAX_EMBED];
-    extract_fnn_features_device(state, moves, n, features);
-    fnn_encode(features, embed, params, weights);
-    return fnn_value(embed, params, weights);
+    MovegenStateCache cache;
+    int n = generate_fnn_feature_moves_with_cache(state, moves, cache);
+    return ab_evaluate_with_moves_and_ap(
+        state, moves, n, cache.ap_mask, params, weights);
 }
 
 __device__ inline float ab_ordering_heuristic(
@@ -138,18 +323,23 @@ __device__ inline float ab_ordering_heuristic(
 __device__ inline void ab_policy_scores(
     const HiveState& state, const GPUMove* moves, int n,
     const float* params, const FNNWeights& weights,
-    const ABSearchConfig& config, float* scores
+    const ABSearchConfig& config, const Bitboard& root_ap_mask,
+    float* scores
 ) {
     float root_features[FNN_FEAT_DIM], root_embed[FNN_MAX_EMBED];
-    extract_fnn_features_device(state, moves, n, root_features);
+    extract_fnn_features_with_ap_device(
+        state, moves, n, root_ap_mask, root_features);
     fnn_encode(root_features, root_embed, params, weights);
     for (int i = 0; i < n; ++i) {
         HiveState child = state;
         apply_move(child, moves[i]);
         GPUMove child_moves[MAX_LEGAL_MOVES];
-        int child_n = generate_legal_moves(child, child_moves);
+        MovegenStateCache child_cache;
+        int child_n = generate_fnn_feature_moves_with_cache(
+            child, child_moves, child_cache);
         float child_features[FNN_FEAT_DIM], child_embed[FNN_MAX_EMBED];
-        extract_fnn_features_device(child, child_moves, child_n, child_features);
+        extract_fnn_features_with_ap_device(
+            child, child_moves, child_n, child_cache.ap_mask, child_features);
         fnn_encode(child_features, child_embed, params, weights);
         scores[i] =
             config.policy_ordering_weight * fnn_score_action(
@@ -158,6 +348,106 @@ __device__ inline void ab_policy_scores(
             + config.tactical_ordering_weight *
                 ab_ordering_heuristic(state, child);
     }
+}
+
+__device__ __forceinline__ bool ab_adjacent_to(int cell, uint16_t target) {
+    if (cell < 0 || cell >= NUM_CELLS || target == 0xFFFF) return false;
+    for (int direction = 0; direction < NUM_DIRS; ++direction) {
+        if (NEIGHBORS[(int)target][direction] == cell) return true;
+    }
+    return false;
+}
+
+__device__ __forceinline__ int ab_move_history_index(const GPUMove& move) {
+    uint32_t key = (uint32_t)move.to_cell * 37U + (uint32_t)move.from_cell * 11U +
+        (uint32_t)move.piece_type * 131U + (uint32_t)move.type * 521U;
+    return (int)(key & (AB_HISTORY_SIZE - 1));
+}
+
+__device__ inline float ab_search_order_score(
+    const HiveState& state, const GPUMove& move, int ply,
+    const ABPackedMove* killers, const int* history
+) {
+    Color mover = current_player(state);
+    Color opponent = mover == WHITE ? BLACK : WHITE;
+    float score = (float)history[ab_move_history_index(move)];
+    if (ply < AB_MAX_PV) {
+        ABPackedMove packed = ab_pack_move(move);
+        if (packed == killers[ply * 2]) score += 1000000.0f;
+        else if (packed == killers[ply * 2 + 1]) score += 900000.0f;
+    }
+    if (ab_adjacent_to((int)move.to_cell, state.queen_cell[opponent])) {
+        score += 10000.0f;
+    }
+    if (move.type == MOVE_MOVE &&
+        ab_adjacent_to((int)move.from_cell, state.queen_cell[mover]) &&
+        !ab_adjacent_to((int)move.to_cell, state.queen_cell[mover])) {
+        score += 8000.0f;
+    }
+    if (move.piece_type == PT_BEETLE || move.piece_type == PT_QUEEN ||
+        move.piece_type == PT_PILLBUG) {
+        score += 100.0f;
+    }
+    return score;
+}
+
+__device__ inline void ab_order_move_at_rank(
+    const HiveState& state, ABPackedMove* moves, int n, int rank,
+    int ply, const ABPackedMove* killers, const int* history,
+    ABPackedMove tt_move
+) {
+    int best_index = rank;
+    float best_score = -1e30f;
+    for (int i = rank; i < n; ++i) {
+        GPUMove move = ab_unpack_move(moves[i]);
+        float score = ab_search_order_score(state, move, ply, killers, history);
+        if (moves[i] == tt_move) {
+            score += 1e20f;
+        }
+        if (score > best_score) {
+            best_score = score;
+            best_index = i;
+        }
+    }
+    if (best_index != rank) {
+        // Stable extraction preserves the old selected-mask tie order while
+        // eliminating that extra per-frame array.
+        ABPackedMove best = moves[best_index];
+        for (int i = best_index; i > rank; --i) moves[i] = moves[i - 1];
+        moves[rank] = best;
+    }
+}
+
+__device__ inline void ab_order_native_move_at_rank(
+    const HiveState& state, GPUMove* moves, int n, int rank,
+    int ply, const ABPackedMove* killers, const int* history,
+    ABPackedMove tt_move
+) {
+    int best_index = rank;
+    float best_score = -1e30f;
+    for (int i = rank; i < n; ++i) {
+        float score = ab_search_order_score(
+            state, moves[i], ply, killers, history);
+        if (ab_pack_move(moves[i]) == tt_move) score += 1e20f;
+        if (score > best_score) {
+            best_score = score;
+            best_index = i;
+        }
+    }
+    if (best_index != rank) {
+        GPUMove best = moves[best_index];
+        for (int i = best_index; i > rank; --i) moves[i] = moves[i - 1];
+        moves[rank] = best;
+    }
+}
+
+__device__ __noinline__ int ab_generate_packed_moves(
+    const HiveState& state, ABPackedMove* packed
+) {
+    GPUMove generated[MAX_LEGAL_MOVES];
+    int n = generate_legal_moves(state, generated);
+    for (int i = 0; i < n; ++i) packed[i] = ab_pack_move(generated[i]);
+    return n;
 }
 
 __device__ inline void ab_tt_store(
@@ -170,7 +460,7 @@ __device__ inline void ab_tt_store(
         tt.values[slot] = value;
         tt.depths[slot] = (int16_t)depth;
         tt.bounds[slot] = bound;
-        tt.moves[slot] = best_move;
+        tt.moves[slot] = ab_pack_move(best_move);
         __threadfence();
         tt.keys[slot] = key;
     }
@@ -200,62 +490,6 @@ __device__ inline bool ab_color_won(const HiveState& state, Color color) {
            (color == BLACK && state.result == BLACK_WINS);
 }
 
-/**
- * Prove a win for the side to move in at most three plies.
- *
- * The surround gates make the exhaustive all-replies probe affordable:
- * surround 5 can be won in one move, while surround 4/5 can potentially be
- * won by move-reply-move. Unlike the older diagnostic probe, every legal
- * defensive reply is checked.
- */
-__device__ inline int ab_forced_win_distance(
-    const HiveState& state, int node_budget, ABStats* stats,
-    const ABSearchConfig& config
-) {
-    if (!config.force_win_probes) return 0;
-    Color player = current_player(state);
-    Color opponent = player == WHITE ? BLACK : WHITE;
-    int surround = queen_surround_count_for_color_device(state, opponent);
-    if (surround < 4) return 0;
-    ++stats->forced_win_probes;
-
-    GPUMove moves[MAX_LEGAL_MOVES];
-    int n = generate_legal_moves(state, moves);
-    for (int i = 0; i < n; ++i) {
-        HiveState child = state;
-        apply_move(child, moves[i]);
-        if (!ab_take_node(stats, node_budget, config, true)) return 0;
-        if (ab_color_won(child, player)) return 1;
-        if (child.result != IN_PROGRESS) continue;
-
-        // A three-ply win needs the target queen to be one cell from defeat
-        // after the attacker's first move.
-        if (queen_surround_count_for_color_device(child, opponent) != 5) continue;
-
-        GPUMove replies[MAX_LEGAL_MOVES];
-        int nr = generate_legal_moves(child, replies);
-        bool wins_after_every_reply = nr > 0;
-        for (int r = 0; r < nr; ++r) {
-            HiveState grandchild = child;
-            apply_move(grandchild, replies[r]);
-            if (!ab_take_node(stats, node_budget, config, true)) return 0;
-            if (ab_color_won(grandchild, opponent) ||
-                grandchild.result == DRAW) {
-                wins_after_every_reply = false;
-                break;
-            }
-            if (ab_color_won(grandchild, player)) continue;
-            if (grandchild.result != IN_PROGRESS ||
-                !has_immediate_surround_win_for_current_player(grandchild)) {
-                wins_after_every_reply = false;
-                break;
-            }
-        }
-        if (wins_after_every_reply) return 3;
-    }
-    return 0;
-}
-
 __device__ inline bool ab_power_piece_mobile(
     const HiveState& state, int cell, MovegenStateCache& cache
 ) {
@@ -273,36 +507,42 @@ __device__ inline bool ab_power_piece_mobile(
     return false;
 }
 
-__device__ inline bool ab_immobilizes_power_piece(
-    const HiveState& state, const GPUMove& move, const HiveState& child,
-    const GPUMove* child_moves, int child_n
+__device__ inline Bitboard ab_mobile_power_pieces(
+    const HiveState& state, Color color, MovegenStateCache& cache
 ) {
-    Color opponent = current_player(child);
-    MovegenStateCache cache;
-    init_movegen_state_cache(state, cache);
-    const Bitboard& tops = opponent == WHITE ? state.white_top : state.black_top;
+    Bitboard mobile;
+    mobile.clear();
+    const Bitboard& tops = color == WHITE ? state.white_top : state.black_top;
     for (int wi = 0; wi < BB_WORDS; ++wi) {
         uint64_t bits = tops.w[wi];
         while (bits) {
             int bit = __ffsll(bits) - 1;
             int cell = wi * 64 + bit;
             bits &= bits - 1;
-            if (!ab_power_piece_mobile(state, cell, cache)) continue;
+            if (cell < NUM_CELLS && ab_power_piece_mobile(state, cell, cache)) {
+                mobile.set(cell);
+            }
+        }
+    }
+    return mobile;
+}
 
-            // Relocating an enemy piece is not immobilization; its identity
-            // has simply moved to a new cell.
+__device__ inline bool ab_immobilizes_from_mask(
+    const Bitboard& mobile_before, Color target, const GPUMove& move,
+    const HiveState& child, MovegenStateCache& child_cache
+) {
+    for (int wi = 0; wi < BB_WORDS; ++wi) {
+        uint64_t bits = mobile_before.w[wi];
+        while (bits) {
+            int bit = __ffsll(bits) - 1;
+            int cell = wi * 64 + bit;
+            bits &= bits - 1;
             if (move.type == MOVE_MOVE && (int)move.from_cell == cell) continue;
-
             bool still_mobile = false;
             if (cell < NUM_CELLS && child.height[cell] > 0 &&
-                top_piece_color_at(child, cell) == opponent) {
-                for (int i = 0; i < child_n; ++i) {
-                    if (child_moves[i].type == MOVE_MOVE &&
-                        (int)child_moves[i].from_cell == cell) {
-                        still_mobile = true;
-                        break;
-                    }
-                }
+                top_piece_color_at(child, cell) == target) {
+                still_mobile = ab_power_piece_mobile(
+                    child, cell, child_cache);
             }
             if (!still_mobile) return true;
         }
@@ -314,117 +554,152 @@ __device__ inline bool ab_creates_queen_threat(
     const HiveState& child, Color mover
 ) {
     if (child.result != IN_PROGRESS) return false;
+    Color opponent = mover == WHITE ? BLACK : WHITE;
+    if (queen_surround_count_for_color_device(child, opponent) != 5) {
+        return false;
+    }
     HiveState probe = child;
     probe.turn = (uint16_t)((probe.turn & ~1U) | (uint16_t)mover);
     probe.stunned_cell = 0xFFFF;
     return has_immediate_surround_win_for_current_player(probe);
 }
 
-__device__ inline bool ab_is_tactical_move(
-    const HiveState& state, const GPUMove& move, const HiveState& child,
-    const GPUMove* child_moves, int child_n, const ABSearchConfig& config
+__device__ inline bool ab_priority_q_candidate(
+    const HiveState& state, const GPUMove& move, Color mover, Color opponent,
+    const Bitboard& mobile_power
 ) {
-    Color mover = current_player(state);
-    Color opponent = mover == WHITE ? BLACK : WHITE;
-    int own_before = queen_surround_count_for_color_device(state, mover);
-    int opp_before = queen_surround_count_for_color_device(state, opponent);
-    if ((config.tactical_mask & AB_TACTICAL_OPP_SURROUND) &&
-        queen_surround_count_for_color_device(child, opponent) > opp_before) {
+    if (ab_adjacent_to((int)move.to_cell, state.queen_cell[opponent])) {
         return true;
     }
-    if ((config.tactical_mask & AB_TACTICAL_OWN_RELIEF) &&
-        queen_surround_count_for_color_device(child, mover) < own_before) {
-        return true;
+    if (move.type == MOVE_MOVE) {
+        if (move.from_cell == state.queen_cell[mover] ||
+            ab_adjacent_to((int)move.from_cell, state.queen_cell[mover])) {
+            return true;
+        }
+        for (int wi = 0; wi < BB_WORDS; ++wi) {
+            uint64_t bits = mobile_power.w[wi];
+            while (bits) {
+                int bit = __ffsll(bits) - 1;
+                int cell = wi * 64 + bit;
+                bits &= bits - 1;
+                if ((int)move.to_cell == cell ||
+                    ab_adjacent_to((int)move.to_cell, (uint16_t)cell) ||
+                    ab_adjacent_to((int)move.from_cell, (uint16_t)cell)) {
+                    return true;
+                }
+            }
+        }
     }
-    if ((config.tactical_mask & AB_TACTICAL_QUEEN_THREAT) &&
-        ab_creates_queen_threat(child, mover)) {
-        return true;
-    }
-    return (config.tactical_mask & AB_TACTICAL_IMMOBILIZE) &&
-           ab_immobilizes_power_piece(
-               state, move, child, child_moves, child_n);
+    return false;
 }
 
 __device__ float ab_quiescence(
-    const HiveState& state, float alpha, float beta, int ply, int qplies,
+    HiveState& state, float alpha, float beta, int ply,
     const float* params, const FNNWeights& weights, int node_budget,
-    ABStats* stats, bool count_node, const ABSearchConfig& config
+    ABStats* stats, const ABSearchConfig& config
 ) {
     if (state.result != IN_PROGRESS) return ab_terminal_value(state, ply);
-    if (count_node && !ab_take_node(stats, node_budget, config, true)) {
-        return stats->aborted ? 0.0f : ab_evaluate(state, params, weights);
+    if (config.quiescence_plies <= 0) {
+        return ab_evaluate(state, params, weights);
     }
-    if (!count_node) ++stats->qnodes;
-
-    int win_distance = ab_forced_win_distance(
-        state, node_budget, stats, config);
-    if (stats->aborted) return 0.0f;
-    if (stats->q_exhausted) return ab_evaluate(state, params, weights);
-    if (win_distance > 0) {
-        return AB_MATE - min(ply + win_distance, 100) * 0.01f;
-    }
-
-    float best = ab_evaluate(state, params, weights);
-    if (qplies <= 0 || best >= beta) return best;
+    GPUMove moves[MAX_LEGAL_MOVES];
+    MovegenStateCache state_cache;
+    int n = generate_legal_moves_with_cache(state, moves, state_cache);
+    float best = ab_evaluate_with_moves_and_ap(
+        state, moves, n, state_cache.ap_mask, params, weights);
+    if (best >= beta || n <= 0) return best;
     alpha = max(alpha, best);
 
-    GPUMove moves[MAX_LEGAL_MOVES];
-    int n = generate_legal_moves(state, moves);
-    if (n <= 0) return best;
-    float scores[MAX_LEGAL_MOVES];
-    ab_policy_scores(state, moves, n, params, weights, config, scores);
-
-    for (int rank = 0; rank < n; ++rank) {
-        int index = -1;
-        float ordering_score = -1e30f;
-        for (int i = 0; i < n; ++i) {
-            if (scores[i] > ordering_score) {
-                ordering_score = scores[i];
-                index = i;
+    Color mover = current_player(state);
+    Color tactical_target = mover == WHITE ? BLACK : WHITE;
+    Bitboard mobile_power;
+    mobile_power.clear();
+    if (config.tactical_mask & AB_TACTICAL_IMMOBILIZE) {
+        mobile_power = ab_mobile_power_pieces(
+            state, tactical_target, state_cache);
+    }
+    int own_before = queen_surround_count_for_color_device(state, mover);
+    for (int phase = 0; phase < 2; ++phase) {
+        for (int index = 0; index < n; ++index) {
+            bool priority = ab_priority_q_candidate(
+                state, moves[index], mover, tactical_target, mobile_power);
+            if (priority != (phase == 0)) continue;
+            if (!ab_take_node(stats, node_budget, config, true)) {
+                return stats->aborted ? 0.0f : best;
             }
-        }
-        scores[index] = -1e30f;
-        HiveState child = state;
-        apply_move(child, moves[index]);
-        GPUMove child_moves[MAX_LEGAL_MOVES];
-        int child_n = generate_legal_moves(child, child_moves);
-        if (!ab_is_tactical_move(
-                state, moves[index], child, child_moves, child_n, config)) {
-            continue;
-        }
-        ++stats->tactical_moves;
-        float value = -ab_quiescence(
-            child, -beta, -alpha, ply + 1, qplies - 1,
-            params, weights, node_budget, stats, true, config);
-        if (stats->aborted) return 0.0f;
-        best = max(best, value);
-        alpha = max(alpha, best);
-        if (alpha >= beta) {
-            ++stats->cutoffs;
-            break;
+            Color opponent = mover == WHITE ? BLACK : WHITE;
+            ABUndo undo;
+            ab_make_move_unhashed(state, moves[index], undo);
+            bool mover_won = ab_color_won(state, mover);
+            int own_after = queen_surround_count_for_color_device(state, mover);
+            bool tactical = mover_won ||
+                ((config.tactical_mask & AB_TACTICAL_OWN_RELIEF) &&
+                 own_after < own_before) ||
+                ((config.tactical_mask & AB_TACTICAL_QUEEN_THREAT) &&
+                 queen_surround_count_for_color_device(state, opponent) == 5 &&
+                 ab_creates_queen_threat(state, mover));
+
+            MovegenStateCache child_cache;
+            bool child_cache_ready = false;
+            if (!tactical &&
+                (config.tactical_mask & AB_TACTICAL_IMMOBILIZE) &&
+                !mobile_power.is_zero()) {
+                init_movegen_state_cache(state, child_cache);
+                child_cache_ready = true;
+                tactical = ab_immobilizes_from_mask(
+                    mobile_power, tactical_target, moves[index], state,
+                    child_cache);
+            }
+            if (!tactical) {
+                ab_unmake_move(state, undo);
+                continue;
+            }
+            ++stats->tactical_moves;
+            float value;
+            if (state.result != IN_PROGRESS) {
+                value = -ab_terminal_value(state, ply + 1);
+            } else {
+                GPUMove feature_moves[MAX_LEGAL_MOVES];
+                if (!child_cache_ready) {
+                    init_movegen_state_cache(state, child_cache);
+                }
+                int feature_n = generate_fnn_feature_moves_from_cache(
+                    state, feature_moves, child_cache);
+                value = -ab_evaluate_with_moves_and_ap(
+                    state, feature_moves, feature_n, child_cache.ap_mask,
+                    params, weights);
+            }
+            ab_unmake_move(state, undo);
+            best = max(best, value);
+            alpha = max(alpha, best);
+            if (alpha >= beta) {
+                ++stats->cutoffs;
+                return best;
+            }
         }
     }
     return best;
 }
 
 __device__ float ab_negamax(
-    const HiveState& state, int depth, float alpha, float beta, int ply,
+    HiveState& state, uint64_t hash, int depth, float alpha, float beta, int ply,
     const float* params, const FNNWeights& weights, int node_budget,
-    ABStats* stats, const ABTT& tt, const ABSearchConfig& config
+    ABStats* stats, const ABTT& tt, const ABSearchConfig& config,
+    ABPackedMove* killers, int* history
 ) {
     if (!ab_take_node(stats, node_budget, config)) return 0.0f;
     if (state.result != IN_PROGRESS) return ab_terminal_value(state, ply);
     if (depth <= 0) {
         return ab_quiescence(
-            state, alpha, beta, ply, config.quiescence_plies,
-            params, weights, node_budget, stats, false, config);
+            state, alpha, beta, ply, params, weights, node_budget,
+            stats, config);
     }
 
     const float alpha_start = alpha;
     const float beta_start = beta;
-    const uint64_t key = ab_hash_state(state);
+    const uint64_t key = hash;
     const int tt_slot = (int)(key & (uint64_t)tt.mask);
-    GPUMove tt_move = {};
+    ABPackedMove tt_move = AB_NO_MOVE;
     bool has_tt_move = false;
     if (tt.keys[tt_slot] == key) {
         has_tt_move = true;
@@ -444,37 +719,22 @@ __device__ float ab_negamax(
     int n = generate_legal_moves(state, moves);
     if (n <= 0) return ab_evaluate(state, params, weights);
 
-    float scores[MAX_LEGAL_MOVES];
-    ab_policy_scores(state, moves, n, params, weights, config, scores);
-    if (has_tt_move) {
-        for (int i = 0; i < n; ++i) {
-            if (ab_move_equal(moves[i], tt_move)) {
-                scores[i] = 1e30f;
-                break;
-            }
-        }
-    }
-
     float best = -AB_INF;
     GPUMove best_move = moves[0];
     for (int rank = 0; rank < n; ++rank) {
-        int index = -1;
-        float ordering_score = -1e30f;
-        for (int i = 0; i < n; ++i) {
-            if (scores[i] > ordering_score) {
-                ordering_score = scores[i];
-                index = i;
-            }
-        }
-        scores[index] = -1e30f;
-        HiveState child = state;
-        apply_move(child, moves[index]);
+        ab_order_native_move_at_rank(
+            state, moves, n, rank, ply, killers, history,
+            has_tt_move ? tt_move : AB_NO_MOVE);
+        GPUMove move = moves[rank];
+        ABUndo undo;
+        uint64_t child_hash = ab_make_move(state, move, hash, undo);
 
         float value;
         if (rank == 0) {
             value = -ab_negamax(
-                child, depth - 1, -beta, -alpha, ply + 1,
-                params, weights, node_budget, stats, tt, config);
+                state, child_hash, depth - 1, -beta, -alpha, ply + 1,
+                params, weights, node_budget, stats, tt, config,
+                killers, history);
         } else {
             int reduction = (
                 depth >= config.lmr_min_depth &&
@@ -482,29 +742,41 @@ __device__ float ab_negamax(
             ) ? min(config.lmr_reduction, max(0, depth - 1)) : 0;
             if (reduction) ++stats->lmr_reductions;
             value = -ab_negamax(
-                child, depth - 1 - reduction, -alpha - AB_PVS_EPSILON, -alpha,
-                ply + 1, params, weights, node_budget, stats, tt, config);
+                state, child_hash, depth - 1 - reduction,
+                -alpha - AB_PVS_EPSILON, -alpha, ply + 1, params, weights,
+                node_budget, stats, tt, config, killers, history);
             if (!stats->aborted && reduction && value > alpha) {
                 ++stats->pvs_researches;
                 value = -ab_negamax(
-                    child, depth - 1, -alpha - AB_PVS_EPSILON, -alpha,
-                    ply + 1, params, weights, node_budget, stats, tt, config);
+                    state, child_hash, depth - 1, -alpha - AB_PVS_EPSILON,
+                    -alpha, ply + 1, params, weights, node_budget, stats, tt,
+                    config, killers, history);
             }
             if (!stats->aborted && value > alpha && value < beta) {
                 ++stats->pvs_researches;
                 value = -ab_negamax(
-                    child, depth - 1, -beta, -alpha, ply + 1,
-                    params, weights, node_budget, stats, tt, config);
+                    state, child_hash, depth - 1, -beta, -alpha, ply + 1,
+                    params, weights, node_budget, stats, tt, config,
+                    killers, history);
             }
         }
+        ab_unmake_move(state, undo);
         if (stats->aborted) return 0.0f;
         if (value > best) {
             best = value;
-            best_move = moves[index];
+            best_move = move;
         }
         alpha = max(alpha, best);
         if (alpha >= beta) {
             ++stats->cutoffs;
+            int history_index = ab_move_history_index(move);
+            history[history_index] = min(
+                1000000, history[history_index] + depth * depth);
+            ABPackedMove packed = ab_pack_move(move);
+            if (ply < AB_MAX_PV && packed != killers[ply * 2]) {
+                killers[ply * 2 + 1] = killers[ply * 2];
+                killers[ply * 2] = packed;
+            }
             break;
         }
     }
@@ -516,12 +788,294 @@ __device__ float ab_negamax(
     return best;
 }
 
+struct ABExplicitFrame {
+    uint64_t hash;
+    float alpha;
+    float beta;
+    float alpha_start;
+    float beta_start;
+    float best;
+    int depth;
+    int ply;
+    int move_count;
+    int rank;
+    int reduction;
+    uint8_t phase;
+    uint8_t entered;
+    uint8_t has_tt_move;
+    uint8_t padding;
+    ABPackedMove best_move;
+    ABPackedMove tt_move;
+    ABPackedMove current_move;
+    ABUndo undo;
+};
+
+__device__ __forceinline__ void ab_init_explicit_frame(
+    ABExplicitFrame& frame, uint64_t hash, int depth,
+    float alpha, float beta, int ply
+) {
+    frame.hash = hash;
+    frame.alpha = alpha;
+    frame.beta = beta;
+    frame.depth = depth;
+    frame.ply = ply;
+    frame.entered = 0;
+    frame.phase = 0;
+    frame.has_tt_move = 0;
+    frame.tt_move = AB_NO_MOVE;
+    frame.current_move = AB_NO_MOVE;
+}
+
+__device__ inline void ab_unwind_explicit_state(
+    HiveState& state, ABExplicitFrame* frames, int top
+) {
+    for (int parent = top - 1; parent >= 0; --parent) {
+        ab_unmake_move(state, frames[parent].undo);
+    }
+}
+
+/**
+ * Iterative equivalent of ab_negamax.
+ *
+ * Frames and per-ply move lists live in global per-game workspaces. This
+ * keeps traversal serial for each game while allowing a warp to advance
+ * independent games through the same resumable state machine.
+ */
+__device__ float ab_negamax_explicit(
+    HiveState& state, uint64_t hash, int depth, float alpha, float beta,
+    int ply, const float* params, const FNNWeights& weights,
+    int node_budget, ABStats* stats, const ABTT& tt,
+    const ABSearchConfig& config, ABPackedMove* killers, int* history,
+    ABExplicitFrame* frames, ABPackedMove* move_stack
+) {
+    int top = 0;
+    ab_init_explicit_frame(frames[0], hash, depth, alpha, beta, ply);
+    bool returning = false;
+    float returned = 0.0f;
+
+    while (top >= 0) {
+        ABExplicitFrame& frame = frames[top];
+        ABPackedMove* moves = move_stack + top * MAX_LEGAL_MOVES;
+
+        if (returning) {
+            ab_unmake_move(state, frame.undo);
+            float value = -returned;
+            returning = false;
+
+            if (stats->aborted) {
+                ab_unwind_explicit_state(state, frames, top);
+                return 0.0f;
+            }
+
+            if (frame.rank > 0 && frame.phase == 0 &&
+                frame.reduction > 0 && value > frame.alpha) {
+                ++stats->pvs_researches;
+                frame.phase = 1;
+                GPUMove move = ab_unpack_move(frame.current_move);
+                uint64_t child_hash = ab_make_move(
+                    state, move, frame.hash, frame.undo);
+                if (top + 1 >= AB_MAX_PV) {
+                    value = -ab_quiescence(
+                        state, -frame.alpha - AB_PVS_EPSILON, -frame.alpha,
+                        frame.ply + 1, params, weights, node_budget, stats,
+                        config);
+                    ab_unmake_move(state, frame.undo);
+                } else {
+                    ++top;
+                    ab_init_explicit_frame(
+                        frames[top], child_hash, frame.depth - 1,
+                        -frame.alpha - AB_PVS_EPSILON, -frame.alpha,
+                        frame.ply + 1);
+                    continue;
+                }
+            }
+
+            if (frame.rank > 0 && frame.phase < 2 &&
+                value > frame.alpha && value < frame.beta) {
+                ++stats->pvs_researches;
+                frame.phase = 2;
+                GPUMove move = ab_unpack_move(frame.current_move);
+                uint64_t child_hash = ab_make_move(
+                    state, move, frame.hash, frame.undo);
+                if (top + 1 >= AB_MAX_PV) {
+                    value = -ab_quiescence(
+                        state, -frame.beta, -frame.alpha, frame.ply + 1,
+                        params, weights, node_budget, stats, config);
+                    ab_unmake_move(state, frame.undo);
+                } else {
+                    ++top;
+                    ab_init_explicit_frame(
+                        frames[top], child_hash, frame.depth - 1,
+                        -frame.beta, -frame.alpha, frame.ply + 1);
+                    continue;
+                }
+            }
+
+            if (value > frame.best) {
+                frame.best = value;
+                frame.best_move = frame.current_move;
+            }
+            frame.alpha = max(frame.alpha, frame.best);
+            if (frame.alpha >= frame.beta) {
+                ++stats->cutoffs;
+                GPUMove move = ab_unpack_move(frame.current_move);
+                int history_index = ab_move_history_index(move);
+                history[history_index] = min(
+                    1000000, history[history_index] + frame.depth * frame.depth);
+                if (frame.ply < AB_MAX_PV &&
+                    frame.current_move != killers[frame.ply * 2]) {
+                    killers[frame.ply * 2 + 1] = killers[frame.ply * 2];
+                    killers[frame.ply * 2] = frame.current_move;
+                }
+                frame.rank = frame.move_count;
+            } else {
+                ++frame.rank;
+            }
+            continue;
+        }
+
+        if (!frame.entered) {
+            frame.entered = 1;
+            float immediate = 0.0f;
+            bool complete = false;
+            if (!ab_take_node(stats, node_budget, config)) {
+                immediate = 0.0f;
+                complete = true;
+            } else if (state.result != IN_PROGRESS) {
+                immediate = ab_terminal_value(state, frame.ply);
+                complete = true;
+            } else if (frame.depth <= 0) {
+                __syncwarp(__activemask());
+                immediate = ab_quiescence(
+                    state, frame.alpha, frame.beta, frame.ply, params,
+                    weights, node_budget, stats, config);
+                complete = true;
+            } else {
+                frame.alpha_start = frame.alpha;
+                frame.beta_start = frame.beta;
+                int tt_slot = (int)(frame.hash & (uint64_t)tt.mask);
+                if (tt.keys[tt_slot] == frame.hash) {
+                    frame.has_tt_move = 1;
+                    frame.tt_move = tt.moves[tt_slot];
+                    if ((int)tt.depths[tt_slot] >= frame.depth) {
+                        ++stats->tt_hits;
+                        float tt_value = tt.values[tt_slot];
+                        uint8_t tt_bound = tt.bounds[tt_slot];
+                        if (tt_bound == AB_TT_EXACT) {
+                            immediate = tt_value;
+                            complete = true;
+                        } else {
+                            if (tt_bound == AB_TT_LOWER) {
+                                frame.alpha = max(frame.alpha, tt_value);
+                            }
+                            if (tt_bound == AB_TT_UPPER) {
+                                frame.beta = min(frame.beta, tt_value);
+                            }
+                            if (frame.alpha >= frame.beta) {
+                                immediate = tt_value;
+                                complete = true;
+                            }
+                        }
+                    }
+                }
+                if (!complete) {
+                    frame.move_count = ab_generate_packed_moves(state, moves);
+                    if (frame.move_count <= 0) {
+                        __syncwarp(__activemask());
+                        immediate = ab_evaluate(state, params, weights);
+                        complete = true;
+                    } else {
+                        frame.rank = 0;
+                        frame.best = -AB_INF;
+                        frame.best_move = moves[0];
+                    }
+                }
+            }
+
+            if (complete) {
+                if (top == 0) return immediate;
+                --top;
+                returned = immediate;
+                returning = true;
+            }
+            continue;
+        }
+
+        if (frame.rank >= frame.move_count) {
+            uint8_t bound = AB_TT_EXACT;
+            if (frame.best <= frame.alpha_start) bound = AB_TT_UPPER;
+            else if (frame.best >= frame.beta_start) bound = AB_TT_LOWER;
+            ab_tt_store(
+                tt, frame.hash, frame.depth, frame.best, bound,
+                ab_unpack_move(frame.best_move));
+            float result = frame.best;
+            if (top == 0) return result;
+            --top;
+            returned = result;
+            returning = true;
+            continue;
+        }
+
+        ab_order_move_at_rank(
+            state, moves, frame.move_count, frame.rank, frame.ply, killers,
+            history, frame.has_tt_move ? frame.tt_move : AB_NO_MOVE);
+        frame.current_move = moves[frame.rank];
+        frame.phase = 0;
+        frame.reduction = (
+            frame.rank > 0 && frame.depth >= config.lmr_min_depth &&
+            frame.rank >= config.lmr_min_move
+        ) ? min(config.lmr_reduction, max(0, frame.depth - 1)) : 0;
+        if (frame.reduction) ++stats->lmr_reductions;
+
+        GPUMove move = ab_unpack_move(frame.current_move);
+        uint64_t child_hash = ab_make_move(
+            state, move, frame.hash, frame.undo);
+        int child_depth = frame.depth - 1 - frame.reduction;
+        float child_alpha = frame.rank == 0 ? -frame.beta :
+            -frame.alpha - AB_PVS_EPSILON;
+        float child_beta = frame.rank == 0 ? -frame.alpha : -frame.alpha;
+        if (top + 1 >= AB_MAX_PV) {
+            returned = ab_quiescence(
+                state, child_alpha, child_beta, frame.ply + 1, params,
+                weights, node_budget, stats, config);
+            returning = true;
+        } else {
+            ++top;
+            ab_init_explicit_frame(
+                frames[top], child_hash, child_depth, child_alpha,
+                child_beta, frame.ply + 1);
+        }
+    }
+    return 0.0f;
+}
+
+template <bool EXPLICIT_STACK>
+__device__ inline float ab_run_negamax(
+    HiveState& state, uint64_t hash, int depth, float alpha, float beta,
+    int ply, const float* params, const FNNWeights& weights,
+    int node_budget, ABStats* stats, const ABTT& tt,
+    const ABSearchConfig& config, ABPackedMove* killers, int* history,
+    ABExplicitFrame* frames, ABPackedMove* move_stack
+) {
+    if constexpr (EXPLICIT_STACK) {
+        return ab_negamax_explicit(
+            state, hash, depth, alpha, beta, ply, params, weights,
+            node_budget, stats, tt, config, killers, history, frames,
+            move_stack);
+    }
+    return ab_negamax(
+        state, hash, depth, alpha, beta, ply, params, weights, node_budget,
+        stats, tt, config, killers, history);
+}
+
 __device__ inline void ab_write_pv(
-    const HiveState& root, const GPUMove& root_move, int depth,
+    const HiveState& root, uint64_t root_hash,
+    const GPUMove& root_move, int depth,
     const ABTT& tt, GPUMove* out, int* out_length
 ) {
     int length = 0;
     HiveState state = root;
+    uint64_t hash = root_hash;
     GPUMove move = root_move;
     for (int ply = 0; ply < depth && ply < AB_MAX_PV; ++ply) {
         GPUMove legal[MAX_LEGAL_MOVES];
@@ -536,17 +1090,18 @@ __device__ inline void ab_write_pv(
         }
         if (!found) break;
         out[length++] = move;
-        apply_move(state, move);
+        ABUndo undo;
+        hash = ab_make_move(state, move, hash, undo);
         if (state.result != IN_PROGRESS) break;
 
-        uint64_t key = ab_hash_state(state);
-        int slot = (int)(key & (uint64_t)tt.mask);
-        if (tt.keys[slot] != key) break;
-        move = tt.moves[slot];
+        int slot = (int)(hash & (uint64_t)tt.mask);
+        if (tt.keys[slot] != hash) break;
+        move = ab_unpack_move(tt.moves[slot]);
     }
     *out_length = length;
 }
 
+template <bool EXPLICIT_STACK>
 __global__ void fnn_alphabeta_kernel(
     const HiveState* states, const float* params, int hidden_dim, int embed_dim,
     int action_hidden, const float* search_config_values, int node_budget,
@@ -554,12 +1109,15 @@ __global__ void fnn_alphabeta_kernel(
     float* out_values, int* out_stats, float* out_raw_values,
     GPUMove* out_root_moves, int* out_num_legal, float* out_root_scores,
     uint8_t* out_root_bounds, int* out_selected_indices,
-    GPUMove* out_pv_moves, int* out_pv_lengths,
     uint64_t* tt_keys, float* tt_values, int16_t* tt_depths,
-    uint8_t* tt_bounds, GPUMove* tt_moves, int tt_entries, int batch_size
+    uint8_t* tt_bounds, ABPackedMove* tt_moves,
+    float* order_workspace, float* iteration_value_workspace,
+    uint8_t* iteration_bound_workspace, ABPackedMove* killer_workspace,
+    int* history_workspace, ABExplicitFrame* frame_workspace,
+    ABPackedMove* move_stack_workspace, int tt_entries, int batch_size
 ) {
-    int game = blockIdx.x;
-    if (game >= batch_size || threadIdx.x != 0) return;
+    int game = blockIdx.x * blockDim.x + threadIdx.x;
+    if (game >= batch_size) return;
     FNNWeights weights = make_fnn_weights(hidden_dim, embed_dim, action_hidden);
     ABSearchConfig config = ab_make_search_config(search_config_values);
     ABTT tt = {
@@ -571,15 +1129,14 @@ __global__ void fnn_alphabeta_kernel(
         tt_entries - 1,
     };
     HiveState root = states[game];
-    GPUMove root_moves[MAX_LEGAL_MOVES];
-    int n = generate_legal_moves(root, root_moves);
+    uint64_t root_hash = ab_hash_state(root);
     int root_offset = game * MAX_LEGAL_MOVES;
-    int pv_offset = game * AB_MAX_PV;
+    GPUMove* root_moves = out_root_moves + root_offset;
+    MovegenStateCache root_cache;
+    int n = generate_legal_moves_with_cache(root, root_moves, root_cache);
     out_num_legal[game] = n;
-    out_raw_values[game] = ab_evaluate(root, params, weights);
-    for (int i = 0; i < n; ++i) {
-        out_root_moves[root_offset + i] = root_moves[i];
-    }
+    out_raw_values[game] = ab_evaluate_with_moves_and_ap(
+        root, root_moves, n, root_cache.ap_mask, params, weights);
     if (n <= 0) return;
     float branch_scale = 1.0f + config.branching_allocation *
         ((float)n / 24.0f - 1.0f);
@@ -587,9 +1144,11 @@ __global__ void fnn_alphabeta_kernel(
     int search_node_budget = max(1, (int)(node_budget * branch_scale));
     Color root_player = current_player(root);
     for (int i = 0; i < n; ++i) {
-        HiveState child = root;
-        apply_move(child, root_moves[i]);
-        if (ab_color_won(child, root_player)) {
+        ABUndo undo;
+        ab_make_move(root, root_moves[i], root_hash, undo);
+        bool immediate_win = ab_color_won(root, root_player);
+        ab_unmake_move(root, undo);
+        if (immediate_win) {
             out_moves[game] = root_moves[i];
             out_values[game] = AB_MATE - 0.01f;
             int* game_stats = out_stats + game * 9;
@@ -601,35 +1160,38 @@ __global__ void fnn_alphabeta_kernel(
             out_root_scores[root_offset + i] = AB_MATE - 0.01f;
             out_root_bounds[root_offset + i] = AB_TT_EXACT;
             out_selected_indices[game] = i;
-            out_pv_moves[pv_offset] = root_moves[i];
-            out_pv_lengths[game] = 1;
             return;
         }
     }
 
-    float policy_scores[MAX_LEGAL_MOVES];
-    float previous_values[MAX_LEGAL_MOVES];
+    float* order_scores = order_workspace + root_offset;
+    float* iteration_values = iteration_value_workspace + root_offset;
+    uint8_t* iteration_bounds = iteration_bound_workspace + root_offset;
+    ABPackedMove* killers = killer_workspace + game * AB_MAX_PV * 2;
+    int* history = history_workspace + game * AB_HISTORY_SIZE;
+    ABExplicitFrame* frames = frame_workspace + game * AB_MAX_PV;
+    ABPackedMove* move_stack = move_stack_workspace +
+        (int64_t)game * AB_MAX_PV * MAX_LEGAL_MOVES;
     ab_policy_scores(
-        root, root_moves, n, params, weights, config, policy_scores);
+        root, root_moves, n, params, weights, config,
+        root_cache.ap_mask, order_scores);
     GPUMove best_move = root_moves[0];
     float best_value = out_raw_values[game];
     int best_index = 0;
     int completed = 0;
     ABStats stats = {};
     root_exact_count = max(1, min(root_exact_count, n));
-    for (int i = 0; i < n; ++i) {
-        previous_values[i] = policy_scores[i];
-    }
 
     for (int depth = 1; depth <= max_depth; ++depth) {
-        float scores[MAX_LEGAL_MOVES];
-        float iteration_values[MAX_LEGAL_MOVES];
-        uint8_t iteration_bounds[MAX_LEGAL_MOVES];
         for (int i = 0; i < n; ++i) {
             // Once a depth completes, its root values are substantially better
             // MultiPV ordering signals than the policy prior.
-            scores[i] = completed > 0 ? previous_values[i] : policy_scores[i];
-            if (ab_move_equal(root_moves[i], best_move)) scores[i] = 1e30f;
+            if (completed > 0) {
+                order_scores[i] = out_root_scores[root_offset + i];
+                if (ab_move_equal(root_moves[i], best_move)) {
+                    order_scores[i] = 1e30f;
+                }
+            }
             iteration_values[i] = 0.0f;
             iteration_bounds[i] = AB_TT_EMPTY;
         }
@@ -641,14 +1203,15 @@ __global__ void fnn_alphabeta_kernel(
             int index = -1;
             float ordering_score = -1e30f;
             for (int i = 0; i < n; ++i) {
-                if (scores[i] > ordering_score) {
-                    ordering_score = scores[i];
+                if (order_scores[i] > ordering_score) {
+                    ordering_score = order_scores[i];
                     index = i;
                 }
             }
-            scores[index] = -1e30f;
-            HiveState child = root;
-            apply_move(child, root_moves[index]);
+            order_scores[index] = -1e30f;
+            ABUndo undo;
+            uint64_t child_hash = ab_make_move(
+                root, root_moves[index], root_hash, undo);
 
             float child_value;
             uint8_t root_bound = AB_TT_EXACT;
@@ -661,32 +1224,36 @@ __global__ void fnn_alphabeta_kernel(
                 if (use_aspiration) {
                     float low = best_value - config.aspiration_window;
                     float high = best_value + config.aspiration_window;
-                    child_value = -ab_negamax(
-                        child, depth - 1, -high, -low, 1, params, weights,
-                        search_node_budget, &stats, tt, config);
+                    child_value = -ab_run_negamax<EXPLICIT_STACK>(
+                        root, child_hash, depth - 1, -high, -low, 1,
+                        params, weights, search_node_budget, &stats, tt,
+                        config, killers, history, frames, move_stack);
                     if (!stats.aborted &&
                         (child_value <= low || child_value >= high)) {
                         ++stats.pvs_researches;
-                        child_value = -ab_negamax(
-                            child, depth - 1, -AB_INF, AB_INF, 1,
+                        child_value = -ab_run_negamax<EXPLICIT_STACK>(
+                            root, child_hash, depth - 1, -AB_INF, AB_INF, 1,
                             params, weights, search_node_budget, &stats, tt,
-                            config);
+                            config, killers, history, frames, move_stack);
                     }
                 } else {
-                    child_value = -ab_negamax(
-                        child, depth - 1, -AB_INF, AB_INF, 1,
+                    child_value = -ab_run_negamax<EXPLICIT_STACK>(
+                        root, child_hash, depth - 1, -AB_INF, AB_INF, 1,
                         params, weights, search_node_budget, &stats, tt,
-                        config);
+                        config, killers, history, frames, move_stack);
                 }
             } else {
-                child_value = -ab_negamax(
-                    child, depth - 1, -alpha - AB_PVS_EPSILON, -alpha, 1,
-                    params, weights, search_node_budget, &stats, tt, config);
+                child_value = -ab_run_negamax<EXPLICIT_STACK>(
+                    root, child_hash, depth - 1,
+                    -alpha - AB_PVS_EPSILON, -alpha, 1, params, weights,
+                    search_node_budget, &stats, tt, config, killers, history,
+                    frames, move_stack);
                 if (!stats.aborted && child_value > alpha) {
                     ++stats.pvs_researches;
-                    child_value = -ab_negamax(
-                        child, depth - 1, -AB_INF, -alpha, 1, params, weights,
-                        search_node_budget, &stats, tt, config);
+                    child_value = -ab_run_negamax<EXPLICIT_STACK>(
+                        root, child_hash, depth - 1, -AB_INF, -alpha, 1,
+                        params, weights, search_node_budget, &stats, tt,
+                        config, killers, history, frames, move_stack);
                     root_bound = AB_TT_EXACT;
                 } else {
                     // A failed root scout proves only that this move cannot
@@ -694,6 +1261,7 @@ __global__ void fnn_alphabeta_kernel(
                     root_bound = AB_TT_UPPER;
                 }
             }
+            ab_unmake_move(root, undo);
             if (stats.aborted) break;
             iteration_values[index] = child_value;
             iteration_bounds[index] = root_bound;
@@ -710,14 +1278,10 @@ __global__ void fnn_alphabeta_kernel(
         best_index = move_index;
         completed = depth;
         for (int i = 0; i < n; ++i) {
-            previous_values[i] = iteration_values[i];
             out_root_scores[root_offset + i] = iteration_values[i];
             out_root_bounds[root_offset + i] = iteration_bounds[i];
         }
         out_selected_indices[game] = best_index;
-        ab_write_pv(
-            root, best_move, completed, tt,
-            out_pv_moves + pv_offset, out_pv_lengths + game);
         if (completed >= config.early_stop_min_depth &&
             fabsf(value) >= config.early_stop_score) {
             break;
@@ -736,6 +1300,31 @@ __global__ void fnn_alphabeta_kernel(
     game_stats[6] = stats.qnodes;
     game_stats[7] = stats.forced_win_probes;
     game_stats[8] = stats.tactical_moves;
+}
+
+__global__ void fnn_alphabeta_pv_kernel(
+    const HiveState* states, const GPUMove* best_moves, const int* stats,
+    const uint64_t* tt_keys, const float* tt_values,
+    const int16_t* tt_depths, const uint8_t* tt_bounds,
+    const ABPackedMove* tt_moves, int tt_entries, GPUMove* out_pv_moves,
+    int* out_pv_lengths, int batch_size
+) {
+    int game = blockIdx.x * blockDim.x + threadIdx.x;
+    if (game >= batch_size) return;
+    ABTT tt = {
+        const_cast<uint64_t*>(tt_keys + (int64_t)game * tt_entries),
+        const_cast<float*>(tt_values + (int64_t)game * tt_entries),
+        const_cast<int16_t*>(tt_depths + (int64_t)game * tt_entries),
+        const_cast<uint8_t*>(tt_bounds + (int64_t)game * tt_entries),
+        const_cast<ABPackedMove*>(tt_moves + (int64_t)game * tt_entries),
+        tt_entries - 1,
+    };
+    int depth = max(0, min(stats[game * 9], AB_MAX_PV));
+    if (depth == 0) return;
+    HiveState root = states[game];
+    ab_write_pv(
+        root, ab_hash_state(root), best_moves[game], depth, tt,
+        out_pv_moves + game * AB_MAX_PV, out_pv_lengths + game);
 }
 
 #endif

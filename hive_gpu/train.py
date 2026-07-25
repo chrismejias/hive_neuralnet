@@ -50,7 +50,6 @@ try:
 except ImportError:
     GNNNetConfig = None  # type: ignore[assignment,misc]
     HiveGNN = None       # type: ignore[assignment,misc]
-from archive.legacy_transformer.hive_transformer.transformer_net import TransformerConfig, HiveTransformer
 from hive_gpu.gpu_trainer import GPUTrainConfig, GPUTrainer
 
 
@@ -398,13 +397,15 @@ def _get_net_config_and_class(args: argparse.Namespace):
     """Return (net_config, net_class) preset based on --encoder-type and --model-size."""
     predict_uncertainty = args.predict_uncertainty
     if args.encoder_type == "transformer":
-        cfg = TransformerConfig.large() if args.model_size == "large" else TransformerConfig.small()
-        cfg.predict_uncertainty = predict_uncertainty
-        return cfg, HiveTransformer
-    else:
-        cfg = GNNNetConfig.large() if args.model_size == "large" else GNNNetConfig.small()
-        cfg.predict_uncertainty = predict_uncertainty
-        return cfg, HiveGNN
+        raise RuntimeError(
+            "The legacy transformer trainer has been retired; "
+            "use hive_fnn_transformer.train_fnn_transformer instead"
+        )
+    if GNNNetConfig is None or HiveGNN is None:
+        raise RuntimeError("GNN model support is not installed")
+    cfg = GNNNetConfig.large() if args.model_size == "large" else GNNNetConfig.small()
+    cfg.predict_uncertainty = predict_uncertainty
+    return cfg, HiveGNN
 
 
 def main(argv: list[str] | None = None) -> None:

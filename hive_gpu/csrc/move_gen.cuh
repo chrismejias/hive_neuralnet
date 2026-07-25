@@ -821,6 +821,8 @@ __device__ inline bool has_queen_escape_move(const HiveState& s) {
 }
 
 __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out);
+__device__ inline int generate_legal_moves_with_cache(
+    const HiveState& s, GPUMove* out, MovegenStateCache& cache);
 
 __device__ __forceinline__ int queen_surround_count_for_color_device(
     const HiveState& s,
@@ -1148,7 +1150,9 @@ __device__ inline int find_placement_positions(const HiveState& s, Color color,
  * @param out  Output array for moves (max MAX_LEGAL_MOVES)
  * @return     Number of legal moves generated
  */
-__device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
+__device__ inline int generate_legal_moves_impl(
+    const HiveState& s, GPUMove* out, MovegenStateCache* supplied_cache
+) {
     if (s.result != IN_PROGRESS) return 0;
     mgp_add(MGP_CALLS, 1);
 
@@ -1213,8 +1217,10 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
     // ── Movement moves (only if queen is placed) ────────────────
 
     if (is_queen_placed(s, color)) {
-        MovegenStateCache cache;
-        init_movegen_state_cache(s, cache);
+        MovegenStateCache local_cache;
+        MovegenStateCache& cache = supplied_cache != nullptr ?
+            *supplied_cache : local_cache;
+        if (supplied_cache == nullptr) init_movegen_state_cache(s, cache);
 
         const Bitboard& my_pieces = (color == WHITE) ? s.white_top : s.black_top;
 
@@ -1359,16 +1365,25 @@ __device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
     return count;
 }
 
+__device__ inline int generate_legal_moves(const HiveState& s, GPUMove* out) {
+    return generate_legal_moves_impl(s, out, nullptr);
+}
+
+__device__ inline int generate_legal_moves_with_cache(
+    const HiveState& s, GPUMove* out, MovegenStateCache& cache
+) {
+    init_movegen_state_cache(s, cache);
+    return generate_legal_moves_impl(s, out, &cache);
+}
+
 __device__ __forceinline__ void emit_fnn_move_flag(
     const HiveState& s, GPUMove* out, int& count,
-    uint32_t& seen_flags, PieceType pt, int from_cell
+    Bitboard& seen_sources, PieceType pt, int from_cell
 ) {
     int src_h = s.height[from_cell];
     if (src_h <= 0) return;
-    Color owner = cell_color(s.pieces[src_h - 1][from_cell]);
-    int bit = ((int)pt - 1) * 2 + (int)owner;
-    if (seen_flags & (1u << bit)) return;
-    seen_flags |= (1u << bit);
+    if (seen_sources.get(from_cell)) return;
+    seen_sources.set(from_cell);
     out[count].type = MOVE_MOVE;
     out[count].piece_type = pt;
     out[count].from_cell = (uint16_t)from_cell;
@@ -1378,7 +1393,7 @@ __device__ __forceinline__ void emit_fnn_move_flag(
 
 __device__ inline void summarize_pillbug_throws_for_fnn(
     const HiveState& s, int pb_cell, const MovegenStateCache& cache,
-    GPUMove* out, int& count, uint32_t& seen_flags
+    GPUMove* out, int& count, Bitboard& seen_sources
 ) {
     int pb_height = s.height[pb_cell];
 
@@ -1403,7 +1418,8 @@ __device__ inline void summarize_pillbug_throws_for_fnn(
             if (elevated_gate_blocked(s, pb_cell, dd, drop_h)) continue;
 
             PieceType thrown_pt = top_piece_type_at(s, target_cell);
-            emit_fnn_move_flag(s, out, count, seen_flags, thrown_pt, target_cell);
+            emit_fnn_move_flag(
+                s, out, count, seen_sources, thrown_pt, target_cell);
             break;
         }
     }
@@ -1411,9 +1427,11 @@ __device__ inline void summarize_pillbug_throws_for_fnn(
 
 /**
  * Generate a compact move list that preserves the FNN legal-move features:
- * unique placement destinations and one MOVE per movable piece type/color.
+ * unique placement destinations and one MOVE per distinct movable source.
  */
-__device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* out) {
+__device__ inline int generate_fnn_feature_moves_impl(
+    const HiveState& s, GPUMove* out, MovegenStateCache* supplied_cache
+) {
     if (s.result != IN_PROGRESS) return 0;
 
     Color color = current_player(s);
@@ -1465,9 +1483,12 @@ __device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* ou
         return count;
     }
 
-    MovegenStateCache cache;
-    init_movegen_state_cache(s, cache);
-    uint32_t seen_flags = 0;
+    MovegenStateCache local_cache;
+    MovegenStateCache& cache = supplied_cache != nullptr ?
+        *supplied_cache : local_cache;
+    if (supplied_cache == nullptr) init_movegen_state_cache(s, cache);
+    Bitboard seen_sources;
+    seen_sources.clear();
     const Bitboard& my_pieces = (color == WHITE) ? s.white_top : s.black_top;
 
     for (int wi = 0; wi < BB_WORDS && count < MAX_LEGAL_MOVES; wi++) {
@@ -1482,9 +1503,6 @@ __device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* ou
 
             bool has_move = false;
             PieceType pt = top_piece_type_at(s, cell);
-            int flag_bit = ((int)pt - 1) * 2 + (int)color;
-            if (seen_flags & (1u << flag_bit)) continue;
-
             switch (pt) {
                 case PT_QUEEN:
                     has_move = has_queen_move(s, cell);
@@ -1517,7 +1535,7 @@ __device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* ou
                     break;
             }
             if (has_move) {
-                emit_fnn_move_flag(s, out, count, seen_flags, pt, cell);
+                emit_fnn_move_flag(s, out, count, seen_sources, pt, cell);
             }
         }
     }
@@ -1532,7 +1550,8 @@ __device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* ou
 
             PieceType pt = top_piece_type_at(s, cell);
             if (pt == PT_PILLBUG) {
-                summarize_pillbug_throws_for_fnn(s, cell, cache, out, count, seen_flags);
+                summarize_pillbug_throws_for_fnn(
+                    s, cell, cache, out, count, seen_sources);
             }
             if (pt == PT_MOSQUITO && s.height[cell] == 1) {
                 bool adj_pillbug = false;
@@ -1546,7 +1565,7 @@ __device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* ou
                 }
                 if (adj_pillbug) {
                     summarize_pillbug_throws_for_fnn(
-                        s, cell, cache, out, count, seen_flags);
+                        s, cell, cache, out, count, seen_sources);
                 }
             }
         }
@@ -1560,6 +1579,25 @@ __device__ inline int generate_fnn_feature_moves(const HiveState& s, GPUMove* ou
         return 1;
     }
     return count;
+}
+
+__device__ inline int generate_fnn_feature_moves(
+    const HiveState& s, GPUMove* out
+) {
+    return generate_fnn_feature_moves_impl(s, out, nullptr);
+}
+
+__device__ inline int generate_fnn_feature_moves_with_cache(
+    const HiveState& s, GPUMove* out, MovegenStateCache& cache
+) {
+    init_movegen_state_cache(s, cache);
+    return generate_fnn_feature_moves_impl(s, out, &cache);
+}
+
+__device__ inline int generate_fnn_feature_moves_from_cache(
+    const HiveState& s, GPUMove* out, MovegenStateCache& cache
+) {
+    return generate_fnn_feature_moves_impl(s, out, &cache);
 }
 
 #endif  // __CUDACC__

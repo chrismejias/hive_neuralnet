@@ -5,7 +5,7 @@
  * bypassing the full encode_states_batch pipeline (no per-node features,
  * no edges, no graph construction).
  *
- * Feature layout (FNN_FEAT_DIM = 124):
+ * Feature layout (FNN_FEAT_DIM = 140):
  *   [0:16]   count_on_board    — visible top pieces per type(8) × color(2)
  *   [16:32]  count_in_hand     — hand piece counts per type(8) × color(2)
  *   [32:48]  queen_neighbors   — top pieces adjacent to opponent queen, per type(8) × color(2)
@@ -23,9 +23,13 @@
  *   [108:110] throwable_opp    — own-color pieces adjacent to opposing pillbug-capable cell (threatened), per color(2)
  *   [110:116] white_q_surround — one-hot surround count buckets 1..6 for white queen
  *   [116:122] black_q_surround — one-hot surround count buckets 1..6 for black queen
- *   [122:124] own_q_throwable  — own queen could be legally thrown by own
- *                                pillbug/mosquito actor if it were that
- *                                color's turn, per color(2)
+ *   [122:128] sufficient_material — insufficient/exact/surplus free attackers,
+ *                                   per color(2) × bucket(3)
+ *   [128:134] queen_escape     — no relief/exactly 1/at least 2 fewer occupied
+ *                                queen neighbors, per color(2) × bucket(3)
+ *   [134:140] queen_ring_access — zero/one/multiple distinct free pieces that
+ *                                 can enter an empty opposing queen-ring cell,
+ *                                 per color(2) × bucket(3)
  *
  * Must be included from game_logic.cu (needs NEIGHBORS constant memory).
  */
@@ -39,60 +43,11 @@
 
 namespace hive_gpu {
 
-constexpr int FNN_FEAT_DIM = 124;
+constexpr int FNN_FEAT_DIM = 140;
 // Draw is at move 200 in standard Hive
 constexpr int DRAW_MOVE_LIMIT = 200;
 
 #ifdef __CUDACC__
-
-__device__ inline bool can_be_thrown_by_color(
-    const HiveState& s, int cell,
-    const Bitboard& ap_mask, Color thrower
-) {
-    if (s.height[cell] != 1) return false;
-    if (is_pinned(s, ap_mask, cell)) return false;
-    if (is_stunned_cell(s, cell)) return false;
-
-    for (int d = 0; d < NUM_DIRS; d++) {
-        int16_t pb_cell = NEIGHBORS[cell][d];
-        if (pb_cell < 0 || !s.occupied.get(pb_cell)) continue;
-
-        Color top_c = top_piece_color_at(s, pb_cell);
-        if (top_c != thrower) continue;
-
-        PieceType pb_pt = top_piece_type_at(s, pb_cell);
-        bool is_pillbug_actor = false;
-        if (pb_pt == PT_PILLBUG) {
-            is_pillbug_actor = true;
-        } else if (pb_pt == PT_MOSQUITO && s.height[pb_cell] == 1) {
-            for (int d2 = 0; d2 < NUM_DIRS; d2++) {
-                int16_t nb2 = NEIGHBORS[pb_cell][d2];
-                if (nb2 >= 0 && s.occupied.get(nb2) &&
-                    top_piece_type_at(s, nb2) == PT_PILLBUG) {
-                    is_pillbug_actor = true;
-                    break;
-                }
-            }
-        }
-        if (!is_pillbug_actor) continue;
-
-        int pb_height = s.height[pb_cell];
-        int lift_h = max(s.height[cell] - 1, pb_height);
-        int opp_d = find_direction(cell, pb_cell);
-        if (opp_d < 0) continue;
-        if (elevated_gate_blocked(s, cell, opp_d, lift_h)) continue;
-
-        for (int dd = 0; dd < NUM_DIRS; dd++) {
-            int16_t dest = NEIGHBORS[pb_cell][dd];
-            if (dest < 0 || dest == cell || s.occupied.get(dest)) continue;
-            int drop_h = max(pb_height, 0);
-            if (!elevated_gate_blocked(s, pb_cell, dd, drop_h)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
 
 __device__ __forceinline__ int hex_distance(int cell_a, int cell_b) {
     // Axial coordinates
@@ -113,15 +68,176 @@ __device__ __forceinline__ int hex_distance(int cell_a, int cell_b) {
     return mx;
 }
 
+__device__ __forceinline__ bool feature_adjacent_to(
+    int cell, uint16_t target
+) {
+    if (cell < 0 || cell >= NUM_CELLS || target == 0xFFFF) return false;
+    for (int d = 0; d < NUM_DIRS; ++d) {
+        if (NEIGHBORS[cell][d] == (int16_t)target) return true;
+    }
+    return false;
+}
+
+__device__ __forceinline__ int feature_queen_relief(
+    const HiveState& s, Color color, int source, int destination,
+    PieceType moving_type, int baseline_surround
+) {
+    uint16_t queen = s.queen_cell[(int)color];
+    if (queen == 0xFFFF || baseline_surround <= 0) return 0;
+
+    if (source == (int)queen && moving_type == PT_QUEEN) {
+        int next_surround = 0;
+        for (int d = 0; d < NUM_DIRS; ++d) {
+            int16_t neighbor = NEIGHBORS[destination][d];
+            if (neighbor < 0 || neighbor == source) continue;
+            if (s.occupied.get(neighbor)) ++next_surround;
+        }
+        return max(0, baseline_surround - next_surround);
+    }
+
+    int relief = 0;
+    if (s.height[source] == 1 && feature_adjacent_to(source, queen)) {
+        ++relief;
+    }
+    if (!s.occupied.get(destination) &&
+        feature_adjacent_to(destination, queen)) {
+        --relief;
+    }
+    return max(0, relief);
+}
+
+__device__ inline int feature_piece_destinations(
+    const HiveState& s, int cell, PieceType type,
+    Bitboard& base_perimeter, bool& base_perimeter_ready,
+    uint16_t* destinations
+) {
+    switch (type) {
+        case PT_QUEEN:
+            return gen_queen_moves(s, cell, destinations);
+        case PT_ANT:
+            if (!base_perimeter_ready) {
+                build_empty_perimeter_mask(s.occupied, base_perimeter);
+                base_perimeter_ready = true;
+            }
+            return gen_ant_moves_with_perimeter(
+                s, cell, base_perimeter, destinations, MAX_ANT_DESTS);
+        case PT_GRASSHOPPER:
+            return gen_grasshopper_moves(s, cell, destinations);
+        case PT_SPIDER:
+            return gen_spider_moves(s, cell, destinations);
+        case PT_BEETLE:
+            return gen_beetle_moves(s, cell, destinations);
+        case PT_MOSQUITO:
+            return gen_mosquito_moves(
+                s, cell, destinations, &base_perimeter,
+                &base_perimeter_ready);
+        case PT_LADYBUG:
+            return gen_ladybug_moves(s, cell, destinations);
+        case PT_PILLBUG:
+            return gen_pillbug_moves(s, cell, destinations);
+        default:
+            return 0;
+    }
+}
+
+__device__ inline bool feature_piece_has_move(
+    const HiveState& s, int cell, PieceType type,
+    Bitboard& base_perimeter, bool& base_perimeter_ready
+) {
+    switch (type) {
+        case PT_QUEEN:
+            return has_queen_move(s, cell);
+        case PT_ANT:
+            if (!base_perimeter_ready) {
+                build_empty_perimeter_mask(s.occupied, base_perimeter);
+                base_perimeter_ready = true;
+            }
+            return has_ant_move_with_perimeter(
+                s, cell, base_perimeter);
+        case PT_GRASSHOPPER:
+            return has_grasshopper_move(s, cell);
+        case PT_SPIDER:
+            return has_spider_move(s, cell);
+        case PT_BEETLE:
+            return has_beetle_move(s, cell);
+        case PT_MOSQUITO:
+            return has_mosquito_move(
+                s, cell, &base_perimeter, &base_perimeter_ready);
+        case PT_LADYBUG:
+            return has_ladybug_move(s, cell);
+        case PT_PILLBUG:
+            return has_pillbug_move(s, cell);
+        default:
+            return false;
+    }
+}
+
+__device__ inline void feature_ant_tactical_reach(
+    const HiveState& s, int source, const Bitboard& perimeter,
+    bool need_ring_access, uint16_t enemy_queen,
+    bool need_relief, uint16_t own_queen,
+    bool& has_ring_access, int& max_relief
+) {
+    Bitboard occupied = s.occupied;
+    occupied.clr(source);
+    Bitboard visited;
+    visited.clear();
+    visited.set(source);
+    uint16_t queue[MAX_ANT_DESTS];
+    int read = 0;
+    int written = 0;
+
+    for (int d = 0; d < NUM_DIRS && written < MAX_ANT_DESTS; ++d) {
+        if (!can_slide_ant_occ(
+                occupied, perimeter, source, d)) {
+            continue;
+        }
+        int16_t destination = SLIDE_FLANKS[source][d][0];
+        if (!visited.get(destination)) {
+            visited.set(destination);
+            queue[written++] = (uint16_t)destination;
+        }
+    }
+
+    while (read < written) {
+        int destination = (int)queue[read++];
+        if (need_ring_access &&
+            feature_adjacent_to(destination, enemy_queen)) {
+            has_ring_access = true;
+        }
+        if (need_relief &&
+            !feature_adjacent_to(destination, own_queen)) {
+            max_relief = max(max_relief, 1);
+        }
+        if ((!need_ring_access || has_ring_access) &&
+            (!need_relief || max_relief >= 1)) {
+            return;
+        }
+
+        for (int d = 0; d < NUM_DIRS && written < MAX_ANT_DESTS; ++d) {
+            if (!can_slide_ant_occ(
+                    occupied, perimeter, destination, d)) {
+                continue;
+            }
+            int16_t next = SLIDE_FLANKS[destination][d][0];
+            if (!visited.get(next)) {
+                visited.set(next);
+                queue[written++] = (uint16_t)next;
+            }
+        }
+    }
+}
+
 /**
  * Device function: extract FNN features for a single game state.
  *
  * Can be called from any kernel (selfplay, batch feature extraction, etc.).
  */
-__device__ inline void extract_fnn_features_device(
+__device__ inline void extract_fnn_features_with_ap_device(
     const HiveState& s,
     const GPUMove* my_moves,   // legal moves for this state
     int n_legal,               // number of legal moves
+    const Bitboard& ap_mask,
     float* f                   // [FNN_FEAT_DIM] output
 ) {
     // Zero output
@@ -145,23 +261,42 @@ __device__ inline void extract_fnn_features_device(
     opp_queen[0] = s.queen_cell[1];  // white's opponent is black's queen
     opp_queen[1] = s.queen_cell[0];  // black's opponent is white's queen
     int queen_surround_counts[2] = {0, 0};
-
-    Bitboard ap_mask = find_articulation_points(s);
+    for (int c = 0; c < 2; ++c) {
+        uint16_t queen = s.queen_cell[c];
+        if (queen != 0xFFFF) {
+            queen_surround_counts[c] =
+                num_occupied_neighbors(s, (int)queen);
+        }
+    }
 
     constexpr int PB_CELLS_PER_COLOR = 8;   // generous; real games see <= 2
     uint16_t pb_cells[2][PB_CELLS_PER_COLOR];
     int      pb_count[2] = {0, 0};
+    Bitboard sufficient_sources[2];
+    Bitboard ring_access_sources[2];
+    sufficient_sources[0].clear();
+    sufficient_sources[1].clear();
+    ring_access_sources[0].clear();
+    ring_access_sources[1].clear();
+    int max_queen_relief[2] = {0, 0};
+    Bitboard feature_perimeter;
+    bool feature_perimeter_ready = false;
 
-    for (int cell = 0; cell < NUM_CELLS; cell++) {
-        int h = s.height[cell];
-        if (h == 0) continue;
+    for (int wi = 0; wi < BB_WORDS; ++wi) {
+        uint64_t occupied = s.occupied.w[wi];
+        while (occupied) {
+            int bit = __ffsll(occupied) - 1;
+            int cell = wi * 64 + bit;
+            occupied &= occupied - 1;
+            if (cell >= NUM_CELLS) continue;
+            int h = s.height[cell];
 
-        // Top piece
-        uint8_t top = s.pieces[h - 1][cell];
-        PieceType pt = cell_piece_type(top);
-        Color pc = cell_color(top);
-        int type_idx = (int)pt - 1;  // 0-indexed
-        int tc_idx = type_idx * 2 + (int)pc;  // type×color index
+            // Top piece
+            uint8_t top = s.pieces[h - 1][cell];
+            PieceType pt = cell_piece_type(top);
+            Color pc = cell_color(top);
+            int type_idx = (int)pt - 1;  // 0-indexed
+            int tc_idx = type_idx * 2 + (int)pc;  // type×color index
 
         // count_on_board
         f[tc_idx] += 1.0f;
@@ -185,20 +320,6 @@ __device__ inline void extract_fnn_features_device(
                 int16_t nb = NEIGHBORS[cell][d];
                 if (nb >= 0 && (uint16_t)nb == opp_q) {
                     f[32 + tc_idx] += 1.0f;
-                    break;
-                }
-            }
-        }
-
-        // Queen surround counts for both queens. This is fused into the main
-        // occupied-top-piece pass so we do not need a second neighborhood scan.
-        for (int qc = 0; qc < 2; qc++) {
-            uint16_t qcell = s.queen_cell[qc];
-            if (qcell == 0xFFFF) continue;
-            for (int d = 0; d < NUM_DIRS; d++) {
-                int16_t nb = NEIGHBORS[(int)qcell][d];
-                if (nb >= 0 && (uint16_t)nb == (uint16_t)cell) {
-                    queen_surround_counts[qc] += 1;
                     break;
                 }
             }
@@ -242,10 +363,71 @@ __device__ inline void extract_fnn_features_device(
                 }
             }
         }
-        if (is_capable) {
-            f[104 + (int)pc] = 1.0f;
-            if (pb_count[(int)pc] < PB_CELLS_PER_COLOR) {
-                pb_cells[(int)pc][pb_count[(int)pc]++] = (uint16_t)cell;
+            if (is_capable) {
+                f[104 + (int)pc] = 1.0f;
+                if (pb_count[(int)pc] < PB_CELLS_PER_COLOR) {
+                    pb_cells[(int)pc][pb_count[(int)pc]++] = (uint16_t)cell;
+                }
+            }
+
+            // One pass over each visible piece supplies both players' exact
+            // normal-move mobility, immediate ring access, and queen relief.
+            if (s.result == IN_PROGRESS && is_queen_placed(s, pc) &&
+                !is_stunned_cell(s, cell) &&
+                !is_pinned(s, ap_mask, cell)) {
+                uint16_t enemy_queen = opp_queen[(int)pc];
+                bool free_attacker =
+                    enemy_queen != 0xFFFF &&
+                    !feature_adjacent_to(cell, enemy_queen);
+                bool has_normal_move = feature_piece_has_move(
+                    s, cell, pt, feature_perimeter,
+                    feature_perimeter_ready);
+                if (has_normal_move && free_attacker) {
+                    sufficient_sources[(int)pc].set(cell);
+                }
+
+                uint16_t own_queen = s.queen_cell[(int)pc];
+                bool can_change_own_ring =
+                    (cell == (int)own_queen && pt == PT_QUEEN) ||
+                    (s.height[cell] == 1 &&
+                     feature_adjacent_to(cell, own_queen));
+                if (has_normal_move &&
+                    (free_attacker || can_change_own_ring)) {
+                    if (pt == PT_ANT) {
+                        bool ant_ring_access = false;
+                        feature_ant_tactical_reach(
+                            s, cell, feature_perimeter,
+                            free_attacker, enemy_queen,
+                            can_change_own_ring, own_queen,
+                            ant_ring_access,
+                            max_queen_relief[(int)pc]);
+                        if (ant_ring_access) {
+                            ring_access_sources[(int)pc].set(cell);
+                        }
+                        continue;
+                    }
+                    uint16_t destinations[MAX_ANT_DESTS];
+                    int n_destinations = feature_piece_destinations(
+                        s, cell, pt, feature_perimeter,
+                        feature_perimeter_ready, destinations);
+                    for (int di = 0; di < n_destinations; ++di) {
+                        int destination = (int)destinations[di];
+                        if (free_attacker &&
+                            !s.occupied.get(destination) &&
+                            feature_adjacent_to(
+                                destination, enemy_queen)) {
+                            ring_access_sources[(int)pc].set(cell);
+                        }
+                        if (can_change_own_ring) {
+                            int relief = feature_queen_relief(
+                                s, pc, cell, destination, pt,
+                                queen_surround_counts[(int)pc]);
+                            if (relief > max_queen_relief[(int)pc]) {
+                                max_queen_relief[(int)pc] = relief;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -271,13 +453,13 @@ __device__ inline void extract_fnn_features_device(
 
     // ── Features from legal moves: can_move_count [64:80], num_placement_pos [100:102] ──
 
-    // For can_move_count: track distinct source cells per type×color bucket.
-    Bitboard can_move_seen[16];
-    for (int i = 0; i < 16; i++) can_move_seen[i].clear();
-
-    // Track seen placement destinations with a small linear scan
-    uint16_t seen_place_dst[2][MAX_LEGAL_MOVES];
-    int seen_place_count[2] = {0, 0};
+    // One source can have many destinations, but contributes only once to its
+    // piece-type/color mobility bucket.
+    Bitboard movable_sources;
+    movable_sources.clear();
+    Bitboard seen_place_dst[2];
+    seen_place_dst[0].clear();
+    seen_place_dst[1].clear();
 
     Color cur = current_player(s);
 
@@ -285,42 +467,33 @@ __device__ inline void extract_fnn_features_device(
         const GPUMove& mv = my_moves[m];
 
         if (mv.type == MOVE_MOVE) {
-            // Count distinct pieces with at least one legal MOVE. Pillbug throws
-            // (and mosquito-as-pillbug throws) move opponent pieces, so the
-            // piece's actual owner must be read from the board — we cannot
-            // assume the mover equals the current player.
-            int pt_idx = (int)mv.piece_type - 1;
-            int src_h = s.height[mv.from_cell];
-            Color mover_color = cur;
-            if (src_h > 0) {
-                uint8_t packed = s.pieces[src_h - 1][mv.from_cell];
-                mover_color = cell_color(packed);
+            if (mv.from_cell < NUM_CELLS && s.height[mv.from_cell] > 0) {
+                movable_sources.set(mv.from_cell);
             }
-            int flag_bit = pt_idx * 2 + (int)mover_color;
-            can_move_seen[flag_bit].set(mv.from_cell);
         } else if (mv.type == MOVE_PLACE) {
-            // Count unique placement destinations
-            bool seen = false;
-            for (int j = 0; j < seen_place_count[(int)cur]; j++) {
-                if (seen_place_dst[(int)cur][j] == mv.to_cell) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen && seen_place_count[(int)cur] < MAX_LEGAL_MOVES) {
-                seen_place_dst[(int)cur][seen_place_count[(int)cur]++] = mv.to_cell;
+            if (mv.to_cell < NUM_CELLS) {
+                seen_place_dst[(int)cur].set(mv.to_cell);
             }
         }
     }
 
-    // Write can_move counts
-    for (int i = 0; i < 16; i++) {
-        f[64 + i] = (float)can_move_seen[i].popcount();
+    for (int wi = 0; wi < BB_WORDS; ++wi) {
+        uint64_t sources = movable_sources.w[wi];
+        while (sources) {
+            int bit = __ffsll(sources) - 1;
+            int cell = wi * 64 + bit;
+            sources &= sources - 1;
+            if (cell >= NUM_CELLS || s.height[cell] == 0) continue;
+            uint8_t packed = s.pieces[s.height[cell] - 1][cell];
+            int bucket = ((int)cell_piece_type(packed) - 1) * 2 +
+                (int)cell_color(packed);
+            if (bucket >= 0 && bucket < 16) f[64 + bucket] += 1.0f;
+        }
     }
 
     // Write num_placement_pos (normalized by ~10 typical positions)
     for (int c = 0; c < 2; c++) {
-        f[100 + c] = (float)seen_place_count[c] / 10.0f;
+        f[100 + c] = (float)seen_place_dst[c].popcount() / 10.0f;
     }
 
     // ── moves_to_draw [102] ───────────────────────────────────
@@ -356,6 +529,13 @@ __device__ inline void extract_fnn_features_device(
     for (int c = 0; c < 2; c++) {
         for (int pi = 0; pi < pb_count[c]; pi++) {
             int pbc = (int)pb_cells[c][pi];
+            uint16_t enemy_queen = opp_queen[c];
+            int actor_distance =
+                enemy_queen == 0xFFFF ? 99 :
+                hex_distance(pbc, (int)enemy_queen);
+            bool actor_near_enemy_queen =
+                actor_distance >= 1 && actor_distance <= 2;
+            int pillbug_height = s.height[pbc];
             for (int d = 0; d < NUM_DIRS; d++) {
                 int16_t nb = NEIGHBORS[pbc][d];
                 if (nb < 0 || s.height[nb] == 0) continue;
@@ -370,18 +550,57 @@ __device__ inline void extract_fnn_features_device(
                     // under threat from c's pillbug.
                     f[108 + (int)nc] += 1.0f;
                 }
-            }
-        }
-    }
 
-    // ── own_q_throwable [122:124] ─────────────────────────────
-    MovegenStateCache throw_cache;
-    init_movegen_state_cache(s, throw_cache);
-    for (int c = 0; c < 2; c++) {
-        uint16_t qcell = s.queen_cell[c];
-        if (qcell == 0xFFFF) continue;
-        if (can_be_thrown_by_color(s, (int)qcell, ap_mask, (Color)c)) {
-            f[122 + c] = 1.0f;
+                // Merge exact throw-derived features into this existing
+                // pillbug-neighbor pass. Throws are legal only after the
+                // actor's queen has been placed.
+                if (s.result != IN_PROGRESS ||
+                    !is_queen_placed(s, (Color)c) ||
+                    s.height[nb] != 1 ||
+                    is_pinned(s, ap_mask, nb)) {
+                    continue;
+                }
+                int lift_height = max(s.height[nb] - 1, pillbug_height);
+                int lift_direction = find_direction(nb, pbc);
+                if (lift_direction < 0 ||
+                    elevated_gate_blocked(
+                        s, nb, lift_direction, lift_height)) {
+                    continue;
+                }
+
+                PieceType target_type = cell_piece_type(ntop);
+                bool free_owned_target =
+                    (int)nc == c && enemy_queen != 0xFFFF &&
+                    !feature_adjacent_to(nb, enemy_queen);
+                bool has_legal_throw = false;
+                for (int dd = 0; dd < NUM_DIRS; ++dd) {
+                    int16_t destination = NEIGHBORS[pbc][dd];
+                    if (destination < 0 || destination == nb ||
+                        s.occupied.get(destination)) {
+                        continue;
+                    }
+                    int drop_height = max(pillbug_height, 0);
+                    if (elevated_gate_blocked(
+                            s, pbc, dd, drop_height)) {
+                        continue;
+                    }
+                    has_legal_throw = true;
+                    if (free_owned_target &&
+                        feature_adjacent_to(destination, enemy_queen)) {
+                        ring_access_sources[c].set(nb);
+                    }
+                    int relief = feature_queen_relief(
+                        s, (Color)c, nb, destination, target_type,
+                        queen_surround_counts[c]);
+                    if (relief > max_queen_relief[c]) {
+                        max_queen_relief[c] = relief;
+                    }
+                }
+                if (has_legal_throw && free_owned_target &&
+                    actor_near_enemy_queen) {
+                    sufficient_sources[c].set(nb);
+                }
+            }
         }
     }
 
@@ -392,6 +611,47 @@ __device__ inline void extract_fnn_features_device(
             f[110 + qc * 6 + (surround - 1)] = 1.0f;
         }
     }
+
+    // ── sufficient material [122:128] ───────────────────────────
+    // A player's free material excludes pieces already on the opposing
+    // queen's ring. Normal movers and nearby legal pillbug throws share one
+    // source bitboard, so a piece can never be counted twice.
+    for (int c = 0; c < 2; ++c) {
+        Color target = (Color)(1 - c);
+        if (!is_queen_placed(s, target)) continue;
+        int vacancies = 6 - queen_surround_counts[(int)target];
+        int material = sufficient_sources[c].popcount();
+        int bucket = material < vacancies ? 0 :
+            (material == vacancies ? 1 : 2);
+        f[122 + c * 3 + bucket] = 1.0f;
+    }
+
+    // ── available queen escape [128:134] ────────────────────────
+    for (int c = 0; c < 2; ++c) {
+        if (!is_queen_placed(s, (Color)c)) continue;
+        int bucket = max_queen_relief[c] <= 0 ? 0 :
+            (max_queen_relief[c] == 1 ? 1 : 2);
+        f[128 + c * 3 + bucket] = 1.0f;
+    }
+
+    // ── immediate queen-ring access [134:140] ───────────────────
+    for (int c = 0; c < 2; ++c) {
+        Color target = (Color)(1 - c);
+        if (!is_queen_placed(s, target)) continue;
+        int access = ring_access_sources[c].popcount();
+        int bucket = access == 0 ? 0 : (access == 1 ? 1 : 2);
+        f[134 + c * 3 + bucket] = 1.0f;
+    }
+}
+
+__device__ inline void extract_fnn_features_device(
+    const HiveState& s,
+    const GPUMove* my_moves,
+    int n_legal,
+    float* f
+) {
+    Bitboard ap_mask = find_articulation_points(s);
+    extract_fnn_features_with_ap_device(s, my_moves, n_legal, ap_mask, f);
 }
 
 #ifndef HIVE_CPU_NATIVE

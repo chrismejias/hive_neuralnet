@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from hive_fnn.fnn_alphabeta_training import AlphaBetaReplayBuffer
 from hive_fnn.fnn_alphabeta_tuning import (
@@ -19,8 +20,8 @@ def test_default_parameter_vector_decodes_to_current_search_defaults() -> None:
     assert config.lmr_min_depth == 4
     assert config.lmr_min_move == 4
     assert config.lmr_reduction == 1
-    assert config.quiescence_plies == 2
-    assert config.quiescence_budget_fraction == 0.5
+    assert config.quiescence_plies == 1
+    assert config.quiescence_budget_fraction == pytest.approx(0.2)
     assert config.force_win_probes
     assert config.tactical_immobilization
     assert config.tactical_opponent_surround

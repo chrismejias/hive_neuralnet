@@ -85,10 +85,13 @@ __global__ void generate_legal_moves_and_fnn_features_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < batch_size) {
         GPUMove* my_moves = moves_out + idx * MAX_LEGAL_MOVES;
-        int n = generate_legal_moves(states[idx], my_moves);
+        MovegenStateCache cache;
+        int n = generate_legal_moves_with_cache(
+            states[idx], my_moves, cache);
         num_legal_out[idx] = n;
-        extract_fnn_features_device(
-            states[idx], my_moves, n, features_out + idx * FNN_FEAT_DIM);
+        extract_fnn_features_with_ap_device(
+            states[idx], my_moves, n, cache.ap_mask,
+            features_out + idx * FNN_FEAT_DIM);
     }
 }
 
@@ -112,11 +115,13 @@ __global__ void generate_legal_moves_and_hybrid_root_features_kernel(
 
     const HiveState& s = states[idx];
     GPUMove* my_moves = moves_out + idx * MAX_LEGAL_MOVES;
-    int n = generate_legal_moves(s, my_moves);
+    MovegenStateCache cache;
+    int n = generate_legal_moves_with_cache(s, my_moves, cache);
     num_legal_out[idx] = n;
 
-    extract_fnn_features_device(
-        s, my_moves, n, fnn_features_out + idx * FNN_FEAT_DIM);
+    extract_fnn_features_with_ap_device(
+        s, my_moves, n, cache.ap_mask,
+        fnn_features_out + idx * FNN_FEAT_DIM);
 
     float* tf = token_features_out + idx * HYBRID_MAX_PIECE_TOKENS * HYBRID_NODE_FEAT_DIM;
     int* tq = token_q_out + idx * HYBRID_MAX_PIECE_TOKENS;
@@ -213,15 +218,17 @@ __global__ void fnn_successor_features_kernel(
         }
 
         GPUMove child_moves[MAX_LEGAL_MOVES];
-        int child_nlegal = generate_fnn_feature_moves(child, child_moves);
+        MovegenStateCache child_cache;
+        int child_nlegal = generate_fnn_feature_moves_with_cache(
+            child, child_moves, child_cache);
         if (MOVEGEN_PROFILE_ENABLED) {
             t1 = clock64();
             mgp_add(MGP_FNN_SUCC_LEGAL_CYCLES, t1 - t0);
             t0 = t1;
         }
 
-        extract_fnn_features_device(
-            child, child_moves, child_nlegal,
+        extract_fnn_features_with_ap_device(
+            child, child_moves, child_nlegal, child_cache.ap_mask,
             features_out + (int64_t)idx * FNN_FEAT_DIM);
         if (MOVEGEN_PROFILE_ENABLED) {
             t1 = clock64();
@@ -1758,9 +1765,10 @@ static FNNAlphaBetaBatchOutputs run_fnn_alphabeta_batch(
     at::Tensor states, at::Tensor weights,
     int hidden_dim, int embed_dim, int action_hidden,
     at::Tensor search_config, int node_budget, int max_depth,
-    int root_exact_count
+    int root_exact_count, bool explicit_stack
 ) {
     const int batch_size = (int)states.size(0);
+    max_depth = std::max(1, std::min(max_depth, AB_MAX_PV - 1));
     auto dev = states.device();
     auto move_opts = at::TensorOptions().dtype(c10::kByte).device(dev);
     auto value_opts = at::TensorOptions().dtype(c10::kFloat).device(dev);
@@ -1789,30 +1797,77 @@ static FNNAlphaBetaBatchOutputs run_fnn_alphabeta_batch(
     auto tt_values = at::zeros({batch_size, tt_entries}, value_opts);
     auto tt_depths = at::zeros({batch_size, tt_entries}, depth_opts);
     auto tt_bounds = at::zeros({batch_size, tt_entries}, move_opts);
-    auto tt_moves = at::zeros(
-        {batch_size, tt_entries, (int64_t)sizeof(GPUMove)}, move_opts);
-    // Recursive negamax keeps a packed HiveState and legal-move buffers at
-    // each depth. CUDA's default device stack is too small for that layout.
-    const size_t stack_bytes = std::max<size_t>(384 * 1024, (size_t)max_depth * 16 * 1024);
+    auto tt_moves = at::full(
+        {batch_size, tt_entries}, (int64_t)-1, stat_opts);
+    // Root-only workspaces stay in global memory so concurrent searches do
+    // not replicate large ordering tables on every CUDA thread stack.
+    auto order_workspace = at::zeros(
+        {batch_size, MAX_LEGAL_MOVES}, value_opts);
+    auto iteration_values = at::zeros(
+        {batch_size, MAX_LEGAL_MOVES}, value_opts);
+    auto iteration_bounds = at::zeros(
+        {batch_size, MAX_LEGAL_MOVES}, move_opts);
+    auto killer_workspace = at::full(
+        {batch_size, AB_MAX_PV * 2}, (int64_t)-1, stat_opts);
+    auto history_workspace = at::zeros(
+        {batch_size, AB_HISTORY_SIZE}, stat_opts);
+    auto frame_workspace = explicit_stack ? at::zeros(
+        {batch_size, AB_MAX_PV, (int64_t)sizeof(ABExplicitFrame)}, move_opts) :
+        at::zeros({1}, move_opts);
+    auto move_stack_workspace = explicit_stack ? at::full(
+        {batch_size, AB_MAX_PV, MAX_LEGAL_MOVES}, (int64_t)-1, stat_opts) :
+        at::full({1}, (int64_t)-1, stat_opts);
+    // Keep enough device stack for the recursive reference path and leaf
+    // helpers. The default traversal stores its explicit frames globally.
+    const size_t stack_bytes = std::max<size_t>(96 * 1024, (size_t)max_depth * 6 * 1024);
     cudaDeviceSetLimit(cudaLimitStackSize, stack_bytes);
-    fnn_alphabeta_kernel<<<batch_size, 1>>>(
+    // The explicit state machine assigns one lane to each complete game.
+    // Root branches are never split across lanes; only independent games
+    // share a warp and reconverge around leaf evaluation.
+    const int search_threads = explicit_stack ? 32 : 1;
+    const int search_blocks = (batch_size + search_threads - 1) / search_threads;
+#define FNN_AB_KERNEL_ARGS \
+        reinterpret_cast<const HiveState*>(states.data_ptr<uint8_t>()), \
+        weights.data_ptr<float>(), hidden_dim, embed_dim, action_hidden, \
+        search_config.data_ptr<float>(), node_budget, max_depth, \
+        root_exact_count, \
+        reinterpret_cast<GPUMove*>(moves.data_ptr<uint8_t>()), \
+        values.data_ptr<float>(), stats.data_ptr<int>(), \
+        raw_values.data_ptr<float>(), \
+        reinterpret_cast<GPUMove*>(root_moves.data_ptr<uint8_t>()), \
+        num_legal.data_ptr<int>(), root_scores.data_ptr<float>(), \
+        root_bounds.data_ptr<uint8_t>(), selected_indices.data_ptr<int>(), \
+        reinterpret_cast<uint64_t*>(tt_keys.data_ptr<int64_t>()), \
+        tt_values.data_ptr<float>(), tt_depths.data_ptr<int16_t>(), \
+        tt_bounds.data_ptr<uint8_t>(), \
+        reinterpret_cast<ABPackedMove*>(tt_moves.data_ptr<int>()), \
+        order_workspace.data_ptr<float>(), iteration_values.data_ptr<float>(), \
+        iteration_bounds.data_ptr<uint8_t>(), \
+        reinterpret_cast<ABPackedMove*>(killer_workspace.data_ptr<int>()), \
+        history_workspace.data_ptr<int>(), \
+        reinterpret_cast<ABExplicitFrame*>(frame_workspace.data_ptr<uint8_t>()), \
+        reinterpret_cast<ABPackedMove*>(move_stack_workspace.data_ptr<int>()), \
+        tt_entries, batch_size
+    if (explicit_stack) {
+        fnn_alphabeta_kernel<true><<<search_blocks, search_threads>>>(
+            FNN_AB_KERNEL_ARGS);
+    } else {
+        fnn_alphabeta_kernel<false><<<search_blocks, search_threads>>>(
+            FNN_AB_KERNEL_ARGS);
+    }
+#undef FNN_AB_KERNEL_ARGS
+    constexpr int pv_threads = 32;
+    const int pv_blocks = (batch_size + pv_threads - 1) / pv_threads;
+    fnn_alphabeta_pv_kernel<<<pv_blocks, pv_threads>>>(
         reinterpret_cast<const HiveState*>(states.data_ptr<uint8_t>()),
-        weights.data_ptr<float>(), hidden_dim, embed_dim, action_hidden,
-        search_config.data_ptr<float>(), node_budget, max_depth,
-        root_exact_count,
-        reinterpret_cast<GPUMove*>(moves.data_ptr<uint8_t>()),
-        values.data_ptr<float>(), stats.data_ptr<int>(),
-        raw_values.data_ptr<float>(),
-        reinterpret_cast<GPUMove*>(root_moves.data_ptr<uint8_t>()),
-        num_legal.data_ptr<int>(), root_scores.data_ptr<float>(),
-        root_bounds.data_ptr<uint8_t>(), selected_indices.data_ptr<int>(),
-        reinterpret_cast<GPUMove*>(pv_moves.data_ptr<uint8_t>()),
-        pv_lengths.data_ptr<int>(),
-        reinterpret_cast<uint64_t*>(tt_keys.data_ptr<int64_t>()),
+        reinterpret_cast<const GPUMove*>(moves.data_ptr<uint8_t>()),
+        stats.data_ptr<int>(),
+        reinterpret_cast<const uint64_t*>(tt_keys.data_ptr<int64_t>()),
         tt_values.data_ptr<float>(), tt_depths.data_ptr<int16_t>(),
         tt_bounds.data_ptr<uint8_t>(),
-        reinterpret_cast<GPUMove*>(tt_moves.data_ptr<uint8_t>()),
-        tt_entries, batch_size);
+        reinterpret_cast<const ABPackedMove*>(tt_moves.data_ptr<int>()),
+        tt_entries, reinterpret_cast<GPUMove*>(pv_moves.data_ptr<uint8_t>()),
+        pv_lengths.data_ptr<int>(), batch_size);
     return {
         moves, values, stats, raw_values, root_moves, num_legal,
         root_scores, root_bounds, selected_indices, pv_moves, pv_lengths,
@@ -1827,7 +1882,19 @@ fnn_alphabeta_batch(
 ) {
     auto out = run_fnn_alphabeta_batch(
         states, weights, hidden_dim, embed_dim, action_hidden,
-        search_config, node_budget, max_depth, 1);
+        search_config, node_budget, max_depth, 1, false);
+    return std::make_tuple(out.moves, out.values, out.stats);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+fnn_alphabeta_resumable_batch(
+    at::Tensor states, at::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    at::Tensor search_config, int node_budget, int max_depth
+) {
+    auto out = run_fnn_alphabeta_batch(
+        states, weights, hidden_dim, embed_dim, action_hidden,
+        search_config, node_budget, max_depth, 1, true);
     return std::make_tuple(out.moves, out.values, out.stats);
 }
 
@@ -1842,7 +1909,7 @@ fnn_alphabeta_teacher_batch(
 ) {
     auto out = run_fnn_alphabeta_batch(
         states, weights, hidden_dim, embed_dim, action_hidden,
-        search_config, node_budget, max_depth, root_exact_count);
+        search_config, node_budget, max_depth, root_exact_count, false);
     return std::make_tuple(
         out.moves, out.values, out.stats, out.raw_values, out.root_moves,
         out.num_legal, out.root_scores, out.root_bounds, out.selected_indices,
