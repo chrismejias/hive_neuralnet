@@ -1,25 +1,44 @@
 # Hive Neural Network
 
-AlphaZero-style self-play training for the board game [Hive](https://en.wikipedia.org/wiki/Hive_(game)), focused on a recommended small FNN-transformer engine, a compact FNN baseline, archived PRS / graph-based research lines, and a shared GPU-native game engine.
+Neural-guided search and self-play training for the board game
+[Hive](https://en.wikipedia.org/wiki/Hive_(game)), centered on the FNN
+alpha-beta engine, with MCTS, transformer, PRS, and graph-based research lines
+retained as alternatives.
 
 ## Recommended Engine
 
-**Small FNN Transformer is the default recommended engine.** It is the strongest practical model in the repository today. It keeps the fast handcrafted FNN successor-feature policy path, but adds a small relative transformer trunk that improves tactical and positional strength enough to outperform the current FNN line in direct arenas.
+**FNN alpha-beta is the recommended default search engine for play, analysis,
+and evaluation.** Use the latest alpha-beta checkpoint,
+`checkpoints_fnn_alphabeta_50k_512/hive_fnn_alphabeta_0147.pt`, with a
+50,000-node budget as the current reference configuration. The native CPU
+search is intended for a single game or analysis session; the CUDA search
+scales across wide batches for self-play, training, and arenas.
 
-**FNN remains the recommended compact baseline.** It is still faster, simpler, and easier to train than the transformer line, and remains useful as a reference engine and a low-cost training path.
+The alpha-beta engine combines iterative deepening, transposition tables,
+history/killer ordering, tactical quiescence, selective extensions, and an FNN
+for leaf values and move ordering. In recent testing it was competitive with
+Nokamute while remaining practical on both CPU and GPU.
 
-**PRS and the older graph-based hybrids are no longer recommended active paths.** They remain in the repository for reference and experiments, but the current training effort is focused on the FNN and especially the small FNN-transformer line.
+**Small FNN Transformer with Gumbel/PUCT MCTS remains the recommended MCTS
+alternative.** It is useful for AlphaZero-style experiments, but MCTS is no
+longer the default search recommendation.
+
+**PRS and the older graph-based hybrids are not recommended active paths.**
+They remain in the repository for reference and experiments.
 
 ## Architecture Overview
 
 | Model | Package | Params | Status |
 |-------|---------|--------|--------|
-| Small FNN Transformer | `hive_fnn_transformer` | ~146K | Recommended |
-| FNN | `hive_fnn` | ~1K – 22K | Strong baseline |
+| FNN Alpha-Beta | `hive_fnn` | ~22K | Recommended default |
+| Small FNN Transformer | `hive_fnn_transformer` | ~146K | Recommended MCTS alternative |
+| FNN Gumbel/PUCT | `hive_fnn` | ~1K – 22K | MCTS baseline |
 | Large FNN Transformer | `hive_fnn_transformer` | ~1.03M | Experimental |
 | PRS Transformer | `hive_prs` | 1.7M / 9.8M | Archived research path |
 
-All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels for move generation, state encoding, and legal move lookup.
+Wide-batch search and training use the GPU-native game engine (`hive_gpu`).
+Single-game alpha-beta uses the native C++ bitmap engine through
+`hive_cpu_native`.
 
 ## Requirements
 
@@ -27,7 +46,10 @@ All models use the same GPU-native game engine (`hive_gpu`) with CUDA kernels fo
 - PyTorch 2.4+ (tested with 2.10.0+cu128)
 - CUDA 12.4+ / driver supporting CUDA 12.8
 
-If you do not have an NVIDIA GPU, the repository also includes a **single-game CPU FNN fallback** for play and analysis. It is much slower than the GPU engine and is not used for self-play training, but it does let you play against a compact FNN model on CPU-only machines.
+If you do not have an NVIDIA GPU, use the native **single-game CPU FNN
+alpha-beta engine**. GPU alpha-beta is preferred for wide-batch self-play and
+arenas, but the CPU path is the intended deployment target for ordinary
+single-game analysis.
 
 ## Setup
 
@@ -72,7 +94,28 @@ Or if a prebuilt `.pyd`/`.so` is already present in `hive_gpu/`, it loads automa
 
 ## Playing Against The Engine
 
-On a CUDA machine, use the GPU path with the recommended small FNN-transformer checkpoint:
+The recommended single-game interface is `FNNAlphaBetaPlayer`. It loads EMA
+weights when present and uses the native C++ search by default:
+
+```python
+from hive_engine.game_state import GameState
+from hive_fnn.fnn_alphabeta_player import AlphaBetaConfig, FNNAlphaBetaPlayer
+
+state = GameState()
+player = FNNAlphaBetaPlayer.from_checkpoint(
+    "checkpoints_fnn_alphabeta_50k_512/hive_fnn_alphabeta_0147.pt",
+    config=AlphaBetaConfig(node_budget=50_000, max_depth=32),
+)
+move = player.choose_move(state)
+```
+
+For checkpoint or configuration evaluation, use the paired CPU/GPU alpha-beta
+arenas described under
+[Alpha-Beta Training And Search Tuning](#alpha-beta-training-and-search-tuning-recommended-default).
+The GPU path is fastest with wide batches rather than a single game.
+
+The pygame GUI currently exposes the older MCTS interfaces. To use the
+supported small FNN-transformer MCTS alternative on CUDA:
 
 ```bash
 cd /workspace/hive_neuralnet
@@ -83,18 +126,7 @@ python3.11 gui.py \
   --expansion MLP
 ```
 
-For the compact FNN baseline on GPU:
-
-```bash
-cd /workspace/hive_neuralnet
-python3.11 gui.py \
-  --engine legacy \
-  --checkpoint checkpoints_fnn/hive_fnn_checkpoint_1080.pt \
-  --simulations 16384 \
-  --expansion MLP
-```
-
-On a machine without an NVIDIA GPU, use the CPU FNN fallback:
+The older CPU Gumbel/PUCT path is also retained:
 
 ```bash
 cd /workspace/hive_neuralnet
@@ -117,7 +149,9 @@ python3.11 play_fnn_cpu.py \
   --root-workers 2
 ```
 
-The `gui.py --engine legacy` path is the GPU route for FNN-transformer and FNN checkpoints. The CPU FNN option is only the fallback when CUDA is unavailable.
+The `gui.py --engine legacy` path is the GPU MCTS route for FNN-transformer and
+FNN checkpoints. These GUI choices do not change the repository-wide
+recommendation to use alpha-beta for new play and analysis integrations.
 
 ## Long-Running Background Training
 
@@ -198,7 +232,13 @@ background-launch templates.
 
 ## Search Algorithms
 
-### Gumbel AlphaZero with sequential Halving (default)
+**Neural-guided alpha-beta is the recommended default search.** Its
+implementation, training pipeline, tuning controls, and arena commands are
+documented in
+[Alpha-Beta Training And Search Tuning](#alpha-beta-training-and-search-tuning-recommended-default).
+The MCTS algorithms below remain supported research alternatives.
+
+### Gumbel AlphaZero with sequential Halving (MCTS alternative)
 
 Based on [Danihelka et al., 2022](https://openreview.net/forum?id=bERaNdoegnO). At the root, candidate moves are sampled from the policy prior plus Gumbel noise, typically with `k = 16`. All other legal moves are dropped from search for that move. Search then runs in four sequential-halving rounds:
 
@@ -262,7 +302,7 @@ This is the compact baseline engine. It is inspired by HiveGo's AlphaZeroFNN. Th
 - **Small** (~1.0K params): hidden=8, embed=8, action\_hidden=8
 - **Medium** (~6.3K params): hidden=32, embed=32, action\_hidden=32
 - **Large** (~22K params, current default): hidden=64, embed=64, action\_hidden=64
-- **Current search default**: Gumbel-root MCTS with non-root PUCT, visited-only policy targets, wave-parallel halving, and the queen-surround reserve described above
+- **MCTS-path default**: Gumbel-root MCTS with non-root PUCT, visited-only policy targets, wave-parallel halving, and the queen-surround reserve described above
 
 ### 140-dim Feature Vector (per state, extracted by CUDA kernel)
 
@@ -315,7 +355,7 @@ There is also an experimental fused FNN self-play kernel in `hive_gpu/csrc/fnn_s
 
 ### Search Patterns
 
-- **Default:** Gumbel-root MCTS tree search (`FNNMCTSOrchestrator`)
+- **MCTS-path default:** Gumbel-root MCTS tree search (`FNNMCTSOrchestrator`)
 - Gumbel MCTS uses a hard-coded per-round wave schedule `2, 4, 8, 16` by default; use `--no-gumbel-wave-parallel` for pure serial waves.
 - The current Gumbel implementations standardize on `k=16`.
 - Within the Gumbel search, inner-node selection uses standard non-root PUCT MCTS.
@@ -360,7 +400,7 @@ python -m hive_fnn.train_fnn \
 
 The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 
-### Alpha-Beta Training And Search Tuning
+### Alpha-Beta Training And Search Tuning (recommended default)
 
 The separate alpha-beta trainer learns a move-ordering policy and calibrated
 value from completed iterative-deepening searches. Move-cap games are omitted
@@ -525,7 +565,7 @@ The latest promoted champion is also written to `champion_latest.pt` in the chec
 | `--action-hidden` | 64 | Action tower hidden dimension |
 | `--iterations` | 1500 | Training iterations |
 | `--games` | 128 | Parallel self-play games per iteration |
-| `--simulations` | 128 | Gumbel simulation budget per move; current FNN play/eval default is `16384` |
+| `--simulations` | 128 | Gumbel simulation budget per move; current FNN MCTS play/eval default is `16384` |
 | `--gumbel-considered` | 16 | Root actions considered (k) |
 | `--gumbel-wave-parallel` / `--no-gumbel-wave-parallel` | on | Enable/disable FNN Gumbel per-round MCTS wave schedule (`2,4,8,16`) |
 | `--buffer-size` | 100000 | Replay buffer capacity |
@@ -535,7 +575,7 @@ The latest promoted champion is also written to `champion_latest.pt` in the chec
 
 ---
 
-## FNN Transformer (recommended small model)
+## FNN Transformer (recommended MCTS alternative)
 
 The active FNN-transformer direction lives in `hive_fnn_transformer`.
 
@@ -566,7 +606,8 @@ Current status:
 - the trainer reuses the FNN raw-state replay format and caches the hybrid root feature bundle in replay so training can skip repeated root-side feature extraction
 - the root-side training/search feature path is fused on CUDA to avoid separate root token/move-feature passes
 - training uses a persistent optimizer and stores optimizer / scaler / EMA / champion state in checkpoints
-- the default CLI preset is now `small`, and this is the recommended model to train and play
+- the default CLI preset is `small`; this is the recommended model when
+  experimenting with the transformer/MCTS path
 - the line now supports the same adaptive policy-target softening and EMA champion/challenger loop as FNN
 - this remains a lighter and faster alternative to a full PRS-style transformer trunk
 
@@ -602,7 +643,7 @@ Quick parameter summary:
 python3.11 -m hive_fnn_transformer
 ```
 
-### Current Recommended Training Shape
+### Current Small-Transformer Training Shape
 
 The current strongest small-transformer runs have used:
 
@@ -632,7 +673,7 @@ python3.11 -m hive_fnn_transformer.train_fnn_transformer \
 
 Other important current defaults:
 
-- recommended play/evaluation simulation budget:
+- MCTS play/evaluation simulation budgets:
   - FNN-transformer: `8192`
   - FNN: `16384`
 - adaptive replay-target temperature:
@@ -892,7 +933,7 @@ hive_fnn/          # HiveGo-style FNN with multiple search paths
   train_fnn_alphabeta.py    # Alpha-beta self-play trainer
   fnn_trainer.py       # FNNTrainer training loop
   train_fnn.py         # CLI entry point
-hive_fnn_transformer/  # Recommended small FNN policy + relative-transformer model
+hive_fnn_transformer/  # Small FNN policy + relative-transformer MCTS alternative
   fnn_transformer_net.py          # FNN + relative piece-transformer trunk
   fnn_transformer_trainer.py      # Training loop
   fnn_transformer_mcts_orchestrator.py  # Search orchestration
