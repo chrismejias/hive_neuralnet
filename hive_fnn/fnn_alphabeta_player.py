@@ -22,6 +22,7 @@ _BOARD_SIZE: Final = 23
 _HALF_BOARD: Final = 11
 _MATE_SCORE: Final = 10.0
 _INF: Final = 1000.0
+_PVS_EPSILON: Final = 1e-4
 
 
 class _Bound(IntEnum):
@@ -42,6 +43,9 @@ class AlphaBetaConfig:
     max_depth: int = 32
     torch_threads: int | None = 1
     tt_max_entries: int = 500_000
+    neural_policy_all_nodes: bool = True
+    pvs: bool = False
+    native_tree: bool = True
 
 
 @dataclass
@@ -50,6 +54,7 @@ class AlphaBetaStats:
     nodes: int = 0
     cutoffs: int = 0
     transposition_hits: int = 0
+    pvs_researches: int = 0
     value: float = 0.0
 
 
@@ -88,8 +93,22 @@ class FNNAlphaBetaPlayer:
         self.config = config or AlphaBetaConfig()
         self.tt: dict[bytes, _TTEntry] = {}
         self._expansion_cache: dict[bytes, _Expansion] = {}
+        self._feature_cache: dict[bytes, np.ndarray] = {}
+        self._embed_cache: dict[bytes, torch.Tensor] = {}
         self._value_cache: dict[bytes, float] = {}
+        self._killers: dict[int, tuple[bytes, bytes | None]] = {}
+        self._history: dict[bytes, int] = {}
         self.last_stats = AlphaBetaStats()
+        state_dict = self.net.state_dict()
+        weight_order = (
+            "fc1.weight", "fc1.bias", "ln1.weight", "ln1.bias",
+            "fc2.weight", "fc2.bias", "value_fc.weight", "value_fc.bias",
+            "action_fc1.weight", "action_fc1.bias",
+            "action_fc2.weight", "action_fc2.bias",
+        )
+        self._native_weights = np.concatenate([
+            state_dict[name].detach().numpy().ravel() for name in weight_order
+        ]).astype(np.float32, copy=False)
         if self.config.torch_threads is not None:
             torch.set_num_threads(max(1, int(self.config.torch_threads)))
 
@@ -140,7 +159,7 @@ class FNNAlphaBetaPlayer:
         if self.last_stats.nodes > max(1, int(self.config.node_budget)):
             raise _SearchAborted
 
-    def _expand(self, state: bytes) -> _Expansion:
+    def _expand(self, state: bytes, *, use_policy: bool = False) -> _Expansion:
         cached = self._expansion_cache.get(state)
         if cached is not None:
             return cached
@@ -148,7 +167,10 @@ class FNNAlphaBetaPlayer:
         moves_pad, n_legal, root_features = self.ext.legal_moves_and_fnn_features(state)
         n_legal = int(n_legal)
         moves = np.asarray(moves_pad, dtype=np.uint8)[:n_legal].copy()
-        root_features_np = np.asarray(root_features, dtype=np.float32).copy()
+        root_features_np = self._feature_cache.get(state)
+        if root_features_np is None:
+            root_features_np = np.asarray(root_features, dtype=np.float32).copy()
+            self._feature_cache[state] = root_features_np
         if n_legal <= 0:
             expansion = _Expansion(
                 moves=moves,
@@ -157,6 +179,21 @@ class FNNAlphaBetaPlayer:
                 root_features=root_features_np,
                 child_features=np.zeros((0, root_features_np.shape[0]), dtype=np.float32),
                 priors=np.zeros((0,), dtype=np.float32),
+            )
+            self._expansion_cache[state] = expansion
+            return expansion
+
+        score_policy = use_policy or self.config.neural_policy_all_nodes
+        if not score_policy:
+            child_states, child_results = self.ext.successors(state, moves, n_legal)
+            child_results_np = np.asarray(child_results, dtype=np.int32).copy()
+            expansion = _Expansion(
+                moves=moves,
+                child_states=list(child_states),
+                child_results=child_results_np,
+                root_features=root_features_np,
+                child_features=np.zeros((0, root_features_np.shape[0]), dtype=np.float32),
+                priors=np.zeros((n_legal,), dtype=np.float32),
             )
             self._expansion_cache[state] = expansion
             return expansion
@@ -170,7 +207,11 @@ class FNNAlphaBetaPlayer:
         with torch.inference_mode():
             root_t = torch.from_numpy(root_features_np).unsqueeze(0)
             child_t = torch.from_numpy(child_features_np)
-            root_embed = self.net.encode(root_t)
+            root_embed = self._embed_cache.get(state)
+            if root_embed is None:
+                root_embed = self.net.encode(root_t)
+                self._embed_cache[state] = root_embed
+                self._value_cache[state] = float(self.net.value_head(root_embed).item())
             child_embed = self.net.encode(child_t)
             logits = self.net.score_actions(
                 root_embed.expand(n_legal, -1),
@@ -179,6 +220,16 @@ class FNNAlphaBetaPlayer:
                 child_t,
             )
             priors = torch.softmax(logits.float(), dim=0).cpu().numpy().astype(np.float32)
+            child_values = self.net.value_head(child_embed).flatten().tolist()
+        for child_state, child_feature, child_embed_row, child_value in zip(
+            child_states, child_features_np, child_embed, child_values,
+        ):
+            if child_state not in self._value_cache:
+                # These arrays/tensors already belong to this move's expansion
+                # cache, so retaining views avoids thousands of tiny copies.
+                self._feature_cache[child_state] = child_feature
+                self._embed_cache[child_state] = child_embed_row.unsqueeze(0)
+                self._value_cache[child_state] = float(child_value)
 
         expansion = _Expansion(
             moves=moves,
@@ -195,10 +246,16 @@ class FNNAlphaBetaPlayer:
         cached = self._value_cache.get(state)
         if cached is not None:
             return cached
-        expansion = self._expand(state)
+        features_np = self._feature_cache.get(state)
+        if features_np is None:
+            _moves, _n_legal, features = self.ext.legal_moves_and_fnn_features(state)
+            features_np = np.asarray(features, dtype=np.float32).copy()
+            self._feature_cache[state] = features_np
         with torch.inference_mode():
-            features = torch.from_numpy(expansion.root_features).unsqueeze(0)
-            value = float(self.net.value_head(self.net.encode(features)).item())
+            features_t = torch.from_numpy(features_np).unsqueeze(0)
+            embed = self.net.encode(features_t)
+            self._embed_cache[state] = embed
+            value = float(self.net.value_head(embed).item())
         self._value_cache[state] = value
         return value
 
@@ -211,11 +268,22 @@ class FNNAlphaBetaPlayer:
         state: bytes,
         expansion: _Expansion,
         tt_move: bytes | None,
+        ply: int,
     ) -> list[int]:
         n = len(expansion.moves)
         if n == 0:
             return []
         scores = expansion.priors.astype(np.float64, copy=True)
+        if not self.config.neural_policy_all_nodes:
+            killer_pair = self._killers.get(ply)
+            for idx, move in enumerate(expansion.moves):
+                key = self._move_key(move)
+                scores[idx] += float(self._history.get(key, 0))
+                if killer_pair is not None:
+                    if key == killer_pair[0]:
+                        scores[idx] += 1_000_000.0
+                    elif key == killer_pair[1]:
+                        scores[idx] += 900_000.0
         # A known terminal win must be tried before learned ordering.
         for idx, (child_state, result) in enumerate(
             zip(expansion.child_states, expansion.child_results)
@@ -284,21 +352,53 @@ class FNNAlphaBetaPlayer:
         alpha_start = alpha
         best_value = -_INF
         best_move: bytes | None = None
-        for idx in self._ordered_indices(state, expansion, tt_entry.best_move if tt_entry else None):
-            child_value = -self._negamax(
-                expansion.child_states[idx],
-                int(expansion.child_results[idx]),
-                depth - 1,
-                -beta,
-                -alpha,
-                ply + 1,
-            )
+        for rank, idx in enumerate(self._ordered_indices(
+            state, expansion, tt_entry.best_move if tt_entry else None, ply,
+        )):
+            if self.config.pvs and rank > 0:
+                child_value = -self._negamax(
+                    expansion.child_states[idx],
+                    int(expansion.child_results[idx]),
+                    depth - 1,
+                    -alpha - _PVS_EPSILON,
+                    -alpha,
+                    ply + 1,
+                )
+                if alpha < child_value < beta:
+                    self.last_stats.pvs_researches += 1
+                    child_value = -self._negamax(
+                        expansion.child_states[idx],
+                        int(expansion.child_results[idx]),
+                        depth - 1,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                    )
+            else:
+                child_value = -self._negamax(
+                    expansion.child_states[idx],
+                    int(expansion.child_results[idx]),
+                    depth - 1,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                )
             if child_value > best_value:
                 best_value = child_value
                 best_move = self._move_key(expansion.moves[idx])
             alpha = max(alpha, best_value)
             if alpha >= beta:
                 self.last_stats.cutoffs += 1
+                cutoff_move = self._move_key(expansion.moves[idx])
+                first, _second = self._killers.get(ply, (cutoff_move, None))
+                if cutoff_move != first:
+                    self._killers[ply] = (cutoff_move, first)
+                else:
+                    self._killers[ply] = (first, _second)
+                self._history[cutoff_move] = min(
+                    1_000_000,
+                    self._history.get(cutoff_move, 0) + depth * depth,
+                )
                 break
 
         self._store_tt(state, depth, best_value, alpha_start, beta, best_move)
@@ -314,7 +414,7 @@ class FNNAlphaBetaPlayer:
         self._consume_node()
         if result != 0:
             return None, self._terminal_value(state, result, 0)
-        expansion = self._expand(state)
+        expansion = self._expand(state, use_policy=True)
         if not expansion.child_states:
             return None, self._leaf_value(state)
 
@@ -324,15 +424,35 @@ class FNNAlphaBetaPlayer:
         best_value = -_INF
         alpha = -_INF
         beta = _INF
-        for idx in self._ordered_indices(state, expansion, tt_move):
-            value = -self._negamax(
-                expansion.child_states[idx],
-                int(expansion.child_results[idx]),
-                depth - 1,
-                -beta,
-                -alpha,
-                1,
-            )
+        for rank, idx in enumerate(self._ordered_indices(state, expansion, tt_move, 0)):
+            if self.config.pvs and rank > 0:
+                value = -self._negamax(
+                    expansion.child_states[idx],
+                    int(expansion.child_results[idx]),
+                    depth - 1,
+                    -alpha - _PVS_EPSILON,
+                    -alpha,
+                    1,
+                )
+                if value > alpha:
+                    self.last_stats.pvs_researches += 1
+                    value = -self._negamax(
+                        expansion.child_states[idx],
+                        int(expansion.child_results[idx]),
+                        depth - 1,
+                        -beta,
+                        -alpha,
+                        1,
+                    )
+            else:
+                value = -self._negamax(
+                    expansion.child_states[idx],
+                    int(expansion.child_results[idx]),
+                    depth - 1,
+                    -beta,
+                    -alpha,
+                    1,
+                )
             if value > best_value:
                 best_value = value
                 best_move = self._move_key(expansion.moves[idx])
@@ -344,9 +464,31 @@ class FNNAlphaBetaPlayer:
         result = int(self.ext.check_result(state))
         self.last_stats = AlphaBetaStats()
         self._expansion_cache.clear()
+        self._feature_cache.clear()
+        self._embed_cache.clear()
         self._value_cache.clear()
+        self._killers.clear()
+        self._history.clear()
 
-        root = self._expand(state)
+        if self.config.native_tree and result == 0:
+            move, stats = self.ext.native_alpha_beta(
+                state,
+                self._native_weights,
+                int(self.net.config.hidden_dim),
+                int(self.net.config.embed_dim),
+                int(self.config.node_budget),
+                int(self.config.max_depth),
+            )
+            self.last_stats = AlphaBetaStats(
+                completed_depth=int(stats["depth"]),
+                nodes=int(stats["nodes"]),
+                cutoffs=int(stats["cutoffs"]),
+                transposition_hits=int(stats["tt_hits"]),
+                value=float(stats["value"]),
+            )
+            return np.asarray(move, dtype=np.uint8).copy()
+
+        root = self._expand(state, use_policy=True)
         if not root.child_states:
             return np.zeros((int(self.ext.SIZEOF_GPU_MOVE),), dtype=np.uint8)
         fallback = self._move_key(root.moves[int(np.argmax(root.priors))])

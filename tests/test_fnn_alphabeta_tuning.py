@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from hive_fnn.fnn_alphabeta_training import AlphaBetaReplayBuffer
+from hive_fnn.fnn_native_alphabeta import AlphaBetaSearchConfig
 from hive_fnn.fnn_alphabeta_tuning import (
     AlphaBetaSPSATuner,
     PairedArenaResult,
@@ -32,6 +33,21 @@ def test_default_parameter_vector_decodes_to_current_search_defaults() -> None:
     assert config.branching_allocation == 0.0
     assert config.early_stop_score == 9.0
     assert config.early_stop_min_depth == 1
+
+
+def test_named_profiles_are_independent_and_baseline_is_legacy() -> None:
+    baseline = AlphaBetaSearchConfig.from_profile("baseline")
+    threat = AlphaBetaSearchConfig.from_profile("threat")
+    proof = AlphaBetaSearchConfig.from_profile("proof")
+    full = AlphaBetaSearchConfig.from_profile("full")
+
+    assert baseline == AlphaBetaSearchConfig()
+    assert not baseline.recursive_threat_qsearch
+    assert threat.recursive_threat_qsearch and threat.quiescence_plies == 4
+    assert threat.forced_extensions and not threat.proof_search
+    assert proof.proof_search and not proof.forced_extensions
+    assert full.proof_search and full.persistent_tt
+    assert full.countermove_ordering and full.continuation_history
 
 
 def test_default_alpha_beta_replay_capacity_is_75000() -> None:

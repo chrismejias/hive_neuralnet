@@ -529,6 +529,12 @@ class TestExpansionEncoding:
             assert decoded.piece.piece_type == PieceType.PILLBUG
 
     def test_action_space_size(self):
-        """Action space should be 29914 with 8 piece types."""
-        assert HiveEncoder.ACTION_SPACE_SIZE == 29914
-        assert HiveEncoder.NUM_PLACEMENT_ACTIONS == 8 * 169
+        """Action-space components must match the active encoder grid."""
+        assert HiveEncoder.NUM_PLACEMENT_ACTIONS == (
+            HiveEncoder.NUM_PIECE_TYPES * HiveEncoder.NUM_GRID_CELLS
+        )
+        assert HiveEncoder.ACTION_SPACE_SIZE == (
+            HiveEncoder.NUM_PLACEMENT_ACTIONS
+            + HiveEncoder.NUM_GRID_CELLS * HiveEncoder.NUM_GRID_CELLS
+            + 1
+        )

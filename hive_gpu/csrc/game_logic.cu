@@ -16,6 +16,7 @@
 #include <c10/core/DeviceType.h>
 #include <limits>
 #include <tuple>
+#include <vector>
 #include "hex_grid.cuh"
 #include "hive_state.cuh"
 #include "move_gen.cuh"
@@ -1765,7 +1766,9 @@ static FNNAlphaBetaBatchOutputs run_fnn_alphabeta_batch(
     at::Tensor states, at::Tensor weights,
     int hidden_dim, int embed_dim, int action_hidden,
     at::Tensor search_config, int node_budget, int max_depth,
-    int root_exact_count, bool explicit_stack
+    int root_exact_count, bool explicit_stack, bool build_pv,
+    const std::vector<at::Tensor>& reusable = {},
+    int tt_generation = 1
 ) {
     const int batch_size = (int)states.size(0);
     max_depth = std::max(1, std::min(max_depth, AB_MAX_PV - 1));
@@ -1787,30 +1790,52 @@ static FNNAlphaBetaBatchOutputs run_fnn_alphabeta_batch(
         std::numeric_limits<float>::quiet_NaN(), value_opts);
     auto root_bounds = at::zeros({batch_size, MAX_LEGAL_MOVES}, move_opts);
     auto selected_indices = at::full({batch_size}, -1, stat_opts);
-    auto pv_moves = at::zeros(
-        {batch_size, AB_MAX_PV, (int64_t)sizeof(GPUMove)}, move_opts);
-    auto pv_lengths = at::zeros({batch_size}, stat_opts);
+    auto pv_moves = build_pv ? at::zeros(
+        {batch_size, AB_MAX_PV, (int64_t)sizeof(GPUMove)}, move_opts) :
+        at::empty({0}, move_opts);
+    auto pv_lengths = build_pv ? at::zeros({batch_size}, stat_opts) :
+        at::empty({0}, stat_opts);
     // Per-game tables avoid synchronization between divergent searches.
     // Keep the size a power of two so the device probe is a cheap mask.
-    constexpr int tt_entries = 4096;
-    auto tt_keys = at::zeros({batch_size, tt_entries}, key_opts);
-    auto tt_values = at::zeros({batch_size, tt_entries}, value_opts);
-    auto tt_depths = at::zeros({batch_size, tt_entries}, depth_opts);
-    auto tt_bounds = at::zeros({batch_size, tt_entries}, move_opts);
-    auto tt_moves = at::full(
-        {batch_size, tt_entries}, (int64_t)-1, stat_opts);
+    constexpr int tt_entries = 16384;
+    TORCH_CHECK(reusable.empty() || reusable.size() == 11,
+        "alpha-beta workspace must contain 11 tensors");
+    if (!reusable.empty()) {
+        for (const auto& tensor : reusable) {
+            TORCH_CHECK(tensor.is_cuda() && tensor.is_contiguous(),
+                "alpha-beta workspace tensors must be contiguous CUDA tensors");
+            TORCH_CHECK(tensor.size(0) >= batch_size,
+                "alpha-beta workspace capacity is smaller than the batch");
+        }
+    }
+    auto tt_keys = reusable.empty() ?
+        at::zeros({batch_size, tt_entries}, key_opts) : reusable[0];
+    auto tt_values = reusable.empty() ?
+        at::empty({batch_size, tt_entries}, value_opts) : reusable[1];
+    auto tt_depths = reusable.empty() ?
+        at::empty({batch_size, tt_entries}, depth_opts) : reusable[2];
+    auto tt_bounds = reusable.empty() ?
+        at::empty({batch_size, tt_entries}, move_opts) : reusable[3];
+    auto tt_moves = reusable.empty() ?
+        at::empty({batch_size, tt_entries}, stat_opts) : reusable[4];
+    auto tt_generations = reusable.empty() ?
+        at::zeros({batch_size, tt_entries}, stat_opts) : reusable[5];
     // Root-only workspaces stay in global memory so concurrent searches do
     // not replicate large ordering tables on every CUDA thread stack.
-    auto order_workspace = at::zeros(
-        {batch_size, MAX_LEGAL_MOVES}, value_opts);
-    auto iteration_values = at::zeros(
-        {batch_size, MAX_LEGAL_MOVES}, value_opts);
-    auto iteration_bounds = at::zeros(
-        {batch_size, MAX_LEGAL_MOVES}, move_opts);
-    auto killer_workspace = at::full(
-        {batch_size, AB_MAX_PV * 2}, (int64_t)-1, stat_opts);
-    auto history_workspace = at::zeros(
-        {batch_size, AB_HISTORY_SIZE}, stat_opts);
+    auto order_workspace = reusable.empty() ?
+        at::empty({batch_size, MAX_LEGAL_MOVES}, value_opts) : reusable[6];
+    auto iteration_values = reusable.empty() ?
+        at::empty({batch_size, MAX_LEGAL_MOVES}, value_opts) : reusable[7];
+    auto iteration_bounds = reusable.empty() ?
+        at::empty({batch_size, MAX_LEGAL_MOVES}, move_opts) : reusable[8];
+    auto killer_workspace = reusable.empty() ?
+        at::empty({batch_size, AB_MAX_PV * 2}, stat_opts) : reusable[9];
+    auto history_workspace = reusable.empty() ?
+        at::empty({batch_size, AB_ORDERING_SIZE}, stat_opts) : reusable[10];
+    // These heuristics are search-local. Reset only active rows while the
+    // much larger TT is invalidated in O(1) with a generation number.
+    killer_workspace.narrow(0, 0, batch_size).fill_(-1);
+    history_workspace.narrow(0, 0, batch_size).zero_();
     auto frame_workspace = explicit_stack ? at::zeros(
         {batch_size, AB_MAX_PV, (int64_t)sizeof(ABExplicitFrame)}, move_opts) :
         at::zeros({1}, move_opts);
@@ -1841,6 +1866,7 @@ static FNNAlphaBetaBatchOutputs run_fnn_alphabeta_batch(
         tt_values.data_ptr<float>(), tt_depths.data_ptr<int16_t>(), \
         tt_bounds.data_ptr<uint8_t>(), \
         reinterpret_cast<ABPackedMove*>(tt_moves.data_ptr<int>()), \
+        tt_generations.data_ptr<int>(), tt_generation, \
         order_workspace.data_ptr<float>(), iteration_values.data_ptr<float>(), \
         iteration_bounds.data_ptr<uint8_t>(), \
         reinterpret_cast<ABPackedMove*>(killer_workspace.data_ptr<int>()), \
@@ -1856,22 +1882,88 @@ static FNNAlphaBetaBatchOutputs run_fnn_alphabeta_batch(
             FNN_AB_KERNEL_ARGS);
     }
 #undef FNN_AB_KERNEL_ARGS
-    constexpr int pv_threads = 32;
-    const int pv_blocks = (batch_size + pv_threads - 1) / pv_threads;
-    fnn_alphabeta_pv_kernel<<<pv_blocks, pv_threads>>>(
-        reinterpret_cast<const HiveState*>(states.data_ptr<uint8_t>()),
-        reinterpret_cast<const GPUMove*>(moves.data_ptr<uint8_t>()),
-        stats.data_ptr<int>(),
-        reinterpret_cast<const uint64_t*>(tt_keys.data_ptr<int64_t>()),
-        tt_values.data_ptr<float>(), tt_depths.data_ptr<int16_t>(),
-        tt_bounds.data_ptr<uint8_t>(),
-        reinterpret_cast<const ABPackedMove*>(tt_moves.data_ptr<int>()),
-        tt_entries, reinterpret_cast<GPUMove*>(pv_moves.data_ptr<uint8_t>()),
-        pv_lengths.data_ptr<int>(), batch_size);
+    if (build_pv) {
+        constexpr int pv_threads = 32;
+        const int pv_blocks = (batch_size + pv_threads - 1) / pv_threads;
+        fnn_alphabeta_pv_kernel<<<pv_blocks, pv_threads>>>(
+            reinterpret_cast<const HiveState*>(states.data_ptr<uint8_t>()),
+            reinterpret_cast<const GPUMove*>(moves.data_ptr<uint8_t>()),
+            stats.data_ptr<int>(),
+            reinterpret_cast<const uint64_t*>(tt_keys.data_ptr<int64_t>()),
+            tt_values.data_ptr<float>(), tt_depths.data_ptr<int16_t>(),
+            tt_bounds.data_ptr<uint8_t>(),
+            reinterpret_cast<const ABPackedMove*>(tt_moves.data_ptr<int>()),
+            tt_entries, reinterpret_cast<GPUMove*>(pv_moves.data_ptr<uint8_t>()),
+            tt_generations.data_ptr<int>(), tt_generation,
+            pv_lengths.data_ptr<int>(), batch_size);
+    }
     return {
         moves, values, stats, raw_values, root_moves, num_legal,
         root_scores, root_bounds, selected_indices, pv_moves, pv_lengths,
     };
+}
+
+std::vector<at::Tensor> fnn_alphabeta_workspace(
+    at::Tensor states, int capacity
+) {
+    TORCH_CHECK(states.is_cuda(), "workspace template must be a CUDA tensor");
+    TORCH_CHECK(capacity > 0, "workspace capacity must be positive");
+    auto dev = states.device();
+    auto u8 = at::TensorOptions().dtype(c10::kByte).device(dev);
+    auto f32 = at::TensorOptions().dtype(c10::kFloat).device(dev);
+    auto i32 = at::TensorOptions().dtype(c10::kInt).device(dev);
+    auto i64 = at::TensorOptions().dtype(c10::kLong).device(dev);
+    auto i16 = at::TensorOptions().dtype(c10::kShort).device(dev);
+    constexpr int tt_entries = 16384;
+    return {
+        at::empty({capacity, tt_entries}, i64),
+        at::empty({capacity, tt_entries}, f32),
+        at::empty({capacity, tt_entries}, i16),
+        at::empty({capacity, tt_entries}, u8),
+        at::empty({capacity, tt_entries}, i32),
+        at::zeros({capacity, tt_entries}, i32),
+        at::empty({capacity, MAX_LEGAL_MOVES}, f32),
+        at::empty({capacity, MAX_LEGAL_MOVES}, f32),
+        at::empty({capacity, MAX_LEGAL_MOVES}, u8),
+        at::empty({capacity, AB_MAX_PV * 2}, i32),
+        at::empty({capacity, AB_ORDERING_SIZE}, i32),
+    };
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+fnn_alphabeta_batch_reuse(
+    at::Tensor states, at::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    at::Tensor search_config, int node_budget, int max_depth,
+    const std::vector<at::Tensor>& workspace, int tt_generation
+) {
+    TORCH_CHECK(tt_generation > 0, "TT generation must be positive");
+    auto out = run_fnn_alphabeta_batch(
+        states, weights, hidden_dim, embed_dim, action_hidden,
+        search_config, node_budget, max_depth, 1, false, false,
+        workspace, tt_generation);
+    return std::make_tuple(out.moves, out.values, out.stats);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor>
+fnn_alphabeta_teacher_batch_reuse(
+    at::Tensor states, at::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    at::Tensor search_config, int node_budget, int max_depth,
+    int root_exact_count, const std::vector<at::Tensor>& workspace,
+    int tt_generation
+) {
+    TORCH_CHECK(tt_generation > 0, "TT generation must be positive");
+    auto out = run_fnn_alphabeta_batch(
+        states, weights, hidden_dim, embed_dim, action_hidden,
+        search_config, node_budget, max_depth, root_exact_count, false, true,
+        workspace, tt_generation);
+    return std::make_tuple(
+        out.moves, out.values, out.stats, out.raw_values, out.root_moves,
+        out.num_legal, out.root_scores, out.root_bounds, out.selected_indices,
+        out.pv_moves, out.pv_lengths);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
@@ -1882,7 +1974,7 @@ fnn_alphabeta_batch(
 ) {
     auto out = run_fnn_alphabeta_batch(
         states, weights, hidden_dim, embed_dim, action_hidden,
-        search_config, node_budget, max_depth, 1, false);
+        search_config, node_budget, max_depth, 1, false, false);
     return std::make_tuple(out.moves, out.values, out.stats);
 }
 
@@ -1894,7 +1986,7 @@ fnn_alphabeta_resumable_batch(
 ) {
     auto out = run_fnn_alphabeta_batch(
         states, weights, hidden_dim, embed_dim, action_hidden,
-        search_config, node_budget, max_depth, 1, true);
+        search_config, node_budget, max_depth, 1, true, false);
     return std::make_tuple(out.moves, out.values, out.stats);
 }
 
@@ -1909,7 +2001,7 @@ fnn_alphabeta_teacher_batch(
 ) {
     auto out = run_fnn_alphabeta_batch(
         states, weights, hidden_dim, embed_dim, action_hidden,
-        search_config, node_budget, max_depth, root_exact_count, false);
+        search_config, node_budget, max_depth, root_exact_count, false, true);
     return std::make_tuple(
         out.moves, out.values, out.stats, out.raw_values, out.root_moves,
         out.num_legal, out.root_scores, out.root_bounds, out.selected_indices,

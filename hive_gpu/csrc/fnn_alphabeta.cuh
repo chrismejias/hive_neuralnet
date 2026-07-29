@@ -12,6 +12,10 @@ constexpr float AB_MATE = 10.0f;
 constexpr float AB_PVS_EPSILON = 1e-4f;
 constexpr int AB_MAX_PV = 64;
 constexpr int AB_HISTORY_SIZE = 1024;
+constexpr int AB_COUNTERMOVE_SIZE = 1024;
+constexpr int AB_CONTINUATION_SIZE = 2048;
+constexpr int AB_ORDERING_SIZE =
+    AB_HISTORY_SIZE + AB_COUNTERMOVE_SIZE + AB_CONTINUATION_SIZE;
 
 enum ABTTBound : uint8_t {
     AB_TT_EMPTY = 0,
@@ -26,6 +30,8 @@ struct ABTT {
     int16_t* depths;
     uint8_t* bounds;
     uint32_t* moves;
+    int* generations;
+    int generation;
     int mask;
 };
 
@@ -56,6 +62,20 @@ struct ABSearchConfig {
     float branching_allocation;
     float early_stop_score;
     int early_stop_min_depth;
+    bool recursive_threat_qsearch;
+    bool forced_extensions;
+    int forced_extension_max_chain;
+    bool singular_extensions;
+    int singular_min_depth;
+    float singular_margin;
+    bool proof_search;
+    int proof_max_plies;
+    float proof_budget_fraction;
+    int proof_trigger_surround;
+    bool persistent_tt;
+    bool countermove_ordering;
+    bool continuation_history;
+    bool internal_policy_ordering;
 };
 
 constexpr int AB_TACTICAL_IMMOBILIZE = 1;
@@ -69,9 +89,11 @@ __device__ inline ABSearchConfig ab_make_search_config(const float* values) {
     config.lmr_min_depth = max(1, (int)values[1]);
     config.lmr_min_move = max(1, (int)values[2]);
     config.lmr_reduction = max(0, (int)values[3]);
-    // Quiescence is intentionally capped at one tactical reply. Deeper
-    // tactical sequences belong in the regular alpha-beta tree.
-    config.quiescence_plies = min(1, max(0, (int)values[4]));
+    // Preserve legacy one-reply behavior unless recursive threat search is enabled.
+    config.recursive_threat_qsearch = values[13] >= 0.5f;
+    config.quiescence_plies = min(
+        config.recursive_threat_qsearch ? 4 : 1,
+        max(0, (int)values[4]));
     config.quiescence_budget_fraction =
         min(0.95f, max(0.0f, values[5]));
     config.force_win_probes = values[6] >= 0.5f;
@@ -82,6 +104,19 @@ __device__ inline ABSearchConfig ab_make_search_config(const float* values) {
         min(0.75f, max(-0.75f, values[10]));
     config.early_stop_score = min(9.99f, max(1.0f, values[11]));
     config.early_stop_min_depth = max(1, (int)values[12]);
+    config.forced_extensions = values[14] >= 0.5f;
+    config.forced_extension_max_chain = max(0, (int)values[15]);
+    config.singular_extensions = values[16] >= 0.5f;
+    config.singular_min_depth = max(2, (int)values[17]);
+    config.singular_margin = max(0.0f, values[18]);
+    config.proof_search = values[19] >= 0.5f;
+    config.proof_max_plies = max(1, (int)values[20]);
+    config.proof_budget_fraction = min(0.75f, max(0.0f, values[21]));
+    config.proof_trigger_surround = min(5, max(0, (int)values[22]));
+    config.persistent_tt = values[23] >= 0.5f;
+    config.countermove_ordering = values[24] >= 0.5f;
+    config.continuation_history = values[25] >= 0.5f;
+    config.internal_policy_ordering = values[26] >= 0.5f;
     return config;
 }
 
@@ -303,25 +338,8 @@ __device__ inline float ab_evaluate(
         state, moves, n, cache.ap_mask, params, weights);
 }
 
-__device__ inline float ab_ordering_heuristic(
-    const HiveState& state, const HiveState& child
-) {
-    Color mover = current_player(state);
-    Color opponent = mover == WHITE ? BLACK : WHITE;
-    bool mover_won = (child.result == WHITE_WINS && mover == WHITE) ||
-                     (child.result == BLACK_WINS && mover == BLACK);
-    if (mover_won) return 100.0f;
-    int opp_gain =
-        queen_surround_count_for_color_device(child, opponent) -
-        queen_surround_count_for_color_device(state, opponent);
-    int own_relief =
-        queen_surround_count_for_color_device(state, mover) -
-        queen_surround_count_for_color_device(child, mover);
-    return (float)(opp_gain + own_relief);
-}
-
 __device__ inline void ab_policy_scores(
-    const HiveState& state, const GPUMove* moves, int n,
+    HiveState& state, const GPUMove* moves, int n,
     const float* params, const FNNWeights& weights,
     const ABSearchConfig& config, const Bitboard& root_ap_mask,
     float* scores
@@ -330,23 +348,40 @@ __device__ inline void ab_policy_scores(
     extract_fnn_features_with_ap_device(
         state, moves, n, root_ap_mask, root_features);
     fnn_encode(root_features, root_embed, params, weights);
+    Color mover = current_player(state);
+    Color opponent = mover == WHITE ? BLACK : WHITE;
+    int root_opp_surround = config.tactical_ordering_weight > 0.0f ?
+        queen_surround_count_for_color_device(state, opponent) : 0;
+    int root_own_surround = config.tactical_ordering_weight > 0.0f ?
+        queen_surround_count_for_color_device(state, mover) : 0;
     for (int i = 0; i < n; ++i) {
-        HiveState child = state;
-        apply_move(child, moves[i]);
+        ABUndo undo;
+        ab_make_move_unhashed(state, moves[i], undo);
         GPUMove child_moves[MAX_LEGAL_MOVES];
         MovegenStateCache child_cache;
         int child_n = generate_fnn_feature_moves_with_cache(
-            child, child_moves, child_cache);
+            state, child_moves, child_cache);
         float child_features[FNN_FEAT_DIM], child_embed[FNN_MAX_EMBED];
         extract_fnn_features_with_ap_device(
-            child, child_moves, child_n, child_cache.ap_mask, child_features);
+            state, child_moves, child_n, child_cache.ap_mask, child_features);
         fnn_encode(child_features, child_embed, params, weights);
+        float tactical = 0.0f;
+        if (config.tactical_ordering_weight > 0.0f) {
+            bool mover_won =
+                (state.result == WHITE_WINS && mover == WHITE) ||
+                (state.result == BLACK_WINS && mover == BLACK);
+            tactical = mover_won ? 100.0f : (float)(
+                queen_surround_count_for_color_device(state, opponent) -
+                    root_opp_surround +
+                root_own_surround -
+                    queen_surround_count_for_color_device(state, mover));
+        }
         scores[i] =
             config.policy_ordering_weight * fnn_score_action(
                 root_embed, child_embed, root_features, child_features,
                 params, weights)
-            + config.tactical_ordering_weight *
-                ab_ordering_heuristic(state, child);
+            + config.tactical_ordering_weight * tactical;
+        ab_unmake_move(state, undo);
     }
 }
 
@@ -366,13 +401,29 @@ __device__ __forceinline__ int ab_move_history_index(const GPUMove& move) {
 
 __device__ inline float ab_search_order_score(
     const HiveState& state, const GPUMove& move, int ply,
-    const ABPackedMove* killers, const int* history
+    const ABPackedMove* killers, const int* history,
+    const ABSearchConfig& config, ABPackedMove previous_move
 ) {
     Color mover = current_player(state);
     Color opponent = mover == WHITE ? BLACK : WHITE;
-    float score = (float)history[ab_move_history_index(move)];
+    int move_index = ab_move_history_index(move);
+    ABPackedMove packed = ab_pack_move(move);
+    float score = (float)history[move_index];
+    if (previous_move != AB_NO_MOVE) {
+        int previous_index = (int)(previous_move & (AB_HISTORY_SIZE - 1));
+        if (config.countermove_ordering &&
+            (ABPackedMove)history[AB_HISTORY_SIZE + previous_index] == packed) {
+            score += 850000.0f;
+        }
+        if (config.continuation_history) {
+            int continuation_index = (int)(
+                (previous_move * 33U + (uint32_t)move_index) &
+                (AB_CONTINUATION_SIZE - 1));
+            score += (float)history[
+                AB_HISTORY_SIZE + AB_COUNTERMOVE_SIZE + continuation_index];
+        }
+    }
     if (ply < AB_MAX_PV) {
-        ABPackedMove packed = ab_pack_move(move);
         if (packed == killers[ply * 2]) score += 1000000.0f;
         else if (packed == killers[ply * 2 + 1]) score += 900000.0f;
     }
@@ -388,19 +439,35 @@ __device__ inline float ab_search_order_score(
         move.piece_type == PT_PILLBUG) {
         score += 100.0f;
     }
+    if (config.internal_policy_ordering) {
+        int pressure = queen_surround_count_for_color_device(state, opponent);
+        if (ab_adjacent_to((int)move.to_cell, state.queen_cell[opponent])) {
+            score += 2500.0f * pressure;
+        }
+        if (move.type == MOVE_MOVE &&
+            ab_adjacent_to((int)move.from_cell, state.queen_cell[opponent]) &&
+            !ab_adjacent_to((int)move.to_cell, state.queen_cell[opponent])) {
+            score -= 4000.0f;
+        }
+        if (move.piece_type == PT_BEETLE || move.piece_type == PT_PILLBUG) {
+            score += 250.0f * pressure;
+        }
+    }
     return score;
 }
 
 __device__ inline void ab_order_move_at_rank(
     const HiveState& state, ABPackedMove* moves, int n, int rank,
     int ply, const ABPackedMove* killers, const int* history,
-    ABPackedMove tt_move
+    ABPackedMove tt_move, const ABSearchConfig& config,
+    ABPackedMove previous_move
 ) {
     int best_index = rank;
     float best_score = -1e30f;
     for (int i = rank; i < n; ++i) {
         GPUMove move = ab_unpack_move(moves[i]);
-        float score = ab_search_order_score(state, move, ply, killers, history);
+        float score = ab_search_order_score(
+            state, move, ply, killers, history, config, previous_move);
         if (moves[i] == tt_move) {
             score += 1e20f;
         }
@@ -421,13 +488,14 @@ __device__ inline void ab_order_move_at_rank(
 __device__ inline void ab_order_native_move_at_rank(
     const HiveState& state, GPUMove* moves, int n, int rank,
     int ply, const ABPackedMove* killers, const int* history,
-    ABPackedMove tt_move
+    ABPackedMove tt_move, const ABSearchConfig& config,
+    ABPackedMove previous_move
 ) {
     int best_index = rank;
     float best_score = -1e30f;
     for (int i = rank; i < n; ++i) {
         float score = ab_search_order_score(
-            state, moves[i], ply, killers, history);
+            state, moves[i], ply, killers, history, config, previous_move);
         if (ab_pack_move(moves[i]) == tt_move) score += 1e20f;
         if (score > best_score) {
             best_score = score;
@@ -450,19 +518,39 @@ __device__ __noinline__ int ab_generate_packed_moves(
     return n;
 }
 
+__device__ __forceinline__ float ab_tt_store_value(
+    float value, int ply, bool normalize
+) {
+    if (!normalize) return value;
+    if (value > AB_MATE - 1.1f) return value + min(ply, 100) * 0.01f;
+    if (value < -AB_MATE + 1.1f) return value - min(ply, 100) * 0.01f;
+    return value;
+}
+
+__device__ __forceinline__ float ab_tt_load_value(
+    float value, int ply, bool normalize
+) {
+    if (!normalize) return value;
+    if (value > AB_MATE - 1.1f) return value - min(ply, 100) * 0.01f;
+    if (value < -AB_MATE + 1.1f) return value + min(ply, 100) * 0.01f;
+    return value;
+}
+
 __device__ inline void ab_tt_store(
     const ABTT& tt, uint64_t key, int depth, float value, uint8_t bound,
-    const GPUMove& best_move
+    const GPUMove& best_move, int ply, bool normalize_mate
 ) {
     int slot = (int)(key & (uint64_t)tt.mask);
-    if (tt.keys[slot] == key || depth >= (int)tt.depths[slot]) {
+    bool occupied = tt.generations[slot] == tt.generation;
+    if (!occupied || tt.keys[slot] == key || depth >= (int)tt.depths[slot]) {
         // Publish the key last so a partially-written entry is never accepted.
-        tt.values[slot] = value;
+        tt.values[slot] = ab_tt_store_value(value, ply, normalize_mate);
         tt.depths[slot] = (int16_t)depth;
         tt.bounds[slot] = bound;
         tt.moves[slot] = ab_pack_move(best_move);
         __threadfence();
         tt.keys[slot] = key;
+        tt.generations[slot] = tt.generation;
     }
 }
 
@@ -488,6 +576,16 @@ __device__ inline bool ab_take_node(
 __device__ inline bool ab_color_won(const HiveState& state, Color color) {
     return (color == WHITE && state.result == WHITE_WINS) ||
            (color == BLACK && state.result == BLACK_WINS);
+}
+
+__device__ inline bool ab_side_under_immediate_threat(const HiveState& state) {
+    if (state.result != IN_PROGRESS) return false;
+    Color side = current_player(state);
+    if (queen_surround_count_for_color_device(state, side) < 5) return false;
+    HiveState probe = state;
+    probe.turn ^= 1U;
+    probe.stunned_cell = 0xFFFF;
+    return has_immediate_surround_win_for_current_player(probe);
 }
 
 __device__ inline bool ab_power_piece_mobile(
@@ -593,13 +691,47 @@ __device__ inline bool ab_priority_q_candidate(
     return false;
 }
 
+__device__ bool ab_prove_forced_win(
+    HiveState& state, Color attacker, int remaining, int* nodes, int limit
+) {
+    if (state.result != IN_PROGRESS) return ab_color_won(state, attacker);
+    if (remaining <= 0 || *nodes >= limit) return false;
+    ++(*nodes);
+    GPUMove moves[MAX_LEGAL_MOVES];
+    int n = generate_legal_moves(state, moves);
+    if (n <= 0) return false;
+    bool attacker_turn = current_player(state) == attacker;
+    if (attacker_turn) {
+        for (int i = 0; i < n; ++i) {
+            ABUndo undo;
+            ab_make_move_unhashed(state, moves[i], undo);
+            bool proven = ab_prove_forced_win(
+                state, attacker, remaining - 1, nodes, limit);
+            ab_unmake_move(state, undo);
+            if (proven) return true;
+            if (*nodes >= limit) return false;
+        }
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        ABUndo undo;
+        ab_make_move_unhashed(state, moves[i], undo);
+        bool proven = ab_prove_forced_win(
+            state, attacker, remaining - 1, nodes, limit);
+        ab_unmake_move(state, undo);
+        if (!proven) return false;
+    }
+    return true;
+}
+
 __device__ float ab_quiescence(
     HiveState& state, float alpha, float beta, int ply,
     const float* params, const FNNWeights& weights, int node_budget,
-    ABStats* stats, const ABSearchConfig& config
+    ABStats* stats, const ABSearchConfig& config, int remaining = -1
 ) {
     if (state.result != IN_PROGRESS) return ab_terminal_value(state, ply);
-    if (config.quiescence_plies <= 0) {
+    int qplies = remaining < 0 ? config.quiescence_plies : remaining;
+    if (qplies <= 0) {
         return ab_evaluate(state, params, weights);
     }
     GPUMove moves[MAX_LEGAL_MOVES];
@@ -658,6 +790,10 @@ __device__ float ab_quiescence(
             float value;
             if (state.result != IN_PROGRESS) {
                 value = -ab_terminal_value(state, ply + 1);
+            } else if (config.recursive_threat_qsearch && qplies > 1) {
+                value = -ab_quiescence(
+                    state, -beta, -alpha, ply + 1, params, weights,
+                    node_budget, stats, config, qplies - 1);
             } else {
                 GPUMove feature_moves[MAX_LEGAL_MOVES];
                 if (!child_cache_ready) {
@@ -685,7 +821,8 @@ __device__ float ab_negamax(
     HiveState& state, uint64_t hash, int depth, float alpha, float beta, int ply,
     const float* params, const FNNWeights& weights, int node_budget,
     ABStats* stats, const ABTT& tt, const ABSearchConfig& config,
-    ABPackedMove* killers, int* history
+    ABPackedMove* killers, int* history, int extension_chain = 0,
+    ABPackedMove previous_move = AB_NO_MOVE
 ) {
     if (!ab_take_node(stats, node_budget, config)) return 0.0f;
     if (state.result != IN_PROGRESS) return ab_terminal_value(state, ply);
@@ -701,12 +838,14 @@ __device__ float ab_negamax(
     const int tt_slot = (int)(key & (uint64_t)tt.mask);
     ABPackedMove tt_move = AB_NO_MOVE;
     bool has_tt_move = false;
-    if (tt.keys[tt_slot] == key) {
+    if (tt.generations[tt_slot] == tt.generation &&
+        tt.keys[tt_slot] == key) {
         has_tt_move = true;
         tt_move = tt.moves[tt_slot];
         if ((int)tt.depths[tt_slot] >= depth) {
             ++stats->tt_hits;
-            float tt_value = tt.values[tt_slot];
+            float tt_value = ab_tt_load_value(
+                tt.values[tt_slot], ply, config.persistent_tt);
             uint8_t tt_bound = tt.bounds[tt_slot];
             if (tt_bound == AB_TT_EXACT) return tt_value;
             if (tt_bound == AB_TT_LOWER) alpha = max(alpha, tt_value);
@@ -718,23 +857,60 @@ __device__ float ab_negamax(
     GPUMove moves[MAX_LEGAL_MOVES];
     int n = generate_legal_moves(state, moves);
     if (n <= 0) return ab_evaluate(state, params, weights);
+    bool extend_node = config.forced_extensions &&
+        extension_chain < config.forced_extension_max_chain &&
+        (n == 1 || ab_side_under_immediate_threat(state));
+    int next_depth = depth - 1 + (extend_node ? 1 : 0);
+    int next_extension_chain = extend_node ? extension_chain + 1 : 0;
+    ABPackedMove singular_move = AB_NO_MOVE;
+    if (config.singular_extensions && has_tt_move &&
+        depth >= config.singular_min_depth &&
+        (int)tt.depths[tt_slot] >= depth - 1 &&
+        (tt.bounds[tt_slot] == AB_TT_EXACT ||
+         tt.bounds[tt_slot] == AB_TT_LOWER)) {
+        float threshold = ab_tt_load_value(
+            tt.values[tt_slot], ply, config.persistent_tt) -
+            config.singular_margin;
+        bool singular = true;
+        ABSearchConfig verify_config = config;
+        verify_config.singular_extensions = false;
+        int verify_depth = max(0, depth / 2 - 1);
+        for (int i = 0; i < n; ++i) {
+            if (ab_pack_move(moves[i]) == tt_move) continue;
+            ABUndo verify_undo;
+            uint64_t verify_hash = ab_make_move(
+                state, moves[i], hash, verify_undo);
+            float alternative = -ab_negamax(
+                state, verify_hash, verify_depth, -AB_INF, -threshold,
+                ply + 1, params, weights, node_budget, stats, tt,
+                verify_config, killers, history, 0, ab_pack_move(moves[i]));
+            ab_unmake_move(state, verify_undo);
+            if (stats->aborted || alternative >= threshold) {
+                singular = false;
+                break;
+            }
+        }
+        if (singular) singular_move = tt_move;
+    }
 
     float best = -AB_INF;
     GPUMove best_move = moves[0];
     for (int rank = 0; rank < n; ++rank) {
         ab_order_native_move_at_rank(
             state, moves, n, rank, ply, killers, history,
-            has_tt_move ? tt_move : AB_NO_MOVE);
+            has_tt_move ? tt_move : AB_NO_MOVE, config, previous_move);
         GPUMove move = moves[rank];
+        int move_depth = next_depth +
+            (ab_pack_move(move) == singular_move ? 1 : 0);
         ABUndo undo;
         uint64_t child_hash = ab_make_move(state, move, hash, undo);
 
         float value;
         if (rank == 0) {
             value = -ab_negamax(
-                state, child_hash, depth - 1, -beta, -alpha, ply + 1,
+                state, child_hash, move_depth, -beta, -alpha, ply + 1,
                 params, weights, node_budget, stats, tt, config,
-                killers, history);
+                killers, history, next_extension_chain, ab_pack_move(move));
         } else {
             int reduction = (
                 depth >= config.lmr_min_depth &&
@@ -742,22 +918,23 @@ __device__ float ab_negamax(
             ) ? min(config.lmr_reduction, max(0, depth - 1)) : 0;
             if (reduction) ++stats->lmr_reductions;
             value = -ab_negamax(
-                state, child_hash, depth - 1 - reduction,
+                state, child_hash, move_depth - reduction,
                 -alpha - AB_PVS_EPSILON, -alpha, ply + 1, params, weights,
-                node_budget, stats, tt, config, killers, history);
+                node_budget, stats, tt, config, killers, history,
+                next_extension_chain);
             if (!stats->aborted && reduction && value > alpha) {
                 ++stats->pvs_researches;
                 value = -ab_negamax(
-                    state, child_hash, depth - 1, -alpha - AB_PVS_EPSILON,
+                    state, child_hash, move_depth, -alpha - AB_PVS_EPSILON,
                     -alpha, ply + 1, params, weights, node_budget, stats, tt,
-                    config, killers, history);
+                    config, killers, history, next_extension_chain, ab_pack_move(move));
             }
             if (!stats->aborted && value > alpha && value < beta) {
                 ++stats->pvs_researches;
                 value = -ab_negamax(
-                    state, child_hash, depth - 1, -beta, -alpha, ply + 1,
+                    state, child_hash, move_depth, -beta, -alpha, ply + 1,
                     params, weights, node_budget, stats, tt, config,
-                    killers, history);
+                    killers, history, next_extension_chain, ab_pack_move(move));
             }
         }
         ab_unmake_move(state, undo);
@@ -772,6 +949,19 @@ __device__ float ab_negamax(
             int history_index = ab_move_history_index(move);
             history[history_index] = min(
                 1000000, history[history_index] + depth * depth);
+            if (previous_move != AB_NO_MOVE && config.countermove_ordering) {
+                int previous_index = (int)(
+                    previous_move & (AB_HISTORY_SIZE - 1));
+                history[AB_HISTORY_SIZE + previous_index] = (int)ab_pack_move(move);
+            }
+            if (previous_move != AB_NO_MOVE && config.continuation_history) {
+                int continuation_index = (int)(
+                    (previous_move * 33U + (uint32_t)history_index) &
+                    (AB_CONTINUATION_SIZE - 1));
+                int slot = AB_HISTORY_SIZE + AB_COUNTERMOVE_SIZE +
+                    continuation_index;
+                history[slot] = min(1000000, history[slot] + depth * depth);
+            }
             ABPackedMove packed = ab_pack_move(move);
             if (ply < AB_MAX_PV && packed != killers[ply * 2]) {
                 killers[ply * 2 + 1] = killers[ply * 2];
@@ -784,7 +974,8 @@ __device__ float ab_negamax(
     uint8_t bound = AB_TT_EXACT;
     if (best <= alpha_start) bound = AB_TT_UPPER;
     else if (best >= beta_start) bound = AB_TT_LOWER;
-    ab_tt_store(tt, key, depth, best, bound, best_move);
+    ab_tt_store(
+        tt, key, depth, best, bound, best_move, ply, config.persistent_tt);
     return best;
 }
 
@@ -922,6 +1113,23 @@ __device__ float ab_negamax_explicit(
                 int history_index = ab_move_history_index(move);
                 history[history_index] = min(
                     1000000, history[history_index] + frame.depth * frame.depth);
+                ABPackedMove previous = top > 0 ?
+                    frames[top - 1].current_move : AB_NO_MOVE;
+                if (previous != AB_NO_MOVE && config.countermove_ordering) {
+                    int previous_index = (int)(
+                        previous & (AB_HISTORY_SIZE - 1));
+                    history[AB_HISTORY_SIZE + previous_index] =
+                        (int)frame.current_move;
+                }
+                if (previous != AB_NO_MOVE && config.continuation_history) {
+                    int continuation_index = (int)(
+                        (previous * 33U + (uint32_t)history_index) &
+                        (AB_CONTINUATION_SIZE - 1));
+                    int slot = AB_HISTORY_SIZE + AB_COUNTERMOVE_SIZE +
+                        continuation_index;
+                    history[slot] = min(
+                        1000000, history[slot] + frame.depth * frame.depth);
+                }
                 if (frame.ply < AB_MAX_PV &&
                     frame.current_move != killers[frame.ply * 2]) {
                     killers[frame.ply * 2 + 1] = killers[frame.ply * 2];
@@ -954,12 +1162,15 @@ __device__ float ab_negamax_explicit(
                 frame.alpha_start = frame.alpha;
                 frame.beta_start = frame.beta;
                 int tt_slot = (int)(frame.hash & (uint64_t)tt.mask);
-                if (tt.keys[tt_slot] == frame.hash) {
+                if (tt.generations[tt_slot] == tt.generation &&
+                    tt.keys[tt_slot] == frame.hash) {
                     frame.has_tt_move = 1;
                     frame.tt_move = tt.moves[tt_slot];
                     if ((int)tt.depths[tt_slot] >= frame.depth) {
                         ++stats->tt_hits;
-                        float tt_value = tt.values[tt_slot];
+                        float tt_value = ab_tt_load_value(
+                            tt.values[tt_slot], frame.ply,
+                            config.persistent_tt);
                         uint8_t tt_bound = tt.bounds[tt_slot];
                         if (tt_bound == AB_TT_EXACT) {
                             immediate = tt_value;
@@ -1007,7 +1218,8 @@ __device__ float ab_negamax_explicit(
             else if (frame.best >= frame.beta_start) bound = AB_TT_LOWER;
             ab_tt_store(
                 tt, frame.hash, frame.depth, frame.best, bound,
-                ab_unpack_move(frame.best_move));
+                ab_unpack_move(frame.best_move), frame.ply,
+                config.persistent_tt);
             float result = frame.best;
             if (top == 0) return result;
             --top;
@@ -1018,7 +1230,8 @@ __device__ float ab_negamax_explicit(
 
         ab_order_move_at_rank(
             state, moves, frame.move_count, frame.rank, frame.ply, killers,
-            history, frame.has_tt_move ? frame.tt_move : AB_NO_MOVE);
+            history, frame.has_tt_move ? frame.tt_move : AB_NO_MOVE, config,
+            top > 0 ? frames[top - 1].current_move : AB_NO_MOVE);
         frame.current_move = moves[frame.rank];
         frame.phase = 0;
         frame.reduction = (
@@ -1095,7 +1308,8 @@ __device__ inline void ab_write_pv(
         if (state.result != IN_PROGRESS) break;
 
         int slot = (int)(hash & (uint64_t)tt.mask);
-        if (tt.keys[slot] != hash) break;
+        if (tt.generations[slot] != tt.generation ||
+            tt.keys[slot] != hash) break;
         move = ab_unpack_move(tt.moves[slot]);
     }
     *out_length = length;
@@ -1111,6 +1325,7 @@ __global__ void fnn_alphabeta_kernel(
     uint8_t* out_root_bounds, int* out_selected_indices,
     uint64_t* tt_keys, float* tt_values, int16_t* tt_depths,
     uint8_t* tt_bounds, ABPackedMove* tt_moves,
+    int* tt_generations, int tt_generation,
     float* order_workspace, float* iteration_value_workspace,
     uint8_t* iteration_bound_workspace, ABPackedMove* killer_workspace,
     int* history_workspace, ABExplicitFrame* frame_workspace,
@@ -1126,6 +1341,8 @@ __global__ void fnn_alphabeta_kernel(
         tt_depths + (int64_t)game * tt_entries,
         tt_bounds + (int64_t)game * tt_entries,
         tt_moves + (int64_t)game * tt_entries,
+        tt_generations + (int64_t)game * tt_entries,
+        tt_generation,
         tt_entries - 1,
     };
     HiveState root = states[game];
@@ -1138,11 +1355,40 @@ __global__ void fnn_alphabeta_kernel(
     out_raw_values[game] = ab_evaluate_with_moves_and_ap(
         root, root_moves, n, root_cache.ap_mask, params, weights);
     if (n <= 0) return;
+    Color root_player = current_player(root);
+    int proof_nodes = 0;
+    if (config.proof_search &&
+        queen_surround_count_for_color_device(root,
+            root_player == WHITE ? BLACK : WHITE) >=
+            config.proof_trigger_surround) {
+        int proof_limit = max(1, (int)(node_budget * config.proof_budget_fraction));
+        for (int i = 0; i < n && proof_nodes < proof_limit; ++i) {
+            ABUndo undo;
+            ab_make_move_unhashed(root, root_moves[i], undo);
+            bool proven = ab_prove_forced_win(
+                root, root_player, config.proof_max_plies - 1,
+                &proof_nodes, proof_limit);
+            ab_unmake_move(root, undo);
+            if (proven) {
+                out_moves[game] = root_moves[i];
+                out_values[game] = AB_MATE - 0.01f;
+                int* game_stats = out_stats + game * 9;
+                game_stats[0] = config.proof_max_plies;
+                game_stats[1] = proof_nodes;
+                game_stats[7] = proof_nodes;
+                game_stats[8] = 1;
+                out_root_scores[root_offset + i] = AB_MATE - 0.01f;
+                out_root_bounds[root_offset + i] = AB_TT_EXACT;
+                out_selected_indices[game] = i;
+                return;
+            }
+        }
+    }
     float branch_scale = 1.0f + config.branching_allocation *
         ((float)n / 24.0f - 1.0f);
     branch_scale = min(1.5f, max(0.5f, branch_scale));
-    int search_node_budget = max(1, (int)(node_budget * branch_scale));
-    Color root_player = current_player(root);
+    int search_node_budget = max(
+        1, (int)((node_budget - proof_nodes) * branch_scale));
     for (int i = 0; i < n; ++i) {
         ABUndo undo;
         ab_make_move(root, root_moves[i], root_hash, undo);
@@ -1180,6 +1426,8 @@ __global__ void fnn_alphabeta_kernel(
     int best_index = 0;
     int completed = 0;
     ABStats stats = {};
+    stats.nodes = proof_nodes;
+    stats.forced_win_probes = proof_nodes;
     root_exact_count = max(1, min(root_exact_count, n));
 
     for (int depth = 1; depth <= max_depth; ++depth) {
@@ -1307,6 +1555,7 @@ __global__ void fnn_alphabeta_pv_kernel(
     const uint64_t* tt_keys, const float* tt_values,
     const int16_t* tt_depths, const uint8_t* tt_bounds,
     const ABPackedMove* tt_moves, int tt_entries, GPUMove* out_pv_moves,
+    const int* tt_generations, int tt_generation,
     int* out_pv_lengths, int batch_size
 ) {
     int game = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1317,6 +1566,8 @@ __global__ void fnn_alphabeta_pv_kernel(
         const_cast<int16_t*>(tt_depths + (int64_t)game * tt_entries),
         const_cast<uint8_t*>(tt_bounds + (int64_t)game * tt_entries),
         const_cast<ABPackedMove*>(tt_moves + (int64_t)game * tt_entries),
+        const_cast<int*>(tt_generations + (int64_t)game * tt_entries),
+        tt_generation,
         tt_entries - 1,
     };
     int depth = max(0, min(stats[game * 9], AB_MAX_PV));

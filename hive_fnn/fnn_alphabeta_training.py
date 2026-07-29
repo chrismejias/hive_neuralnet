@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import hive_gpu
 from hive_fnn.fnn_native_alphabeta import (
     AlphaBetaBound,
+    AlphaBetaGPUContext,
     AlphaBetaSearchConfig,
     AlphaBetaTeacherBatch,
     search_teacher_batch,
@@ -37,6 +38,8 @@ class AlphaBetaRecord:
     completed_depth: int
     nodes: int
     final_result: float
+    depth_value_delta: float = 0.0
+    depth_move_changed: bool = False
 
     @property
     def selected_move(self) -> torch.Tensor:
@@ -61,6 +64,11 @@ class AlphaBetaGenerationConfig:
         default_factory=AlphaBetaSearchConfig,
     )
     seed: int = 0
+    endgame_fraction: float = 0.0
+    endgame_min_surround: int = 4
+    endgame_max_surround: int = 5
+    endgame_mixed_pair: bool = True
+    retain_truncated_teacher_records: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,20 @@ class AlphaBetaLossConfig:
     ranking_score_epsilon: float = 1e-4
     exact_score_loss_weight: float = 0.0
     exact_score_temperature: float = 1.0
+
+
+@dataclass(frozen=True)
+class AlphaBetaReplayPriorityConfig:
+    """Bounded hybrid replay priorities computed when records are generated."""
+
+    enabled: bool = True
+    alpha: float = 0.6
+    uniform_fraction: float = 0.25
+    value_surprise_weight: float = 1.0
+    depth_change_weight: float = 1.0
+    outcome_surprise_weight: float = 0.5
+    complexity_weight: float = 0.25
+    epsilon: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -91,9 +113,15 @@ class AlphaBetaTrainingBatch:
 class AlphaBetaReplayBuffer:
     """Bound-aware replay storage kept separate from MCTS policy targets."""
 
-    def __init__(self, capacity: int = 75_000) -> None:
+    def __init__(
+        self,
+        capacity: int = 75_000,
+        priority_config: AlphaBetaReplayPriorityConfig | None = None,
+    ) -> None:
         self.capacity = max(1, int(capacity))
+        self.priority_config = priority_config or AlphaBetaReplayPriorityConfig()
         self._records: list[AlphaBetaRecord] = []
+        self._priorities: list[float] = []
         self._next = 0
 
     def __len__(self) -> int:
@@ -103,17 +131,91 @@ class AlphaBetaReplayBuffer:
         for record in records:
             if record.completed_depth <= 0:
                 continue
+            priority = self._record_priority(record)
             if len(self._records) < self.capacity:
                 self._records.append(record)
+                self._priorities.append(priority)
             else:
                 self._records[self._next] = record
+                self._priorities[self._next] = priority
             self._next = (self._next + 1) % self.capacity
 
     def sample(self, batch_size: int, *, seed: int | None = None) -> list[AlphaBetaRecord]:
         if not self._records:
             raise ValueError("cannot sample an empty alpha-beta replay buffer")
         rng = random.Random(seed)
-        return [rng.choice(self._records) for _ in range(int(batch_size))]
+        count = int(batch_size)
+        cfg = self.priority_config
+        if not cfg.enabled:
+            return [rng.choice(self._records) for _ in range(count)]
+        uniform_fraction = max(0.0, min(1.0, cfg.uniform_fraction))
+        weights = [
+            max(cfg.epsilon, priority) ** max(0.0, cfg.alpha)
+            for priority in self._priorities
+        ]
+        uniform_count = sum(
+            rng.random() < uniform_fraction for _ in range(count)
+        )
+        samples = [
+            rng.choice(self._records) for _ in range(uniform_count)
+        ]
+        samples.extend(rng.choices(
+            self._records,
+            weights=weights,
+            k=count - uniform_count,
+        ))
+        rng.shuffle(samples)
+        return samples
+
+    def configure_priorities(
+        self,
+        config: AlphaBetaReplayPriorityConfig,
+    ) -> None:
+        self.priority_config = config
+        self._priorities = [
+            self._record_priority(record) for record in self._records
+        ]
+
+    def _record_priority(self, record: AlphaBetaRecord) -> float:
+        cfg = self.priority_config
+        if not cfg.enabled:
+            return 1.0
+
+        value_surprise = min(
+            1.0, abs(float(record.raw_value) - float(record.search_value)) / 2.0,
+        )
+        outcome_surprise = (
+            min(1.0, abs(float(record.search_value) -
+                         float(record.final_result)) / 2.0)
+            if math.isfinite(float(record.final_result)) else 0.0
+        )
+        depth_change = min(
+            1.0,
+            abs(float(getattr(record, "depth_value_delta", 0.0))) / 2.0,
+        )
+        if bool(getattr(record, "depth_move_changed", False)):
+            depth_change = min(1.0, depth_change + 0.5)
+
+        legal_count = max(1, int(record.legal_moves.shape[0]))
+        branching = math.log1p(legal_count) / math.log1p(256)
+        bounds = record.root_bounds
+        exact_fraction = (
+            float((bounds == int(AlphaBetaBound.EXACT)).float().mean())
+            if bounds.numel()
+            else 0.0
+        )
+        bound_uncertainty = 1.0 - exact_fraction
+        depth_difficulty = 1.0 / max(1.0, float(record.completed_depth))
+        complexity = (branching + bound_uncertainty + depth_difficulty) / 3.0
+
+        return max(
+            cfg.epsilon,
+            cfg.epsilon
+            + cfg.value_surprise_weight * value_surprise
+            + cfg.depth_change_weight * depth_change
+            + cfg.outcome_surprise_weight * outcome_surprise
+            + cfg.complexity_weight * complexity,
+        )
 
     def save(self, path: str | Path) -> None:
         torch.save(self.state_dict(), path)
@@ -123,6 +225,8 @@ class AlphaBetaReplayBuffer:
             "capacity": self.capacity,
             "next": self._next,
             "records": self._records,
+            "priorities": self._priorities,
+            "priority_config": asdict(self.priority_config),
         }
 
     def load_state_dict(self, payload: dict) -> None:
@@ -130,6 +234,16 @@ class AlphaBetaReplayBuffer:
         self._records = list(payload["records"])
         if len(self._records) > self.capacity:
             self._records = self._records[-self.capacity:]
+        saved_config = payload.get("priority_config")
+        if saved_config:
+            self.priority_config = AlphaBetaReplayPriorityConfig(**saved_config)
+        saved_priorities = payload.get("priorities")
+        if saved_priorities and len(saved_priorities) == len(self._records):
+            self._priorities = [float(value) for value in saved_priorities]
+        else:
+            self._priorities = [
+                self._record_priority(record) for record in self._records
+            ]
         self._next = int(payload["next"]) % self.capacity
 
     @classmethod
@@ -180,6 +294,28 @@ def _record_from_teacher_row(
         nodes=int(teacher.stats[row, 1]),
         final_result=float(final_result),
     )
+
+
+def _teacher_batch_to_cpu(
+    teacher: AlphaBetaTeacherBatch,
+) -> AlphaBetaTeacherBatch:
+    """Transfer each dense teacher output once instead of once per record."""
+
+    return AlphaBetaTeacherBatch(*(
+        tensor.detach().cpu() for tensor in (
+            teacher.selected_moves,
+            teacher.search_values,
+            teacher.stats,
+            teacher.raw_values,
+            teacher.legal_moves,
+            teacher.num_legal,
+            teacher.root_scores,
+            teacher.root_bounds,
+            teacher.selected_indices,
+            teacher.pv_moves,
+            teacher.pv_lengths,
+        )
+    ))
 
 
 def opening_diversity_candidates(
@@ -257,6 +393,27 @@ def generate_alpha_beta_records(
     ext = hive_gpu.load_extension()
     net = net.cuda().eval()
     states = ext.create_initial_states(cfg.games, cfg.expansion_mask)
+    endgame_count = min(
+        cfg.games, round(cfg.games * max(0.0, min(1.0, cfg.endgame_fraction))),
+    )
+    if endgame_count:
+        from hive_gpu.endgame_generator import (
+            generate_endgame_positions, positions_to_tensor,
+            rebalance_side_to_move,
+        )
+        positions = generate_endgame_positions(
+            endgame_count, expansion_mask=cfg.expansion_mask,
+            min_surround=cfg.endgame_min_surround,
+            max_surround=cfg.endgame_max_surround,
+            mixed_pair=cfg.endgame_mixed_pair, verbose=False,
+        )
+        positions = rebalance_side_to_move(positions, random.Random(cfg.seed))
+        states[:endgame_count] = positions_to_tensor(positions)
+    search_context = AlphaBetaGPUContext(
+        net,
+        capacity=max(cfg.games, cfg.relabel_batch_size),
+        search_config=cfg.search_config,
+    )
     active = torch.ones(cfg.games, dtype=torch.bool)
     histories: list[list[AlphaBetaRecord]] = [[] for _ in range(cfg.games)]
     game_rngs = [
@@ -284,19 +441,24 @@ def generate_alpha_beta_records(
                 else 1
             ),
             search_config=cfg.search_config,
+            context=search_context,
         )
+        roots_cpu = roots.cpu()
+        teacher_cpu = _teacher_batch_to_cpu(teacher)
         played_moves = teacher.selected_moves.clone()
         for local_row, game in enumerate(rows.tolist()):
-            record = _record_from_teacher_row(roots[local_row], teacher, local_row)
+            record = _record_from_teacher_row(
+                roots_cpu[local_row], teacher_cpu, local_row,
+            )
             if record is not None:
                 histories[game].append(record)
             if ply >= cfg.opening_diversity_plies:
                 continue
-            n = int(teacher.num_legal[local_row])
+            n = int(teacher_cpu.num_legal[local_row])
             candidates = opening_diversity_candidates(
-                teacher.root_scores[local_row, :n],
-                teacher.root_bounds[local_row, :n],
-                int(teacher.selected_indices[local_row]),
+                teacher_cpu.root_scores[local_row, :n],
+                teacher_cpu.root_bounds[local_row, :n],
+                int(teacher_cpu.selected_indices[local_row]),
                 max_candidates=cfg.opening_diversity_candidates,
                 value_window=cfg.opening_diversity_value_window,
             )
@@ -306,11 +468,11 @@ def generate_alpha_beta_records(
             candidate_total += len(candidates)
             sampled_index = sample_opening_move_index(
                 candidates,
-                teacher.root_scores[local_row],
+                teacher_cpu.root_scores[local_row],
                 game_rngs[game],
                 temperature=cfg.opening_diversity_temperature,
             )
-            if sampled_index != int(teacher.selected_indices[local_row]):
+            if sampled_index != int(teacher_cpu.selected_indices[local_row]):
                 diverse_moves += 1
             played_moves[local_row] = teacher.legal_moves[local_row, sampled_index]
 
@@ -327,15 +489,17 @@ def generate_alpha_beta_records(
     records: list[AlphaBetaRecord] = []
     for game, history in enumerate(histories):
         result = int(final_results[game])
-        if result == 0:
-            # A move-limit cutoff is unknown, not a rule draw. Omitting the
-            # whole trajectory prevents artificial zero value targets.
+        if result == 0 and not cfg.retain_truncated_teacher_records:
+            # A move-limit cutoff is unknown, not a rule draw.
             continue
         for record in history:
             turn = _turn_from_state(record.state)
             records.append(replace(
                 record,
-                final_result=_outcome_for_turn(result, turn),
+                final_result=(
+                    _outcome_for_turn(result, turn)
+                    if result != 0 else float("nan")
+                ),
             ))
 
     relabel_count = min(
@@ -347,29 +511,46 @@ def generate_alpha_beta_records(
         relabel_indices = rng.sample(range(len(records)), relabel_count)
         for start in range(0, relabel_count, cfg.relabel_batch_size):
             indices = relabel_indices[start : start + cfg.relabel_batch_size]
-            batch_states = torch.stack(
+            batch_states_cpu = torch.stack(
                 [records[index].state for index in indices],
-            ).cuda()
+            )
+            batch_states = batch_states_cpu.cuda()
             teacher = search_teacher_batch(
                 net,
                 batch_states,
                 node_budget=cfg.teacher_node_budget,
                 max_depth=cfg.max_depth,
                 search_config=cfg.search_config,
+                context=search_context,
             )
+            teacher_cpu = _teacher_batch_to_cpu(teacher)
             for row, index in enumerate(indices):
                 relabeled = _record_from_teacher_row(
-                    batch_states[row],
-                    teacher,
+                    batch_states_cpu[row],
+                    teacher_cpu,
                     row,
                     final_result=records[index].final_result,
                 )
                 if relabeled is not None:
-                    records[index] = relabeled
+                    previous = records[index]
+                    records[index] = replace(
+                        relabeled,
+                        depth_value_delta=abs(
+                            relabeled.search_value - previous.search_value,
+                        ),
+                        depth_move_changed=not torch.equal(
+                            relabeled.selected_move,
+                            previous.selected_move,
+                        ),
+                    )
 
     stats = {
         "games": cfg.games,
         "records": len(records),
+        "endgame_starts": endgame_count,
+        "truncated_records_retained": sum(
+            math.isnan(record.final_result) for record in records
+        ),
         "relabel_requested": relabel_count,
         "white_wins": int((final_results == 1).sum()),
         "black_wins": int((final_results == 2).sum()),
@@ -484,7 +665,9 @@ def alpha_beta_value_targets(
     """Blend player-to-move search values with player-to-move WDL outcomes."""
 
     weight = max(0.0, min(1.0, float(search_value_weight)))
-    return weight * search_values.clamp(-1.0, 1.0) + (1.0 - weight) * final_results
+    search = search_values.clamp(-1.0, 1.0)
+    blended = weight * search + (1.0 - weight) * final_results
+    return torch.where(torch.isfinite(final_results), blended, search)
 
 
 def alpha_beta_ranking_mask(

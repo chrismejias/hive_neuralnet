@@ -1,0 +1,3 @@
+[submodule "external/nokamute"]
+	path = external/nokamute
+	url = https://github.com/edre/nokamute.git

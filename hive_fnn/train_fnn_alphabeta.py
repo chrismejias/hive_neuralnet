@@ -12,6 +12,7 @@ import torch
 from hive_fnn.fnn_alphabeta_training import (
     AlphaBetaGenerationConfig,
     AlphaBetaLossConfig,
+    AlphaBetaReplayPriorityConfig,
     AlphaBetaReplayBuffer,
     generate_alpha_beta_records,
     train_alpha_beta_batch,
@@ -154,6 +155,22 @@ def parse_args() -> argparse.Namespace:
         "--search-config",
         help="Tuned SPSA JSON state or a direct AlphaBetaSearchConfig JSON",
     )
+    parser.add_argument(
+        "--search-profile",
+        choices=("baseline", "threat", "proof", "ordering", "full"),
+        help="Named ablation profile; explicit --search-config takes precedence",
+    )
+    parser.add_argument("--endgame-fraction", type=float, default=0.0)
+    parser.add_argument("--endgame-min-surround", type=int, default=4)
+    parser.add_argument("--endgame-max-surround", type=int, default=5)
+    parser.add_argument(
+        "--endgame-mixed-pair", action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--retain-truncated-teacher-records",
+        action=argparse.BooleanOptionalAction, default=False,
+    )
     parser.add_argument("--opening-diversity-plies", type=int, default=6)
     parser.add_argument("--opening-diversity-candidates", type=int, default=4)
     parser.add_argument("--opening-diversity-window", type=float, default=0.12)
@@ -164,6 +181,18 @@ def parse_args() -> argparse.Namespace:
         help="0 samples uniformly; positive values use score softmax",
     )
     parser.add_argument("--buffer-size", type=int, default=75_000)
+    parser.add_argument(
+        "--prioritized-replay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prioritize surprising and complex positions (default: enabled)",
+    )
+    parser.add_argument("--priority-alpha", type=float, default=0.6)
+    parser.add_argument("--priority-uniform-fraction", type=float, default=0.25)
+    parser.add_argument("--priority-value-surprise-weight", type=float, default=1.0)
+    parser.add_argument("--priority-depth-change-weight", type=float, default=1.0)
+    parser.add_argument("--priority-outcome-surprise-weight", type=float, default=0.5)
+    parser.add_argument("--priority-complexity-weight", type=float, default=0.25)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -191,7 +220,19 @@ def main() -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    replay = AlphaBetaReplayBuffer(args.buffer_size)
+    priority_config = AlphaBetaReplayPriorityConfig(
+        enabled=args.prioritized_replay,
+        alpha=args.priority_alpha,
+        uniform_fraction=args.priority_uniform_fraction,
+        value_surprise_weight=args.priority_value_surprise_weight,
+        depth_change_weight=args.priority_depth_change_weight,
+        outcome_surprise_weight=args.priority_outcome_surprise_weight,
+        complexity_weight=args.priority_complexity_weight,
+    )
+    replay = AlphaBetaReplayBuffer(
+        args.buffer_size,
+        priority_config=priority_config,
+    )
     output_dir = Path(args.checkpoint_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     loss_config = AlphaBetaLossConfig(
@@ -209,6 +250,9 @@ def main() -> None:
             optimizer=optimizer,
             replay=replay,
         )
+        # CLI settings intentionally control sampling for the new run, while
+        # old checkpoints remain loadable and have priorities reconstructed.
+        replay.configure_priorities(priority_config)
         # Preserve moments while allowing intentional hyperparameter changes.
         for group in optimizer.param_groups:
             group["lr"] = args.learning_rate
@@ -220,6 +264,8 @@ def main() -> None:
         )
     if args.search_config:
         search_config = load_search_config(args.search_config)
+    elif args.search_profile:
+        search_config = AlphaBetaSearchConfig.from_profile(args.search_profile)
     elif resumed_generation_config and resumed_generation_config.get("search_config"):
         search_config = AlphaBetaSearchConfig(
             **resumed_generation_config["search_config"],
@@ -242,6 +288,13 @@ def main() -> None:
             opening_diversity_temperature=args.opening_diversity_temperature,
             search_config=search_config,
             seed=args.seed + iteration,
+            endgame_fraction=args.endgame_fraction,
+            endgame_min_surround=args.endgame_min_surround,
+            endgame_max_surround=args.endgame_max_surround,
+            endgame_mixed_pair=args.endgame_mixed_pair,
+            retain_truncated_teacher_records=(
+                args.retain_truncated_teacher_records
+            ),
         )
         records, generation_stats = generate_alpha_beta_records(
             ema, generation_config,

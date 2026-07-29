@@ -402,6 +402,25 @@ end-to-end search throughput. The exact resumable path reached about 20k
 nodes/second and is therefore kept for architectural experiments rather than
 training.
 
+Ordinary and teacher alpha-beta calls now support a reusable GPU context. It
+keeps packed weights, configuration, transposition tables, and scratch storage
+resident across moves; TT generations invalidate old entries without clearing
+the table. Ordinary play also skips teacher-only PV reconstruction. The GPU
+checkpoint arena keeps masks and counters on device and reports progress with
+`--progress-every`.
+
+GPU alpha-beta needs wide batches: each production search is still one serial
+CUDA thread. On the local RTX 4090 at a deterministic 12-ply position and a
+500-node budget, batches 8, 128, and 256 reached approximately 31k, 510k, and
+1.00M aggregate nodes/second respectively. Use at least 128 games for training
+when memory permits; small arenas remain a better fit for CPU workers. Re-run
+the batch-width crossover benchmark for a checkpoint and machine with:
+
+```bash
+python3 benchmark_gpu_alphabeta.py --checkpoint CHECKPOINT \
+  --batches 8,16,32,64,128,256 --nodes 1000
+```
+
 ```bash
 # Tune search with paired openings and color swaps.
 python tune_fnn_alphabeta.py \
@@ -429,6 +448,39 @@ node allocation, and mate early stopping. Arena fitness can penalize additional
 nodes per move with `--node-cost-penalty`. Full trainer continuation uses
 `--resume checkpoints_fnn_alphabeta/alpha_beta_training_state_latest.pt`;
 the tuned search configuration is preserved automatically.
+
+Long-horizon search experiments are independently toggleable through the
+`baseline`, `threat`, `proof`, `ordering`, and `full` profiles. `baseline`
+preserves the original one-ply quiescence and search behavior. `threat` enables
+recursive forcing quiescence and capped forced extensions; `proof` enables the
+budgeted exhaustive forced-win verifier; `ordering` enables countermoves,
+continuation history, and cheap internal ordering; `full` combines them with
+singular extensions and persistent TT reuse. Compare profiles on identical
+color-swapped openings with:
+
+```bash
+python gpu_alpha_beta_config_arena.py --checkpoint CHECKPOINT \
+  --plus-profile full --minus-profile baseline --pairs 32 --nodes 10000
+```
+
+Training accepts `--search-profile PROFILE`. Optional endgame curriculum starts
+use `--endgame-fraction`, `--endgame-min-surround`,
+`--endgame-max-surround`, and `--endgame-mixed-pair`.
+`--retain-truncated-teacher-records` keeps policy and searched-value targets
+from move-limit games while masking the unavailable final outcome; it never
+treats the cutoff as a draw. Checkpoints store the fully resolved search and
+generation configuration.
+
+Alpha-beta training uses hybrid prioritized replay by default. Positions receive
+bounded priority from the student/search value discrepancy, changes caused by
+deeper teacher relabeling (including a changed best move), disagreement between
+the searched value and final game result, and search complexity (branching,
+non-exact root bounds, and shallow completed depth). Sampling keeps a 25%
+uniform floor so ordinary positions are not starved, while the circular replay
+buffer still replaces the oldest data first. Old resume states reconstruct
+priorities when loaded. Use `--no-prioritized-replay` for the previous uniform
+behavior, or tune the mixture with `--priority-alpha`,
+`--priority-uniform-fraction`, and the `--priority-*-weight` options.
 
 ### EMA Champion/Challenger Training
 
@@ -848,3 +900,30 @@ tests/             # Test suite
 archive/           # Retained diagnostics and old CPU/research code
 Dockerfile         # Container for cloud/RunPod deployment
 ```
+### Nokamute arena
+
+The external [Nokamute](https://github.com/edre/nokamute) UHP engine is pinned
+under `external/nokamute`. Build it with the workspace-local Rust toolchain:
+
+```bash
+RUSTUP_HOME="$PWD/.tools/rustup" CARGO_HOME="$PWD/.tools/cargo" \
+  .tools/cargo/bin/cargo build --release --manifest-path external/nokamute/Cargo.toml
+```
+
+Run a color-balanced Base-game match against the local FNN alpha-beta engine:
+
+```bash
+python3 nokamute_arena.py --games 20 --our-nodes 10000 \
+  --nokamute-seconds 1 --nokamute-threads 1
+```
+
+Nokamute's UHP interface supports time or depth budgets, but not exact node
+budgets. Use `--nokamute-depth N` instead of `--nokamute-seconds` for a
+fixed-depth comparison. Random opening plies are played before colors alternate.
+
+The single-game CPU FNN alpha-beta player uses its fully native C++ tree by
+default. The native path keeps one bitmap state in place, makes/unmakes only the
+two touched cells, evaluates leaves with packed FNN weights, and uses
+incremental hashing plus a fixed transposition table. Set
+`AlphaBetaConfig(native_tree=False)` (or pass `--no-our-native-tree` to the
+Nokamute arena) to use the older Python-orchestrated reference search.

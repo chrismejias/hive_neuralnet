@@ -13,6 +13,7 @@ import torch
 
 import hive_gpu
 from hive_fnn.fnn_native_alphabeta import (
+    AlphaBetaGPUContext,
     AlphaBetaSearchConfig,
     search_batch,
 )
@@ -87,10 +88,13 @@ def decode_search_config(values: np.ndarray) -> AlphaBetaSearchConfig:
 def load_search_config(path: str | Path) -> AlphaBetaSearchConfig:
     payload = json.loads(Path(path).read_text())
     values = payload.get("search_config", payload)
+    profile = values.get("profile") if isinstance(values, dict) else None
+    base = AlphaBetaSearchConfig.from_profile(profile) if profile else AlphaBetaSearchConfig()
     allowed = {field.name for field in fields(AlphaBetaSearchConfig)}
-    return AlphaBetaSearchConfig(**{
+    overrides = {
         name: value for name, value in values.items() if name in allowed
-    })
+    }
+    return AlphaBetaSearchConfig(**{**asdict(base), **overrides})
 
 
 @dataclass(frozen=True)
@@ -151,6 +155,7 @@ def run_paired_alpha_beta_arena(
     opening_plies: int,
     expansion_mask: int,
     seed: int,
+    min_search_batch: int = 0,
 ) -> PairedArenaResult:
     """Compare two configurations on identical color-swapped openings."""
 
@@ -172,6 +177,14 @@ def run_paired_alpha_beta_arena(
     plus_is_white = np.zeros(games, dtype=bool)
     plus_is_white[::2] = True
     plus_nodes = minus_nodes = plus_moves = minus_moves = 0
+    persistent_contexts = {
+        True: AlphaBetaGPUContext(
+            net, capacity=pairs, search_config=plus_config,
+        ) if plus_config.persistent_tt else None,
+        False: AlphaBetaGPUContext(
+            net, capacity=pairs, search_config=minus_config,
+        ) if minus_config.persistent_tt else None,
+    }
 
     while bool(active.any()):
         turns = states[:, 3412].cpu().numpy().astype(np.int32)
@@ -187,14 +200,58 @@ def run_paired_alpha_beta_arena(
             row_tensor = torch.from_numpy(
                 rows.astype(np.int64, copy=False),
             ).cuda()
+            context = persistent_contexts[is_plus]
+            if context is not None:
+                # Keep one stable workspace slot per paired opening. Exactly
+                # one game in each live pair is normally this configuration's
+                # turn; inactive slots search a harmless duplicate and their
+                # outputs are discarded.
+                slot_rows = np.empty(pairs, dtype=np.int64)
+                active_slots = []
+                active_rows = []
+                fallback = int(rows[0])
+                for pair in range(pairs):
+                    first = pair * 2
+                    second = first + 1
+                    selected = (
+                        first if mask[first] else
+                        second if mask[second] else fallback
+                    )
+                    slot_rows[pair] = selected
+                    if mask[selected]:
+                        active_slots.append(pair)
+                        active_rows.append(selected)
+                slot_tensor = torch.from_numpy(slot_rows).cuda()
+                slot_states = states.index_select(0, slot_tensor).contiguous()
+                all_moves, _values, all_stats = search_batch(
+                    net, slot_states, node_budget=node_budget,
+                    max_depth=max_depth, search_config=config,
+                    context=context,
+                )
+                active_slot_tensor = torch.tensor(
+                    active_slots, device="cuda", dtype=torch.int64,
+                )
+                moves = all_moves.index_select(0, active_slot_tensor)
+                stats = all_stats.index_select(0, active_slot_tensor)
+                rows = np.asarray(active_rows, dtype=np.int64)
+                row_tensor = torch.from_numpy(rows).cuda()
+            else:
+                sub_states = states.index_select(0, row_tensor).contiguous()
+                real_count = int(rows.size)
+                padded_states = sub_states
+                target_count = max(real_count, int(min_search_batch))
+                if target_count > real_count:
+                    padding = sub_states[:1].expand(
+                        target_count - real_count, -1,
+                    ).contiguous()
+                    padded_states = torch.cat((sub_states, padding), dim=0)
+                all_moves, _values, all_stats = search_batch(
+                    net, padded_states, node_budget=node_budget,
+                    max_depth=max_depth, search_config=config,
+                )
+                moves = all_moves[:real_count]
+                stats = all_stats[:real_count]
             sub_states = states.index_select(0, row_tensor).contiguous()
-            moves, _values, stats = search_batch(
-                net,
-                sub_states,
-                node_budget=node_budget,
-                max_depth=max_depth,
-                search_config=config,
-            )
             ext.apply_moves_batch(sub_states, moves, int(rows.size))
             states.index_copy_(0, row_tensor, sub_states)
             plies[rows] += 1

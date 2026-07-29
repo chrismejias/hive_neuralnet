@@ -124,6 +124,23 @@ fnn_selfplay_batch(
     float c_visit, float c_scale,
     int temperature_drop_move, int expansion_mask,
     int64_t rng_seed);
+std::vector<torch::Tensor> fnn_alphabeta_workspace(
+    torch::Tensor states, int capacity);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+fnn_alphabeta_batch_reuse(
+    torch::Tensor states, torch::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    torch::Tensor search_config, int node_budget, int max_depth,
+    const std::vector<torch::Tensor>& workspace, int tt_generation);
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor>
+fnn_alphabeta_teacher_batch_reuse(
+    torch::Tensor states, torch::Tensor weights,
+    int hidden_dim, int embed_dim, int action_hidden,
+    torch::Tensor search_config, int node_budget, int max_depth,
+    int root_exact_count, const std::vector<torch::Tensor>& workspace,
+    int tt_generation);
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 fnn_alphabeta_batch(
     torch::Tensor states, torch::Tensor weights,
@@ -391,6 +408,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("max_considered"), py::arg("c_visit"), py::arg("c_scale"),
           py::arg("temperature_drop_move"), py::arg("expansion_mask"),
           py::arg("rng_seed"));
+    m.def("fnn_alphabeta_workspace", &hive_gpu::fnn_alphabeta_workspace,
+          "Allocate reusable GPU alpha-beta TT and scratch storage",
+          py::arg("states"), py::arg("capacity"));
+    m.def("fnn_alphabeta_batch_reuse",
+          &hive_gpu::fnn_alphabeta_batch_reuse,
+          "GPU alpha-beta using reusable generation-tagged workspace",
+          py::arg("states"), py::arg("weights"), py::arg("hidden_dim"),
+          py::arg("embed_dim"), py::arg("action_hidden"),
+          py::arg("search_config"), py::arg("node_budget"),
+          py::arg("max_depth"), py::arg("workspace"),
+          py::arg("tt_generation"));
+    m.def("fnn_alphabeta_teacher_batch_reuse",
+          &hive_gpu::fnn_alphabeta_teacher_batch_reuse,
+          "Teacher alpha-beta using reusable generation-tagged workspace",
+          py::arg("states"), py::arg("weights"), py::arg("hidden_dim"),
+          py::arg("embed_dim"), py::arg("action_hidden"),
+          py::arg("search_config"), py::arg("node_budget"),
+          py::arg("max_depth"), py::arg("root_exact_count"),
+          py::arg("workspace"), py::arg("tt_generation"));
     m.def("fnn_alphabeta_batch", &hive_gpu::fnn_alphabeta_batch,
           "GPU-native packed recursive iterative-deepening FNN alpha-beta",
           py::arg("states"), py::arg("weights"), py::arg("hidden_dim"),

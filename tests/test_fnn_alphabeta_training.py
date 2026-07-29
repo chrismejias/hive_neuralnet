@@ -2,11 +2,13 @@ import random
 from pathlib import Path
 
 import torch
+import pytest
 
 from hive_fnn.fnn_alphabeta_training import (
     AlphaBetaGenerationConfig,
     AlphaBetaLossConfig,
     AlphaBetaRecord,
+    AlphaBetaReplayPriorityConfig,
     AlphaBetaReplayBuffer,
     alpha_beta_ranking_mask,
     alpha_beta_value_targets,
@@ -28,6 +30,16 @@ def test_value_target_uses_player_to_move_convex_blend() -> None:
     targets = alpha_beta_value_targets(search, outcomes, 0.25)
 
     assert torch.allclose(targets, torch.tensor([-0.55, 0.65, 1.0]))
+
+
+def test_unknown_outcome_uses_search_target_without_fake_draw() -> None:
+    search = torch.tensor([0.8, -0.4])
+    outcomes = torch.tensor([float("nan"), 1.0])
+
+    targets = alpha_beta_value_targets(search, outcomes, 0.25)
+
+    assert targets[0].item() == pytest.approx(0.8)
+    assert targets[1].item() == pytest.approx(0.65)
 
 
 def test_ranking_uses_only_exact_or_proven_upper_bound_inferiors() -> None:
@@ -167,6 +179,88 @@ def test_alpha_beta_replay_state_round_trip() -> None:
     sampled = restored.sample(1, seed=3)[0]
     assert sampled.nodes == 17
     assert torch.equal(sampled.state, record.state)
+
+
+def _priority_record(
+    marker: int,
+    *,
+    raw_value: float = 0.0,
+    search_value: float = 0.0,
+    final_result: float = 0.0,
+    depth_value_delta: float = 0.0,
+    depth_move_changed: bool = False,
+) -> AlphaBetaRecord:
+    return AlphaBetaRecord(
+        state=torch.tensor([marker], dtype=torch.uint8),
+        legal_moves=torch.tensor([[marker, 0]], dtype=torch.uint8),
+        raw_value=raw_value,
+        search_value=search_value,
+        selected_index=0,
+        pv_moves=torch.tensor([[marker, 0]], dtype=torch.uint8),
+        root_scores=torch.tensor([search_value]),
+        root_bounds=torch.tensor([AlphaBetaBound.EXACT], dtype=torch.uint8),
+        completed_depth=2,
+        nodes=17,
+        final_result=final_result,
+        depth_value_delta=depth_value_delta,
+        depth_move_changed=depth_move_changed,
+    )
+
+
+def test_prioritized_replay_favors_surprise_and_depth_change() -> None:
+    replay = AlphaBetaReplayBuffer(
+        capacity=2,
+        priority_config=AlphaBetaReplayPriorityConfig(
+            alpha=1.0,
+            uniform_fraction=0.0,
+            complexity_weight=0.0,
+        ),
+    )
+    replay.add([
+        _priority_record(1),
+        _priority_record(
+            2,
+            raw_value=-1.0,
+            search_value=1.0,
+            final_result=-1.0,
+            depth_value_delta=1.0,
+            depth_move_changed=True,
+        ),
+    ])
+
+    sampled = replay.sample(2_000, seed=7)
+    high_priority = sum(int(record.state[0]) == 2 for record in sampled)
+
+    assert high_priority > 1_700
+
+
+def test_uniform_replay_flag_preserves_uniform_sampling() -> None:
+    replay = AlphaBetaReplayBuffer(
+        capacity=2,
+        priority_config=AlphaBetaReplayPriorityConfig(enabled=False),
+    )
+    replay.add([
+        _priority_record(1),
+        _priority_record(2, raw_value=-1.0, search_value=1.0),
+    ])
+
+    sampled = replay.sample(2_000, seed=11)
+    first_count = sum(int(record.state[0]) == 1 for record in sampled)
+
+    assert 900 < first_count < 1_100
+
+
+def test_old_replay_state_reconstructs_priorities() -> None:
+    record = _priority_record(3, raw_value=-0.5, search_value=0.5)
+    replay = AlphaBetaReplayBuffer(capacity=4)
+    replay.load_state_dict({
+        "capacity": 4,
+        "next": 1,
+        "records": [record],
+    })
+
+    assert len(replay._priorities) == 1
+    assert replay._priorities[0] > 0.05
 
 
 def test_full_resume_restores_models_optimizer_replay_and_rng() -> None:

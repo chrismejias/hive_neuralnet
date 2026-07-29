@@ -45,7 +45,9 @@ def load_extension():
         sources=[os.path.join(csrc, "cpu_native.cpp")],
         build_directory=build_dir,
         extra_include_paths=[csrc],
-        extra_cflags=["/O2", "/std:c++17"] if os.name == "nt" else ["-O3", "-std=c++17"],
+        extra_cflags=["/O2", "/std:c++17"] if os.name == "nt" else [
+            "-O3", "-march=native", "-std=c++17",
+        ],
         verbose=False,
     )
     return _extension
