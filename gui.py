@@ -974,6 +974,32 @@ class MoveEval:
     source: str = ""
     simulations: int = 0
     confidence: float | None = None
+    raw_score: float | None = None
+    mate_plies: int | None = None
+    search_depth: int = 0
+    nodes: int = 0
+
+
+def alpha_beta_move_eval(stats, *, source: str = "alpha-beta") -> MoveEval:
+    """Convert an alpha-beta root score to the GUI's outcome-value scale.
+
+    Ordinary FNN values already live in [-1, 1]. Native search reserves the
+    +/-10 band for proven wins and encodes distance as 0.01 per ply.
+    """
+    from hive_fnn.fnn_alphabeta_player import normalize_alpha_beta_score
+
+    raw = float(stats.value)
+    value, mate_plies = normalize_alpha_beta_score(raw)
+    return MoveEval(
+        q_value=value,
+        root_value=value,
+        eval_value=value,
+        source=source,
+        raw_score=raw,
+        mate_plies=mate_plies,
+        search_depth=int(stats.completed_depth),
+        nodes=int(stats.nodes),
+    )
 
 
 @dataclass
@@ -1180,12 +1206,25 @@ class HiveGUI:
                 try:
                     immediate = find_immediate_win(game_snapshot)
                     if immediate is not None:
+                        if hasattr(self.cpu_player, "last_stats"):
+                            forced_eval = MoveEval(
+                                q_value=1.0, root_value=1.0, eval_value=1.0,
+                                raw_score=10.0, mate_plies=1, source="alpha-beta",
+                            )
+                        else:
+                            forced_eval = MoveEval(source="forced")
                         with self._ai_lock:
-                            self._ai_result = (immediate, MoveEval(source="forced"), gen)
+                            self._ai_result = (immediate, forced_eval, gen)
                         return
 
                     if self.cpu_player is not None:
                         move = self.cpu_player.choose_move(game_snapshot)
+                        if hasattr(self.cpu_player, "last_stats"):
+                            move_eval = alpha_beta_move_eval(
+                                self.cpu_player.last_stats,
+                            )
+                        else:
+                            move_eval = MoveEval()
                     else:
                         mcts = MCTS(self.net, self.encoder, self.mcts_config)
                         policy = mcts.search(game_snapshot, move_number=self.move_number)
@@ -1197,8 +1236,9 @@ class HiveGUI:
                             legal = np.where(mask > 0)[0]
                             best = legal[np.argmax(policy[legal])]
                             move = self.encoder.decode_action(int(best), game_snapshot)
+                        move_eval = MoveEval()
                     with self._ai_lock:
-                        self._ai_result = (move, MoveEval(), gen)
+                        self._ai_result = (move, move_eval, gen)
                 except Exception:
                     print("[GUI] CPU worker failed:")
                     traceback.print_exc()
@@ -1546,7 +1586,7 @@ class HiveGUI:
 
         latest = self._latest_ply()
         selected_idx = self.view_ply - 1
-        card = pygame.Rect(ANALYSIS_X + 14, ANALYSIS_Y + 64, ANALYSIS_W - 28, 108)
+        card = pygame.Rect(ANALYSIS_X + 14, ANALYSIS_Y + 64, ANALYSIS_W - 28, 150)
         pygame.draw.rect(surf, C_ANALYSIS_CARD, card, border_radius=8)
 
         if 0 <= selected_idx < len(self.move_records):
@@ -1560,54 +1600,77 @@ class HiveGUI:
             surf.blit(move_s, (card.x + 12, card.y + 10))
             desc_s = self.f_small.render(self._move_summary(rec.move), True, C_PANEL_TEXT)
             surf.blit(desc_s, (card.x + 12, card.y + 38))
-            if rec.eval.q_value is None:
-                eval_text = "Top: pending"
-                eval_col = C_PENDING
+            if rec.eval.source == "alpha-beta":
+                if rec.eval.eval_value is None:
+                    eval_text = "Eval: pending"
+                    eval_col = C_PENDING
+                elif rec.eval.mate_plies is not None:
+                    side = "Win" if rec.eval.eval_value > 0 else "Loss"
+                    eval_text = f"{side} in {rec.eval.mate_plies} ply"
+                    eval_col = C_WIN_W if rec.eval.eval_value > 0 else C_WIN_B
+                else:
+                    eval_text = f"Eval: {rec.eval.eval_value:+.3f}"
+                    eval_col = (
+                        C_WIN_W if rec.eval.eval_value > 0
+                        else C_WIN_B if rec.eval.eval_value < 0
+                        else C_TITLE
+                    )
+                eval_s = self.f_large.render(eval_text, True, eval_col)
+                surf.blit(eval_s, (card.x + 12, card.y + 62))
+                raw_text = (
+                    f"Raw {rec.eval.raw_score:+.3f}  ·  "
+                    f"depth {rec.eval.search_depth}  ·  {rec.eval.nodes:,} nodes"
+                )
+                surf.blit(
+                    self.f_small.render(raw_text, True, C_PANEL_TEXT),
+                    (card.x + 14, card.y + 94),
+                )
+                scale_text = "+1 expected win  ·  0 even  ·  -1 expected loss"
+                surf.blit(
+                    self.f_small.render(scale_text, True, C_DIM),
+                    (card.x + 14, card.y + 120),
+                )
             else:
-                eval_text = f"Top: {rec.eval.q_value:+.3f}"
-                eval_col = C_WIN_W if rec.eval.q_value > 0 else (C_WIN_B if rec.eval.q_value < 0 else C_TITLE)
-            eval_s = self.f_large.render(eval_text, True, eval_col)
-            surf.blit(eval_s, (card.x + 12, card.y + 58))
-            if rec.eval.root_value is None:
-                root_text = "V: pending"
-                root_col = C_PENDING
-            else:
-                root_text = f"V: {rec.eval.root_value:+.3f}"
-                root_col = C_PANEL_TEXT
-            root_s = self.f_small.render(root_text, True, root_col)
-            surf.blit(root_s, (card.x + 14, card.y + 86))
-            if rec.eval.blend_value is None:
-                blend_text = "Blend: pending"
-                blend_col = C_PENDING
-            else:
-                blend_text = f"Blend: {rec.eval.blend_value:+.3f}"
-                blend_col = C_PANEL_TEXT
-            blend_s = self.f_small.render(blend_text, True, blend_col)
-            surf.blit(blend_s, (card.x + 14, card.y + 104))
-            if rec.eval.eval_value is None:
-                eval2_text = "Eval: pending"
-                eval2_col = C_PENDING
-            else:
-                eval2_text = f"Eval: {rec.eval.eval_value:+.3f}"
-                eval2_col = C_PANEL_TEXT
-            eval2_s = self.f_small.render(eval2_text, True, eval2_col)
-            surf.blit(eval2_s, (card.x + 14, card.y + 122))
-            meta = rec.eval.source or "unavailable"
-            if rec.eval.confidence is not None:
-                meta = f"{meta}  ·  conf {rec.eval.confidence:.2f}"
-            meta_s = self.f_small.render(
-                f"{meta}  ·  sims {rec.eval.simulations}",
-                True,
-                C_DIM,
-            )
-            surf.blit(meta_s, (card.x + 132, card.y + 106))
+                if rec.eval.q_value is None:
+                    eval_text = "Top: pending"
+                    eval_col = C_PENDING
+                else:
+                    eval_text = f"Top: {rec.eval.q_value:+.3f}"
+                    eval_col = C_WIN_W if rec.eval.q_value > 0 else (C_WIN_B if rec.eval.q_value < 0 else C_TITLE)
+                eval_s = self.f_large.render(eval_text, True, eval_col)
+                surf.blit(eval_s, (card.x + 12, card.y + 58))
+                if rec.eval.root_value is None:
+                    root_text = "V: pending"
+                    root_col = C_PENDING
+                else:
+                    root_text = f"V: {rec.eval.root_value:+.3f}"
+                    root_col = C_PANEL_TEXT
+                root_s = self.f_small.render(root_text, True, root_col)
+                surf.blit(root_s, (card.x + 14, card.y + 86))
+                if rec.eval.blend_value is None:
+                    blend_text = "Blend: pending"
+                    blend_col = C_PENDING
+                else:
+                    blend_text = f"Blend: {rec.eval.blend_value:+.3f}"
+                    blend_col = C_PANEL_TEXT
+                blend_s = self.f_small.render(blend_text, True, blend_col)
+                surf.blit(blend_s, (card.x + 14, card.y + 104))
+                meta = rec.eval.source or "unavailable"
+                if rec.eval.confidence is not None:
+                    meta = f"{meta}  ·  conf {rec.eval.confidence:.2f}"
+                meta_s = self.f_small.render(
+                    f"{meta}  ·  sims {rec.eval.simulations}",
+                    True,
+                    C_DIM,
+                )
+                surf.blit(meta_s, (card.x + 132, card.y + 106))
         else:
             move_s = self.f_med.render("Initial position", True, C_TITLE)
             surf.blit(move_s, (card.x + 12, card.y + 10))
             desc_s = self.f_small.render("No move selected yet.", True, C_PANEL_TEXT)
             surf.blit(desc_s, (card.x + 12, card.y + 38))
 
-        graph = pygame.Rect(ANALYSIS_X + 14, ANALYSIS_Y + 190, ANALYSIS_W - 28, 180)
+        graph = pygame.Rect(ANALYSIS_X + 14, ANALYSIS_Y + 230, ANALYSIS_W - 28, 180)
         pygame.draw.rect(surf, C_ANALYSIS_CARD, graph, border_radius=8)
         gtitle = self.f_small.render("Game graph (white advantage)", True, C_TITLE)
         surf.blit(gtitle, (graph.x + 12, graph.y + 8))
@@ -1857,7 +1920,17 @@ class HiveGUI:
         self.move_records.append(MoveRecord(move=move, mover=mover, eval=move_eval))
 
     def _queue_postgame_analysis(self) -> None:
-        if not self.analysis_enabled or self.gpu_ai is None or self.analysis_running:
+        alpha_beta = (
+            self.cpu_player
+            if self.cpu_player is not None
+            and hasattr(self.cpu_player, "last_stats")
+            else None
+        )
+        if (
+            not self.analysis_enabled
+            or (self.gpu_ai is None and alpha_beta is None)
+            or self.analysis_running
+        ):
             return
         pending = [i for i, rec in enumerate(self.move_records) if rec.eval.q_value is None]
         if not pending:
@@ -1865,15 +1938,25 @@ class HiveGUI:
         self.analysis_running = True
         moves_prefix = [rec.move for rec in self.move_records]
         gpu_ai = self.gpu_ai
+        history_states = [state.copy() for state in self.history_states]
 
         def worker() -> None:
             updates: list[tuple[int, MoveEval]] = []
-            for idx in pending:
-                move_eval = gpu_ai.analyze_prefix(moves_prefix[:idx])
-                updates.append((idx, move_eval))
-            with self._analysis_lock:
-                self._analysis_pending.extend(updates)
-            self.analysis_running = False
+            try:
+                for idx in pending:
+                    if gpu_ai is not None:
+                        move_eval = gpu_ai.analyze_prefix(moves_prefix[:idx])
+                    else:
+                        alpha_beta.choose_move(history_states[idx])
+                        move_eval = alpha_beta_move_eval(alpha_beta.last_stats)
+                    updates.append((idx, move_eval))
+                with self._analysis_lock:
+                    self._analysis_pending.extend(updates)
+            except Exception:
+                print("[GUI] postgame analysis failed:")
+                traceback.print_exc()
+            finally:
+                self.analysis_running = False
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2125,19 +2208,20 @@ def main() -> None:
     )
     parser.add_argument(
         "--engine",
-        choices=["auto", "fnn-cpu", "legacy"],
+        choices=["auto", "alpha-beta", "fnn-cpu", "legacy"],
         default="auto",
         help=(
-            "AI engine to use. 'auto' prefers the GPU/legacy path when CUDA is "
-            "available and falls back to 'fnn-cpu' otherwise."
+            "AI engine to use. 'auto' selects the recommended alpha-beta "
+            "engine; 'fnn-cpu' and 'legacy' select Gumbel/MCTS paths."
         ),
     )
     parser.add_argument(
         "--checkpoint",
         default=None,
         help=(
-            "Checkpoint path. For --engine fnn-cpu the default is the latest "
-            "recommended FNN checkpoint. For --engine legacy it follows the "
+            "Checkpoint path. Alpha-beta defaults to value-only checkpoint 161. "
+            "For --engine fnn-cpu the default is its latest FNN checkpoint. "
+            "For --engine legacy it follows the "
             "selected --model path or auto-detect behavior."
         ),
     )
@@ -2181,6 +2265,18 @@ def main() -> None:
         help="Legacy engine only: run GPU move gen in parallel and compare with CPU (requires CUDA)",
     )
     parser.add_argument(
+        "--nodes",
+        type=int,
+        default=20_000,
+        help="Alpha-beta node budget per move (default: 20000).",
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=32,
+        help="Alpha-beta maximum iterative-deepening depth (default: 32).",
+    )
+    parser.add_argument(
         "--root-workers",
         type=int,
         default=2,
@@ -2207,7 +2303,7 @@ def main() -> None:
     human_color = Color.WHITE if args.color == "white" else Color.BLACK
     selected_engine = args.engine
     if selected_engine == "auto":
-        selected_engine = "legacy" if torch.cuda.is_available() else "fnn-cpu"
+        selected_engine = "alpha-beta"
 
     # Default checkpoint paths per model
     _DEFAULT_CHECKPOINTS = {
@@ -2222,6 +2318,33 @@ def main() -> None:
         net, encoder, gpu_ai, cpu_player, title = None, None, None, None, "Hive — Self-Play"
         mcts_config = MCTSConfig(num_simulations=200, temperature=0.0)
         print("Self-play mode: you control both WHITE and BLACK.")
+        print("Controls: click to play · R = restart · Escape = quit\n")
+    elif selected_engine == "alpha-beta":
+        from hive_fnn.fnn_alphabeta_player import (
+            AlphaBetaConfig, FNNAlphaBetaPlayer,
+        )
+
+        checkpoint = (
+            args.checkpoint
+            or "checkpoints_fnn_alphabeta_value_only_20k_512/"
+               "hive_fnn_alphabeta_0161.pt"
+        )
+        net, encoder, gpu_ai = None, None, None
+        cpu_player = FNNAlphaBetaPlayer.from_checkpoint(
+            checkpoint,
+            config=AlphaBetaConfig(
+                node_budget=args.nodes,
+                max_depth=args.max_depth,
+                torch_threads=args.threads,
+            ),
+        )
+        mcts_config = MCTSConfig(num_simulations=0, temperature=0.0)
+        title = "Hive — vs FNN Alpha-Beta"
+        print(f"\nYou are playing as {human_color.name}.")
+        print("AI engine: value-only FNN alpha-beta")
+        print(f"Checkpoint: {checkpoint}")
+        print(f"Search: {args.nodes} nodes, maximum depth {args.max_depth}.")
+        print("Evaluation: -1 to +1 expected outcome; forced wins use mate notation.")
         print("Controls: click to play · R = restart · Escape = quit\n")
     elif selected_engine == "fnn-cpu":
         from hive_fnn.fnn_cpu_player import FNNCPUPlayer, FNNCPUMCTSConfig
@@ -2312,7 +2435,7 @@ def main() -> None:
                 ladybug=bool(exp_mask & 2),
                 pillbug=bool(exp_mask & 4),
             )
-    elif selected_engine == "fnn-cpu" and not exp_str and not args.base_game:
+    elif selected_engine in ("alpha-beta", "fnn-cpu") and not exp_str and not args.base_game:
         expansion_config = ExpansionConfig(mosquito=True, ladybug=True, pillbug=True)
 
     if gpu_ai is not None:

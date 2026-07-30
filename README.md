@@ -117,8 +117,24 @@ arenas described under
 [Alpha-Beta Training And Search Tuning](#alpha-beta-training-and-search-tuning-recommended-default).
 The GPU path is fastest with wide batches rather than a single game.
 
-The pygame GUI currently exposes the older MCTS interfaces. To use the
-supported small FNN-transformer MCTS alternative on CUDA:
+The pygame GUI now defaults to the recommended CPU alpha-beta engine:
+
+```bash
+cd /workspace/hive_neuralnet
+python3.11 gui.py \
+  --engine alpha-beta \
+  --checkpoint checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0161.pt \
+  --nodes 20000 --max-depth 32 \
+  --expansion MLP
+```
+
+Press `A` to enable the analyzer. Alpha-beta evaluations use an expected-outcome
+scale from `-1` (expected loss) through `0` (even) to `+1` (expected win), from
+the player-to-move perspective. Proven terminal lines are shown separately as
+win/loss-in-ply scores, alongside completed depth and searched nodes. The game
+graph converts each score to White's perspective.
+
+To use the supported small FNN-transformer MCTS alternative on CUDA:
 
 ```bash
 cd /workspace/hive_neuralnet
@@ -153,8 +169,8 @@ python3.11 play_fnn_cpu.py \
 ```
 
 The `gui.py --engine legacy` path is the GPU MCTS route for FNN-transformer and
-FNN checkpoints. These GUI choices do not change the repository-wide
-recommendation to use alpha-beta for new play and analysis integrations.
+FNN checkpoints. `--engine auto` selects alpha-beta; the MCTS modes remain
+available for comparison and research.
 
 ## Long-Running Background Training
 
@@ -890,18 +906,17 @@ python eval_value_head.py
 
 ## GUI
 
-Play against the trained AI using pygame (local only):
+Play against the recommended alpha-beta engine using pygame (local only):
 
 ```bash
-# vs AI
-python gui.py \
-  --engine legacy \
-  --checkpoint checkpoints_FNN_transformer/hybrid_gnn_checkpoint_2440.pt \
-  --simulations 8192
+python gui.py --engine alpha-beta --nodes 20000 --expansion MLP
 
-# AI self-play
+# Human controls both sides
 python gui.py --self-play
 ```
+
+Use `--engine legacy` or `--engine fnn-cpu` for the retained MCTS engines.
+Press `A` for the evaluation graph and per-move search details.
 
 Requires `pygame-ce`: `pip install pygame-ce`
 

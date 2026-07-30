@@ -25,6 +25,19 @@ _INF: Final = 1000.0
 _PVS_EPSILON: Final = 1e-4
 
 
+def normalize_alpha_beta_score(raw_score: float) -> tuple[float, int | None]:
+    """Map native root scores to outcome value and optional mate distance.
+
+    Learned/search values occupy [-1, 1]. Scores with magnitude >= 9 are
+    proven terminal lines in the native +/-10, 0.01-per-ply mate band.
+    """
+    raw = float(raw_score)
+    if abs(raw) >= 9.0:
+        plies = max(0, int(round((10.0 - min(abs(raw), 10.0)) * 100.0)))
+        return (1.0 if raw > 0.0 else -1.0), plies
+    return max(-1.0, min(1.0, raw)), None
+
+
 class _Bound(IntEnum):
     EXACT = 0
     LOWER = 1
