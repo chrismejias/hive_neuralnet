@@ -40,10 +40,10 @@ if os.name == "nt":
         os.add_dll_directory(_cuda_bin)
 
 _extension = None
-_JIT_EXTENSION_NAME = "hive_gpu_ext_jit_136"
+_JIT_EXTENSION_NAME = "hive_gpu_ext_jit_137"
 _EXPECTED_FNN_FEATURE_DIM = 140
 _EXPECTED_FNN_ACTION_SURROUND_DIM = 24
-_EXPECTED_FNN_FEATURE_IMPL_VERSION = 9
+_EXPECTED_FNN_FEATURE_IMPL_VERSION = 10
 
 
 def _extension_is_compatible(ext) -> bool:

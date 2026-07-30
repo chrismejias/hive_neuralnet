@@ -269,8 +269,8 @@ def main() -> None:
     elif args.search_profile:
         search_config = AlphaBetaSearchConfig.from_profile(args.search_profile)
     elif resumed_generation_config and resumed_generation_config.get("search_config"):
-        search_config = AlphaBetaSearchConfig(
-            **resumed_generation_config["search_config"],
+        search_config = AlphaBetaSearchConfig.from_metadata(
+            resumed_generation_config["search_config"],
         )
     else:
         search_config = AlphaBetaSearchConfig()

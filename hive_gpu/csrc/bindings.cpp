@@ -549,5 +549,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.attr("MAX_TREE_DEPTH") = hive_gpu::MAX_TREE_DEPTH;
     m.attr("FNN_FEAT_DIM") = hive_gpu::FNN_FEAT_DIM;
     m.attr("FNN_ACTION_SURROUND_DIM") = 24;
-    m.attr("FNN_FEATURE_IMPL_VERSION") = 9;
+    m.attr("FNN_FEATURE_IMPL_VERSION") = 10;
 }
