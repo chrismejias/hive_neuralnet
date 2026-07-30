@@ -9,14 +9,17 @@ retained as alternatives.
 
 **FNN alpha-beta is the recommended default search engine for play, analysis,
 and evaluation.** Use the latest alpha-beta checkpoint,
-`checkpoints_fnn_alphabeta_50k_512/hive_fnn_alphabeta_0147.pt`, with a
-50,000-node budget as the current reference configuration. The native CPU
+`checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0161.pt`.
+A 20,000-node budget is a practical starting point; scale it to the latency
+available to your application. The native CPU
 search is intended for a single game or analysis session; the CUDA search
 scales across wide batches for self-play, training, and arenas.
 
 The alpha-beta engine combines iterative deepening, transposition tables,
 history/killer ordering, tactical quiescence, selective extensions, and an FNN
-for leaf values and move ordering. In recent testing it was competitive with
+used only for scalar leaf values. Move ordering is derived from iterative
+deepening, TT/PV moves, killer/history statistics, and cheap Hive geometry. In
+recent testing it was competitive with
 Nokamute while remaining practical on both CPU and GPU.
 
 **Small FNN Transformer with Gumbel/PUCT MCTS remains the recommended MCTS
@@ -103,8 +106,8 @@ from hive_fnn.fnn_alphabeta_player import AlphaBetaConfig, FNNAlphaBetaPlayer
 
 state = GameState()
 player = FNNAlphaBetaPlayer.from_checkpoint(
-    "checkpoints_fnn_alphabeta_50k_512/hive_fnn_alphabeta_0147.pt",
-    config=AlphaBetaConfig(node_budget=50_000, max_depth=32),
+    "checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0161.pt",
+    config=AlphaBetaConfig(node_budget=20_000, max_depth=32),
 )
 move = player.choose_move(state)
 ```
@@ -402,16 +405,22 @@ The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 
 ### Alpha-Beta Training And Search Tuning (recommended default)
 
-The separate alpha-beta trainer learns a move-ordering policy and calibrated
-value from completed iterative-deepening searches. Move-cap games are omitted
+The separate alpha-beta trainer learns one calibrated scalar value from
+completed iterative-deepening searches. The target is a configurable blend of
+the deeper search value and the final game result; no policy target is trained.
+The recommended checkpoint is iteration 161 of the value-only line. Its file
+retains action-head tensors for checkpoint-format compatibility, but alpha-beta
+neither packs, evaluates, nor trains them. Move-cap games are omitted
 from replay, and the default replay capacity is 75,000 records. Its initial
 weights are stored in
 `checkpoints_fnn_alphabeta/alpha_beta_checkpoint_1.pt`, a byte-identical copy
 of FNN checkpoint 1080.
 
-The CUDA search evaluates the FNN policy once at the root. Deeper nodes use
-transposition/PV moves, killer moves, history scores, and inexpensive Hive move
-geometry for ordering, while incremental hashing and make/unmake avoid copying
+The CPU and CUDA alpha-beta engines never evaluate the action head or encode
+successor positions for policy ranking. Root and deeper nodes use previous
+iterative-deepening scores, transposition/PV moves, killer moves, history
+scores, and inexpensive Hive move geometry for ordering. Incremental hashing
+and make/unmake avoid copying
 the full state at every node. Quiescence is deliberately limited to one legal
 reply at leaf nodes: immediate queen surrounds, queen threats, own-queen escapes
 (including pillbug throws), and moves that immobilize a previously mobile ant,
@@ -483,8 +492,8 @@ python -m hive_fnn.train_fnn_alphabeta \
 ```
 
 SPSA jointly tunes aspiration width, LMR thresholds, one-ply quiescence and
-its budget share, tactical extensions, policy/tactical move ordering, branching
-node allocation, and mate early stopping. Arena fitness can penalize additional
+its budget share, tactical probes, branching node allocation, and mate early
+stopping. Arena fitness can penalize additional
 nodes per move with `--node-cost-penalty`. Full trainer continuation uses
 `--resume checkpoints_fnn_alphabeta/alpha_beta_training_state_latest.pt`;
 the tuned search configuration is preserved automatically.
@@ -506,8 +515,8 @@ python gpu_alpha_beta_config_arena.py --checkpoint CHECKPOINT \
 Training accepts `--search-profile PROFILE`. Optional endgame curriculum starts
 use `--endgame-fraction`, `--endgame-min-surround`,
 `--endgame-max-surround`, and `--endgame-mixed-pair`.
-`--retain-truncated-teacher-records` keeps policy and searched-value targets
-from move-limit games while masking the unavailable final outcome; it never
+`--retain-truncated-teacher-records` keeps searched-value targets from
+move-limit games while masking the unavailable final outcome; it never
 treats the cutoff as a draw. Checkpoints store the fully resolved search and
 generation configuration.
 
@@ -929,7 +938,7 @@ hive_fnn/          # HiveGo-style FNN with multiple search paths
   fnn_mcts_orchestrator.py  # Gumbel-root MCTS tree search
   fnn_puct_orchestrator.py  # Plain PUCT MCTS tree search
   fnn_native_alphabeta.py   # CUDA-native iterative-deepening alpha-beta
-  fnn_alphabeta_training.py # Alpha-beta replay records and training losses
+  fnn_alphabeta_training.py # Alpha-beta replay and scalar-value training
   train_fnn_alphabeta.py    # Alpha-beta self-play trainer
   fnn_trainer.py       # FNNTrainer training loop
   train_fnn.py         # CLI entry point

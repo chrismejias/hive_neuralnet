@@ -4,13 +4,16 @@ from pathlib import Path
 import torch
 import pytest
 
+import hive_fnn.fnn_alphabeta_training as alpha_beta_training
 from hive_fnn.fnn_alphabeta_training import (
     AlphaBetaGenerationConfig,
     AlphaBetaLossConfig,
     AlphaBetaRecord,
     AlphaBetaReplayPriorityConfig,
     AlphaBetaReplayBuffer,
-    alpha_beta_ranking_mask,
+    AlphaBetaTrainingBatch,
+    alpha_beta_expansion_runs,
+    compute_alpha_beta_loss,
     alpha_beta_value_targets,
     opening_diversity_candidates,
     sample_opening_move_index,
@@ -21,6 +24,45 @@ from hive_fnn.train_fnn_alphabeta import (
     _load_resume_state,
     _save_resume_state,
 )
+
+
+def test_all_expansion_combinations_preserve_game_count() -> None:
+    runs = alpha_beta_expansion_runs(10, -1)
+
+    assert [mask for mask, _count in runs] == list(range(8))
+    assert sum(count for _mask, count in runs) == 10
+    assert max(count for _mask, count in runs) - min(
+        count for _mask, count in runs
+    ) <= 1
+
+
+def test_fixed_expansion_mask_uses_one_batch() -> None:
+    assert alpha_beta_expansion_runs(512, 7) == [(7, 512)]
+
+
+def test_alpha_beta_loss_trains_only_scalar_value(monkeypatch) -> None:
+    batch = AlphaBetaTrainingBatch(
+        states=torch.zeros((2, 1), dtype=torch.uint8),
+        legal_moves=torch.zeros((2, 1, 1), dtype=torch.uint8),
+        num_legal=torch.ones(2, dtype=torch.int64),
+        search_values=torch.tensor([0.8, -0.4]),
+        final_results=torch.tensor([-1.0, 1.0]),
+    )
+    monkeypatch.setattr(
+        alpha_beta_training, "_root_values",
+        lambda _net, _batch: torch.tensor([0.1, -0.2], requires_grad=True),
+    )
+
+    loss, components = compute_alpha_beta_loss(
+        None, batch, AlphaBetaLossConfig(),
+    )
+
+    expected_targets = torch.tensor([-0.55, 0.65])
+    expected = torch.nn.functional.mse_loss(
+        torch.tensor([0.1, -0.2]), expected_targets,
+    )
+    assert loss.item() == pytest.approx(expected.item())
+    assert set(components) == {"value_loss", "value_target_mean"}
 
 
 def test_value_target_uses_player_to_move_convex_blend() -> None:
@@ -40,33 +82,6 @@ def test_unknown_outcome_uses_search_target_without_fake_draw() -> None:
 
     assert targets[0].item() == pytest.approx(0.8)
     assert targets[1].item() == pytest.approx(0.65)
-
-
-def test_ranking_uses_only_exact_or_proven_upper_bound_inferiors() -> None:
-    scores = torch.tensor([[0.7, 0.4, 0.6, 0.2, 0.1]])
-    bounds = torch.tensor([[
-        AlphaBetaBound.EXACT,
-        AlphaBetaBound.EXACT,
-        AlphaBetaBound.UPPER,
-        AlphaBetaBound.LOWER,
-        AlphaBetaBound.UNSEARCHED,
-    ]], dtype=torch.uint8)
-
-    mask = alpha_beta_ranking_mask(scores, bounds, torch.tensor([0]))
-
-    assert mask.tolist() == [[False, True, True, False, False]]
-
-
-def test_ranking_is_disabled_when_selected_move_is_not_exact() -> None:
-    scores = torch.tensor([[0.7, 0.2]])
-    bounds = torch.tensor([[
-        AlphaBetaBound.LOWER,
-        AlphaBetaBound.EXACT,
-    ]], dtype=torch.uint8)
-
-    mask = alpha_beta_ranking_mask(scores, bounds, torch.tensor([0]))
-
-    assert not mask.any()
 
 
 def test_opening_diversity_uses_only_exact_near_best_moves() -> None:

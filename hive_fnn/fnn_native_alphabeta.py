@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from enum import IntEnum
 import weakref
 
@@ -34,8 +34,6 @@ class AlphaBetaSearchConfig:
     tactical_opponent_surround: bool = True
     tactical_own_relief: bool = True
     tactical_queen_threat: bool = True
-    policy_ordering_weight: float = 1.0
-    tactical_ordering_weight: float = 0.0
     branching_allocation: float = 0.0
     early_stop_score: float = 9.0
     early_stop_min_depth: int = 1
@@ -52,14 +50,15 @@ class AlphaBetaSearchConfig:
     persistent_tt: bool = False
     countermove_ordering: bool = False
     continuation_history: bool = False
-    internal_policy_ordering: bool = False
+    internal_heuristic_ordering: bool = False
 
     @classmethod
     def from_profile(cls, name: str) -> "AlphaBetaSearchConfig":
         """Construct a stable ablation profile."""
         profile = name.strip().lower()
         baseline = cls()
-        if profile == "baseline":
+        if profile in ("baseline", "value-only"):
+            # ``value-only`` is retained as a legacy alias; all search is value-only.
             return baseline
         if profile == "threat":
             return replace(baseline, recursive_threat_qsearch=True,
@@ -69,19 +68,33 @@ class AlphaBetaSearchConfig:
         if profile == "ordering":
             return replace(baseline, countermove_ordering=True,
                            continuation_history=True,
-                           internal_policy_ordering=True)
+                           internal_heuristic_ordering=True)
         if profile == "full":
             return replace(
                 baseline, recursive_threat_qsearch=True, quiescence_plies=4,
                 forced_extensions=True, singular_extensions=True,
                 proof_search=True, persistent_tt=True,
                 countermove_ordering=True, continuation_history=True,
-                internal_policy_ordering=True,
+                internal_heuristic_ordering=True,
             )
         raise ValueError(
-            f"unknown alpha-beta profile {name!r}; expected baseline, threat, "
-            "proof, ordering, or full"
+            f"unknown alpha-beta profile {name!r}; expected baseline, "
+            "threat, proof, ordering, or full"
         )
+
+    @classmethod
+    def from_metadata(cls, values: dict[str, object]) -> "AlphaBetaSearchConfig":
+        """Load current or legacy checkpoint/search metadata."""
+        normalized = dict(values)
+        if (
+            "internal_policy_ordering" in normalized
+            and "internal_heuristic_ordering" not in normalized
+        ):
+            normalized["internal_heuristic_ordering"] = normalized[
+                "internal_policy_ordering"
+            ]
+        allowed = {field.name for field in fields(cls)}
+        return cls(**{key: value for key, value in normalized.items() if key in allowed})
 
     def metadata(self) -> dict[str, object]:
         return asdict(self)
@@ -103,8 +116,6 @@ class AlphaBetaSearchConfig:
                 min(0.95, max(0.0, float(self.quiescence_budget_fraction))),
                 1.0 if self.force_win_probes else 0.0,
                 float(tactical_mask),
-                max(0.0, float(self.policy_ordering_weight)),
-                max(0.0, float(self.tactical_ordering_weight)),
                 min(0.75, max(-0.75, float(self.branching_allocation))),
                 min(9.99, max(1.0, float(self.early_stop_score))),
                 max(1, int(self.early_stop_min_depth)),
@@ -121,7 +132,7 @@ class AlphaBetaSearchConfig:
                 1.0 if self.persistent_tt else 0.0,
                 1.0 if self.countermove_ordering else 0.0,
                 1.0 if self.continuation_history else 0.0,
-                1.0 if self.internal_policy_ordering else 0.0,
+                1.0 if self.internal_heuristic_ordering else 0.0,
             ],
             dtype=torch.float32,
             device=device,
@@ -171,7 +182,6 @@ def pack_fnn_weights(net: HiveFNN) -> torch.Tensor:
     order = (
         "fc1.weight", "fc1.bias", "ln1.weight", "ln1.bias",
         "fc2.weight", "fc2.bias", "value_fc.weight", "value_fc.bias",
-        "action_fc1.weight", "action_fc1.bias", "action_fc2.weight", "action_fc2.bias",
     )
     packed = torch.cat(
         [state[key].detach().float().flatten() for key in order]

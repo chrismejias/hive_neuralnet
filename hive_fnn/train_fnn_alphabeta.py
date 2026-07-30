@@ -1,4 +1,4 @@
-"""Train the FNN value and move-ordering heads from alpha-beta records."""
+"""Train the FNN scalar value from alpha-beta self-play records."""
 
 from __future__ import annotations
 
@@ -144,6 +144,10 @@ def parse_args() -> argparse.Namespace:
         help="Full training state written as alpha_beta_training_state_latest.pt",
     )
     parser.add_argument("--iterations", type=int, default=1_500)
+    parser.add_argument(
+        "--start-iteration", type=int, default=1,
+        help="First output iteration when starting from --checkpoint",
+    )
     parser.add_argument("--games", type=int, default=256)
     parser.add_argument("--game-nodes", type=int, default=1_000)
     parser.add_argument("--teacher-nodes", type=int, default=6_000)
@@ -198,8 +202,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--search-value-weight", type=float, default=0.25)
-    parser.add_argument("--ranking-weight", type=float, default=0.25)
-    parser.add_argument("--exact-score-weight", type=float, default=0.0)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--checkpoint-dir", default="checkpoints_fnn_alphabeta")
     parser.add_argument("--seed", type=int, default=0)
@@ -210,6 +212,8 @@ def main() -> None:
     args = parse_args()
     if args.checkpoint and args.resume:
         raise ValueError("--checkpoint and --resume are mutually exclusive")
+    if args.start_iteration < 1:
+        raise ValueError("--start-iteration must be positive")
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     net = _load_network(args.resume or args.checkpoint)
@@ -237,10 +241,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     loss_config = AlphaBetaLossConfig(
         search_value_weight=args.search_value_weight,
-        ranking_loss_weight=args.ranking_weight,
-        exact_score_loss_weight=args.exact_score_weight,
     )
-    start_iteration = 1
+    start_iteration = args.start_iteration
     resumed_generation_config = None
     if args.resume:
         start_iteration, resumed_generation_config = _load_resume_state(
@@ -327,9 +329,7 @@ def main() -> None:
             f"depth_records={generation_stats['relabel_requested']} "
             f"diverse={generation_stats['opening_diverse_moves']} "
             f"loss={averaged.get('loss', 0.0):.5f} "
-            f"value={averaged.get('value_loss', 0.0):.5f} "
-            f"best={averaged.get('best_move_loss', 0.0):.5f} "
-            f"ranking={averaged.get('ranking_loss', 0.0):.5f}",
+            f"value={averaged.get('value_loss', 0.0):.5f}",
             flush=True,
         )
         payload = {

@@ -13,7 +13,6 @@ from hive_fnn.fnn_alphabeta_tuning import (
     load_search_config,
 )
 
-
 def test_default_parameter_vector_decodes_to_current_search_defaults() -> None:
     config = decode_search_config(default_normalized_parameters())
 
@@ -28,20 +27,19 @@ def test_default_parameter_vector_decodes_to_current_search_defaults() -> None:
     assert config.tactical_opponent_surround
     assert config.tactical_own_relief
     assert config.tactical_queen_threat
-    assert config.policy_ordering_weight == 1.0
-    assert config.tactical_ordering_weight == 0.0
     assert config.branching_allocation == 0.0
     assert config.early_stop_score == 9.0
     assert config.early_stop_min_depth == 1
 
-
-def test_named_profiles_are_independent_and_baseline_is_legacy() -> None:
+def test_named_profiles_are_independent_and_value_only_alias_is_legacy() -> None:
     baseline = AlphaBetaSearchConfig.from_profile("baseline")
+    value_only = AlphaBetaSearchConfig.from_profile("value-only")
     threat = AlphaBetaSearchConfig.from_profile("threat")
     proof = AlphaBetaSearchConfig.from_profile("proof")
     full = AlphaBetaSearchConfig.from_profile("full")
 
     assert baseline == AlphaBetaSearchConfig()
+    assert value_only == baseline
     assert not baseline.recursive_threat_qsearch
     assert threat.recursive_threat_qsearch and threat.quiescence_plies == 4
     assert threat.forced_extensions and not threat.proof_search
@@ -49,10 +47,18 @@ def test_named_profiles_are_independent_and_baseline_is_legacy() -> None:
     assert full.proof_search and full.persistent_tt
     assert full.countermove_ordering and full.continuation_history
 
+def test_legacy_policy_metadata_loads_without_reenabling_policy() -> None:
+    config = AlphaBetaSearchConfig.from_metadata({
+        "policy_ordering_weight": 3.0,
+        "tactical_ordering_weight": 2.0,
+        "internal_policy_ordering": True,
+    })
+
+    assert config.internal_heuristic_ordering
+    assert not hasattr(config, "policy_ordering_weight")
 
 def test_default_alpha_beta_replay_capacity_is_75000() -> None:
     assert AlphaBetaReplayBuffer().capacity == 75_000
-
 
 def test_spsa_update_is_bounded_and_resumable() -> None:
     output = Path(__file__).parent / ".alpha_beta_spsa_test"

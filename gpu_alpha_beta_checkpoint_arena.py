@@ -9,9 +9,22 @@ import torch
 
 import arena
 import hive_gpu
-from hive_fnn.fnn_native_alphabeta import AlphaBetaGPUContext, search_batch
+from hive_fnn.fnn_native_alphabeta import (
+    AlphaBetaGPUContext, AlphaBetaSearchConfig, search_batch,
+)
 from tune_fnn_alphabeta import _load_network
 
+def _paired_initial_states(ext, *, pairs: int, expansion_mask: int) -> torch.Tensor:
+    """Create adjacent color-swapped pairs with identical expansion sets."""
+    if expansion_mask >= 0:
+        return ext.create_initial_states(pairs * 2, expansion_mask)
+    base, remainder = divmod(pairs, 8)
+    chunks = [
+        ext.create_initial_states(2 * (base + (mask < remainder)), mask)
+        for mask in range(8)
+        if base + (mask < remainder) > 0
+    ]
+    return torch.cat(chunks, dim=0)
 
 def _random_paired_openings(
     states: torch.Tensor,
@@ -38,12 +51,15 @@ def _random_paired_openings(
         selected = torch.repeat_interleave(pair_moves, 2, dim=0).contiguous()
         ext.apply_moves_batch(states, selected, games)
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--challenger", required=True)
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--weights", choices=("model", "ema"), default="model")
+    profiles = ("baseline", "threat", "proof", "ordering", "full")
+    parser.add_argument("--challenger-profile", choices=profiles, default="baseline")
+    parser.add_argument("--baseline-profile", choices=profiles, default="baseline")
+    parser.add_argument("--expansion-mask", type=int, default=0)
     parser.add_argument("--pairs", type=int, default=32)
     parser.add_argument("--nodes", type=int, default=500)
     parser.add_argument("--max-depth", type=int, default=16)
@@ -67,7 +83,9 @@ def main() -> None:
     baseline = loader(args.baseline)
     ext = hive_gpu.load_extension()
     games = args.pairs * 2
-    states = ext.create_initial_states(games)
+    states = _paired_initial_states(
+        ext, pairs=args.pairs, expansion_mask=args.expansion_mask,
+    )
     _random_paired_openings(
         states,
         pairs=args.pairs,
@@ -80,6 +98,11 @@ def main() -> None:
         "challenger": torch.zeros((), dtype=torch.int64, device=states.device),
         "baseline": torch.zeros((), dtype=torch.int64, device=states.device),
     }
+    stat_counts = {
+        "challenger": torch.zeros(9, dtype=torch.int64, device=states.device),
+        "baseline": torch.zeros(9, dtype=torch.int64, device=states.device),
+    }
+    search_seconds = {"challenger": 0.0, "baseline": 0.0}
     plies = torch.full(
         (games,), args.opening_plies, dtype=torch.int32, device=states.device,
     )
@@ -88,9 +111,17 @@ def main() -> None:
         games, dtype=torch.bool, device=states.device,
     )
     challenger_is_white[::2] = True
+    search_configs = {
+        "challenger": AlphaBetaSearchConfig.from_profile(args.challenger_profile),
+        "baseline": AlphaBetaSearchConfig.from_profile(args.baseline_profile),
+    }
     contexts = {
-        "challenger": AlphaBetaGPUContext(challenger, capacity=games),
-        "baseline": AlphaBetaGPUContext(baseline, capacity=games),
+        "challenger": AlphaBetaGPUContext(
+            challenger, capacity=games, search_config=search_configs["challenger"],
+        ),
+        "baseline": AlphaBetaGPUContext(
+            baseline, capacity=games, search_config=search_configs["baseline"],
+        ),
     }
     started = time.perf_counter()
     rounds = 0
@@ -108,6 +139,8 @@ def main() -> None:
             if not num_rows:
                 continue
             sub_states = states.index_select(0, rows).contiguous()
+            torch.cuda.synchronize()
+            search_started = time.perf_counter()
             moves, _values, stats = search_batch(
                 net,
                 sub_states,
@@ -115,6 +148,8 @@ def main() -> None:
                 max_depth=args.max_depth,
                 context=contexts[name],
             )
+            torch.cuda.synchronize()
+            search_seconds[name] += time.perf_counter() - search_started
             ext.apply_moves_batch(sub_states, moves, num_rows)
             states.index_copy_(0, rows, sub_states)
             plies.index_add_(
@@ -122,6 +157,7 @@ def main() -> None:
             )
             move_counts[name] += num_rows
             node_counts[name] += stats[:, 1].sum(dtype=torch.int64)
+            stat_counts[name] += stats.sum(dim=0, dtype=torch.int64)
 
         results_gpu = ext.check_results_batch(states, games)
         active &= (results_gpu == 0) & (plies < args.max_plies)
@@ -152,9 +188,25 @@ def main() -> None:
         f"draws={draws} games={games}"
     )
     print(f"challenger_score={score:.4f}")
+    print(
+        f"challenger_profile={args.challenger_profile} "
+        f"baseline_profile={args.baseline_profile} "
+        f"expansion_mask={args.expansion_mask}"
+    )
     for name in ("challenger", "baseline"):
-        mean_nodes = int(node_counts[name].item()) / max(1, move_counts[name])
-        print(f"{name}_mean_nodes={mean_nodes:.1f}")
+        stats = stat_counts[name].cpu().tolist()
+        nodes = max(1, int(node_counts[name].item()))
+        moves = max(1, move_counts[name])
+        elapsed = max(search_seconds[name], 1e-9)
+        print(f"{name}_mean_nodes={nodes / moves:.1f}")
+        print(f"{name}_mean_depth={stats[0] / moves:.3f}")
+        print(f"{name}_nodes_per_second={nodes / elapsed:.1f}")
+        print(f"{name}_cutoffs_per_1k_nodes={1000.0 * stats[2] / nodes:.3f}")
+        print(f"{name}_tt_hits_per_1k_nodes={1000.0 * stats[3] / nodes:.3f}")
+        print(f"{name}_pvs_researches_per_1k_nodes={1000.0 * stats[4] / nodes:.3f}")
+        print(f"{name}_lmr_reductions_per_1k_nodes={1000.0 * stats[5] / nodes:.3f}")
+        print(f"{name}_qnodes_fraction={stats[6] / nodes:.5f}")
+        print(f"{name}_search_seconds={elapsed:.3f}")
 
 
 if __name__ == "__main__":

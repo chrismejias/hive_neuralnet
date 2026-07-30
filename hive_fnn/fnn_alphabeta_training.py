@@ -71,16 +71,26 @@ class AlphaBetaGenerationConfig:
     retain_truncated_teacher_records: bool = False
 
 
+def alpha_beta_expansion_runs(
+    games: int, expansion_mask: int,
+) -> list[tuple[int, int]]:
+    """Distribute ``-1`` evenly over all eight Base/L/M/P subsets."""
+    if games <= 0:
+        return []
+    if expansion_mask >= 0:
+        return [(expansion_mask, games)]
+    base, remainder = divmod(games, 8)
+    return [
+        (mask, base + (1 if mask < remainder else 0))
+        for mask in range(8)
+        if base + (1 if mask < remainder else 0) > 0
+    ]
+
+
 @dataclass(frozen=True)
 class AlphaBetaLossConfig:
     search_value_weight: float = 0.25
     value_loss_weight: float = 1.0
-    best_move_loss_weight: float = 1.0
-    ranking_loss_weight: float = 0.25
-    ranking_temperature: float = 1.0
-    ranking_score_epsilon: float = 1e-4
-    exact_score_loss_weight: float = 0.0
-    exact_score_temperature: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -102,10 +112,6 @@ class AlphaBetaTrainingBatch:
     states: torch.Tensor
     legal_moves: torch.Tensor
     num_legal: torch.Tensor
-    selected_indices: torch.Tensor
-    root_scores: torch.Tensor
-    root_bounds: torch.Tensor
-    raw_values: torch.Tensor
     search_values: torch.Tensor
     final_results: torch.Tensor
 
@@ -392,7 +398,11 @@ def generate_alpha_beta_records(
     torch.manual_seed(cfg.seed)
     ext = hive_gpu.load_extension()
     net = net.cuda().eval()
-    states = ext.create_initial_states(cfg.games, cfg.expansion_mask)
+    expansion_runs = alpha_beta_expansion_runs(cfg.games, cfg.expansion_mask)
+    states = torch.cat([
+        ext.create_initial_states(count, mask)
+        for mask, count in expansion_runs
+    ], dim=0)
     endgame_count = min(
         cfg.games, round(cfg.games * max(0.0, min(1.0, cfg.endgame_fraction))),
     )
@@ -578,31 +588,15 @@ def collate_alpha_beta_records(
     legal_moves = torch.zeros(
         (batch_size, max_legal, move_size), dtype=torch.uint8,
     )
-    root_scores = torch.full((batch_size, max_legal), float("nan"))
-    root_bounds = torch.zeros((batch_size, max_legal), dtype=torch.uint8)
     num_legal = torch.empty(batch_size, dtype=torch.int64)
     for row, record in enumerate(records):
         n = record.legal_moves.shape[0]
         legal_moves[row, :n] = record.legal_moves
-        root_scores[row, :n] = record.root_scores
-        root_bounds[row, :n] = record.root_bounds
         num_legal[row] = n
     return AlphaBetaTrainingBatch(
         states=states.to(target),
         legal_moves=legal_moves.to(target),
         num_legal=num_legal.to(target),
-        selected_indices=torch.tensor(
-            [record.selected_index for record in records],
-            dtype=torch.int64,
-            device=target,
-        ),
-        root_scores=root_scores.to(target),
-        root_bounds=root_bounds.to(target),
-        raw_values=torch.tensor(
-            [record.raw_value for record in records],
-            dtype=torch.float32,
-            device=target,
-        ),
         search_values=torch.tensor(
             [record.search_value for record in records],
             dtype=torch.float32,
@@ -616,45 +610,17 @@ def collate_alpha_beta_records(
     )
 
 
-def _padded_action_logits(
+def _root_values(
     net: HiveFNN,
     batch: AlphaBetaTrainingBatch,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
+    """Evaluate root values without encoding or scoring successors."""
     ext = hive_gpu.load_extension()
-    batch_size, max_legal = batch.legal_moves.shape[:2]
+    batch_size = batch.states.shape[0]
     root_features = ext.extract_fnn_features_batch(
         batch.states, batch.legal_moves, batch.num_legal.to(torch.int32), batch_size,
     )
-    slots = torch.arange(max_legal, device=batch.states.device).unsqueeze(0)
-    valid = slots < batch.num_legal.unsqueeze(1)
-    action_to_root = torch.arange(
-        batch_size, device=batch.states.device,
-    ).unsqueeze(1).expand_as(valid)[valid]
-    move_indices = slots.expand_as(valid)[valid]
-    successor_features = ext.fnn_successor_features_batch(
-        batch.states,
-        batch.legal_moves,
-        action_to_root,
-        move_indices,
-        int(action_to_root.numel()),
-    )
-    root_embed = net.encode(root_features)
-    successor_embed = net.encode(successor_features)
-    flat_logits = net.score_actions(
-        root_embed[action_to_root],
-        successor_embed,
-        root_features[action_to_root],
-        successor_features,
-    )
-    logits = torch.full(
-        (batch_size, max_legal),
-        float("-inf"),
-        dtype=flat_logits.dtype,
-        device=flat_logits.device,
-    )
-    logits[valid] = flat_logits
-    root_values = net.value_head(root_embed).squeeze(-1)
-    return logits, root_values
+    return net.value_head(net.encode(root_features)).squeeze(-1)
 
 
 def alpha_beta_value_targets(
@@ -670,92 +636,24 @@ def alpha_beta_value_targets(
     return torch.where(torch.isfinite(final_results), blended, search)
 
 
-def alpha_beta_ranking_mask(
-    root_scores: torch.Tensor,
-    root_bounds: torch.Tensor,
-    selected_indices: torch.Tensor,
-    *,
-    score_epsilon: float = 1e-4,
-) -> torch.Tensor:
-    """Return competitors that are rigorously below an exact selected move."""
-
-    rows = torch.arange(root_scores.shape[0], device=root_scores.device)
-    best_scores = root_scores[rows, selected_indices]
-    best_exact = (
-        root_bounds[rows, selected_indices] == int(AlphaBetaBound.EXACT)
-    )
-    strictly_below = root_scores < best_scores.unsqueeze(1) - score_epsilon
-    valid_bound = (
-        (root_bounds == int(AlphaBetaBound.EXACT))
-        | (root_bounds == int(AlphaBetaBound.UPPER))
-    )
-    mask = strictly_below & valid_bound & best_exact.unsqueeze(1)
-    mask[rows, selected_indices] = False
-    return mask
-
-
 def compute_alpha_beta_loss(
     net: HiveFNN,
     batch: AlphaBetaTrainingBatch,
     config: AlphaBetaLossConfig | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Train value calibration and alpha-beta move ordering."""
+    """Train the scalar leaf value used by alpha-beta search."""
 
     cfg = config or AlphaBetaLossConfig()
-    logits, root_values = _padded_action_logits(net, batch)
+    root_values = _root_values(net, batch)
     value_targets = alpha_beta_value_targets(
         batch.search_values,
         batch.final_results,
         cfg.search_value_weight,
     )
     value_loss = F.mse_loss(root_values.float(), value_targets)
-    best_move_loss = F.cross_entropy(logits.float(), batch.selected_indices)
-
-    rows = torch.arange(logits.shape[0], device=logits.device)
-    best_logits = logits[rows, batch.selected_indices]
-    ranking_mask = alpha_beta_ranking_mask(
-        batch.root_scores,
-        batch.root_bounds,
-        batch.selected_indices,
-        score_epsilon=cfg.ranking_score_epsilon,
-    )
-    if ranking_mask.any():
-        differences = (
-            best_logits.unsqueeze(1) - logits
-        )[ranking_mask] / max(float(cfg.ranking_temperature), 1e-6)
-        ranking_loss = F.softplus(-differences).mean()
-    else:
-        ranking_loss = logits.new_zeros(())
-
-    exact_score_loss = logits.new_zeros(())
-    if cfg.exact_score_loss_weight > 0.0:
-        exact_mask = batch.root_bounds == int(AlphaBetaBound.EXACT)
-        rows_with_scores = exact_mask.sum(dim=1) >= 2
-        if rows_with_scores.any():
-            teacher_logits = (
-                batch.root_scores / max(float(cfg.exact_score_temperature), 1e-6)
-            ).masked_fill(~exact_mask, float("-inf"))
-            teacher_probs = torch.softmax(teacher_logits[rows_with_scores], dim=1)
-            student_log_probs = torch.log_softmax(
-                logits[rows_with_scores].float(), dim=1,
-            )
-            student_log_probs = student_log_probs.masked_fill(
-                ~exact_mask[rows_with_scores], 0.0,
-            )
-            exact_score_loss = -(teacher_probs * student_log_probs).sum(dim=1).mean()
-
-    total = (
-        cfg.value_loss_weight * value_loss
-        + cfg.best_move_loss_weight * best_move_loss
-        + cfg.ranking_loss_weight * ranking_loss
-        + cfg.exact_score_loss_weight * exact_score_loss
-    )
+    total = cfg.value_loss_weight * value_loss
     return total, {
         "value_loss": value_loss,
-        "best_move_loss": best_move_loss,
-        "ranking_loss": ranking_loss,
-        "exact_score_loss": exact_score_loss,
-        "ranking_pairs": ranking_mask.sum(),
         "value_target_mean": value_targets.mean(),
     }
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -60,8 +60,6 @@ SEARCH_PARAMETER_SPACE = (
     TunableParameter("tactical_opponent_surround", 0, 1, "bool", 1),
     TunableParameter("tactical_own_relief", 0, 1, "bool", 1),
     TunableParameter("tactical_queen_threat", 0, 1, "bool", 1),
-    TunableParameter("policy_ordering_weight", 0.1, 3.0, "float", 1.0),
-    TunableParameter("tactical_ordering_weight", 0.0, 2.0, "float", 0.0),
     TunableParameter("branching_allocation", -0.5, 0.5, "float", 0.0),
     TunableParameter("early_stop_score", 8.5, 9.95, "float", 9.0),
     TunableParameter("early_stop_min_depth", 1, 6, "int", 1),
@@ -90,11 +88,7 @@ def load_search_config(path: str | Path) -> AlphaBetaSearchConfig:
     values = payload.get("search_config", payload)
     profile = values.get("profile") if isinstance(values, dict) else None
     base = AlphaBetaSearchConfig.from_profile(profile) if profile else AlphaBetaSearchConfig()
-    allowed = {field.name for field in fields(AlphaBetaSearchConfig)}
-    overrides = {
-        name: value for name, value in values.items() if name in allowed
-    }
-    return AlphaBetaSearchConfig(**{**asdict(base), **overrides})
+    return AlphaBetaSearchConfig.from_metadata({**asdict(base), **values})
 
 
 @dataclass(frozen=True)
@@ -342,11 +336,16 @@ class AlphaBetaSPSATuner:
         payload = json.loads(Path(path or self.state_path).read_text())
         self.iteration = int(payload["iteration"])
         self.theta = np.asarray(payload["theta"], dtype=np.float64)
+        # SPSA v1 included two neural-policy ordering weights at indices 11-12.
+        if self.theta.shape == (len(SEARCH_PARAMETER_SPACE) + 2,):
+            self.theta = np.delete(self.theta, [11, 12])
+        if self.theta.shape != (len(SEARCH_PARAMETER_SPACE),):
+            raise ValueError("saved SPSA parameter vector has wrong shape")
         self.rng.bit_generator.state = payload["rng_state"]
 
     def _save(self) -> None:
         payload = {
-            "format": "fnn_alphabeta_spsa_v1",
+            "format": "fnn_alphabeta_spsa_v2",
             "iteration": self.iteration,
             "theta": self.theta.tolist(),
             "search_config": asdict(decode_search_config(self.theta)),

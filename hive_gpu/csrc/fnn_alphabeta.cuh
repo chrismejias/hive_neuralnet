@@ -57,8 +57,6 @@ struct ABSearchConfig {
     float quiescence_budget_fraction;
     bool force_win_probes;
     int tactical_mask;
-    float policy_ordering_weight;
-    float tactical_ordering_weight;
     float branching_allocation;
     float early_stop_score;
     int early_stop_min_depth;
@@ -75,7 +73,7 @@ struct ABSearchConfig {
     bool persistent_tt;
     bool countermove_ordering;
     bool continuation_history;
-    bool internal_policy_ordering;
+    bool internal_heuristic_ordering;
 };
 
 constexpr int AB_TACTICAL_IMMOBILIZE = 1;
@@ -89,34 +87,29 @@ __device__ inline ABSearchConfig ab_make_search_config(const float* values) {
     config.lmr_min_depth = max(1, (int)values[1]);
     config.lmr_min_move = max(1, (int)values[2]);
     config.lmr_reduction = max(0, (int)values[3]);
-    // Preserve legacy one-reply behavior unless recursive threat search is enabled.
-    config.recursive_threat_qsearch = values[13] >= 0.5f;
+    config.recursive_threat_qsearch = values[11] >= 0.5f;
     config.quiescence_plies = min(
         config.recursive_threat_qsearch ? 4 : 1,
         max(0, (int)values[4]));
-    config.quiescence_budget_fraction =
-        min(0.95f, max(0.0f, values[5]));
+    config.quiescence_budget_fraction = min(0.95f, max(0.0f, values[5]));
     config.force_win_probes = values[6] >= 0.5f;
     config.tactical_mask = (int)values[7];
-    config.policy_ordering_weight = max(0.0f, values[8]);
-    config.tactical_ordering_weight = max(0.0f, values[9]);
-    config.branching_allocation =
-        min(0.75f, max(-0.75f, values[10]));
-    config.early_stop_score = min(9.99f, max(1.0f, values[11]));
-    config.early_stop_min_depth = max(1, (int)values[12]);
-    config.forced_extensions = values[14] >= 0.5f;
-    config.forced_extension_max_chain = max(0, (int)values[15]);
-    config.singular_extensions = values[16] >= 0.5f;
-    config.singular_min_depth = max(2, (int)values[17]);
-    config.singular_margin = max(0.0f, values[18]);
-    config.proof_search = values[19] >= 0.5f;
-    config.proof_max_plies = max(1, (int)values[20]);
-    config.proof_budget_fraction = min(0.75f, max(0.0f, values[21]));
-    config.proof_trigger_surround = min(5, max(0, (int)values[22]));
-    config.persistent_tt = values[23] >= 0.5f;
-    config.countermove_ordering = values[24] >= 0.5f;
-    config.continuation_history = values[25] >= 0.5f;
-    config.internal_policy_ordering = values[26] >= 0.5f;
+    config.branching_allocation = min(0.75f, max(-0.75f, values[8]));
+    config.early_stop_score = min(9.99f, max(1.0f, values[9]));
+    config.early_stop_min_depth = max(1, (int)values[10]);
+    config.forced_extensions = values[12] >= 0.5f;
+    config.forced_extension_max_chain = max(0, (int)values[13]);
+    config.singular_extensions = values[14] >= 0.5f;
+    config.singular_min_depth = max(2, (int)values[15]);
+    config.singular_margin = max(0.0f, values[16]);
+    config.proof_search = values[17] >= 0.5f;
+    config.proof_max_plies = max(1, (int)values[18]);
+    config.proof_budget_fraction = min(0.75f, max(0.0f, values[19]));
+    config.proof_trigger_surround = min(5, max(0, (int)values[20]));
+    config.persistent_tt = values[21] >= 0.5f;
+    config.countermove_ordering = values[22] >= 0.5f;
+    config.continuation_history = values[23] >= 0.5f;
+    config.internal_heuristic_ordering = values[24] >= 0.5f;
     return config;
 }
 
@@ -338,53 +331,6 @@ __device__ inline float ab_evaluate(
         state, moves, n, cache.ap_mask, params, weights);
 }
 
-__device__ inline void ab_policy_scores(
-    HiveState& state, const GPUMove* moves, int n,
-    const float* params, const FNNWeights& weights,
-    const ABSearchConfig& config, const Bitboard& root_ap_mask,
-    float* scores
-) {
-    float root_features[FNN_FEAT_DIM], root_embed[FNN_MAX_EMBED];
-    extract_fnn_features_with_ap_device(
-        state, moves, n, root_ap_mask, root_features);
-    fnn_encode(root_features, root_embed, params, weights);
-    Color mover = current_player(state);
-    Color opponent = mover == WHITE ? BLACK : WHITE;
-    int root_opp_surround = config.tactical_ordering_weight > 0.0f ?
-        queen_surround_count_for_color_device(state, opponent) : 0;
-    int root_own_surround = config.tactical_ordering_weight > 0.0f ?
-        queen_surround_count_for_color_device(state, mover) : 0;
-    for (int i = 0; i < n; ++i) {
-        ABUndo undo;
-        ab_make_move_unhashed(state, moves[i], undo);
-        GPUMove child_moves[MAX_LEGAL_MOVES];
-        MovegenStateCache child_cache;
-        int child_n = generate_fnn_feature_moves_with_cache(
-            state, child_moves, child_cache);
-        float child_features[FNN_FEAT_DIM], child_embed[FNN_MAX_EMBED];
-        extract_fnn_features_with_ap_device(
-            state, child_moves, child_n, child_cache.ap_mask, child_features);
-        fnn_encode(child_features, child_embed, params, weights);
-        float tactical = 0.0f;
-        if (config.tactical_ordering_weight > 0.0f) {
-            bool mover_won =
-                (state.result == WHITE_WINS && mover == WHITE) ||
-                (state.result == BLACK_WINS && mover == BLACK);
-            tactical = mover_won ? 100.0f : (float)(
-                queen_surround_count_for_color_device(state, opponent) -
-                    root_opp_surround +
-                root_own_surround -
-                    queen_surround_count_for_color_device(state, mover));
-        }
-        scores[i] =
-            config.policy_ordering_weight * fnn_score_action(
-                root_embed, child_embed, root_features, child_features,
-                params, weights)
-            + config.tactical_ordering_weight * tactical;
-        ab_unmake_move(state, undo);
-    }
-}
-
 __device__ __forceinline__ bool ab_adjacent_to(int cell, uint16_t target) {
     if (cell < 0 || cell >= NUM_CELLS || target == 0xFFFF) return false;
     for (int direction = 0; direction < NUM_DIRS; ++direction) {
@@ -439,7 +385,7 @@ __device__ inline float ab_search_order_score(
         move.piece_type == PT_PILLBUG) {
         score += 100.0f;
     }
-    if (config.internal_policy_ordering) {
+    if (config.internal_heuristic_ordering) {
         int pressure = queen_surround_count_for_color_device(state, opponent);
         if (ab_adjacent_to((int)move.to_cell, state.queen_cell[opponent])) {
             score += 2500.0f * pressure;
@@ -1418,9 +1364,11 @@ __global__ void fnn_alphabeta_kernel(
     ABExplicitFrame* frames = frame_workspace + game * AB_MAX_PV;
     ABPackedMove* move_stack = move_stack_workspace +
         (int64_t)game * AB_MAX_PV * MAX_LEGAL_MOVES;
-    ab_policy_scores(
-        root, root_moves, n, params, weights, config,
-        root_cache.ap_mask, order_scores);
+    // Seed root ordering cheaply; completed depth-one scores replace it.
+    for (int i = 0; i < n; ++i) {
+        order_scores[i] = ab_search_order_score(
+            root, root_moves[i], 0, killers, history, config, AB_NO_MOVE);
+    }
     GPUMove best_move = root_moves[0];
     float best_value = out_raw_values[game];
     int best_index = 0;
@@ -1433,7 +1381,7 @@ __global__ void fnn_alphabeta_kernel(
     for (int depth = 1; depth <= max_depth; ++depth) {
         for (int i = 0; i < n; ++i) {
             // Once a depth completes, its root values are substantially better
-            // MultiPV ordering signals than the policy prior.
+            // MultiPV ordering signals than the initial heuristics.
             if (completed > 0) {
                 order_scores[i] = out_root_scores[root_offset + i];
                 if (ab_move_equal(root_moves[i], best_move)) {

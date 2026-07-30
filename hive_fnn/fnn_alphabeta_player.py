@@ -43,7 +43,6 @@ class AlphaBetaConfig:
     max_depth: int = 32
     torch_threads: int | None = 1
     tt_max_entries: int = 500_000
-    neural_policy_all_nodes: bool = True
     pvs: bool = False
     native_tree: bool = True
 
@@ -72,8 +71,6 @@ class _Expansion:
     child_states: list[bytes]
     child_results: np.ndarray
     root_features: np.ndarray
-    child_features: np.ndarray
-    priors: np.ndarray
 
 
 class _SearchAborted(RuntimeError):
@@ -83,8 +80,8 @@ class _SearchAborted(RuntimeError):
 class FNNAlphaBetaPlayer:
     """Depth-first negamax alpha-beta using the FNN value network at leaves.
 
-    All rule work stays in ``hive_cpu_native``.  The FNN policy head is used
-    only for move ordering; the value head supplies the leaf evaluation.
+    All rule work stays in ``hive_cpu_native``.  The FNN supplies only the
+    scalar leaf evaluation; move ordering is search-derived or handcrafted.
     """
 
     def __init__(self, net: HiveFNN, config: AlphaBetaConfig | None = None) -> None:
@@ -103,8 +100,6 @@ class FNNAlphaBetaPlayer:
         weight_order = (
             "fc1.weight", "fc1.bias", "ln1.weight", "ln1.bias",
             "fc2.weight", "fc2.bias", "value_fc.weight", "value_fc.bias",
-            "action_fc1.weight", "action_fc1.bias",
-            "action_fc2.weight", "action_fc2.bias",
         )
         self._native_weights = np.concatenate([
             state_dict[name].detach().numpy().ravel() for name in weight_order
@@ -159,7 +154,7 @@ class FNNAlphaBetaPlayer:
         if self.last_stats.nodes > max(1, int(self.config.node_budget)):
             raise _SearchAborted
 
-    def _expand(self, state: bytes, *, use_policy: bool = False) -> _Expansion:
+    def _expand(self, state: bytes) -> _Expansion:
         cached = self._expansion_cache.get(state)
         if cached is not None:
             return cached
@@ -177,68 +172,19 @@ class FNNAlphaBetaPlayer:
                 child_states=[],
                 child_results=np.zeros((0,), dtype=np.int32),
                 root_features=root_features_np,
-                child_features=np.zeros((0, root_features_np.shape[0]), dtype=np.float32),
-                priors=np.zeros((0,), dtype=np.float32),
             )
-            self._expansion_cache[state] = expansion
-            return expansion
-
-        score_policy = use_policy or self.config.neural_policy_all_nodes
-        if not score_policy:
-            child_states, child_results = self.ext.successors(state, moves, n_legal)
-            child_results_np = np.asarray(child_results, dtype=np.int32).copy()
+        else:
+            child_states, child_results = self.ext.successors(
+                state, moves, n_legal,
+            )
             expansion = _Expansion(
                 moves=moves,
                 child_states=list(child_states),
-                child_results=child_results_np,
+                child_results=np.asarray(
+                    child_results, dtype=np.int32,
+                ).copy(),
                 root_features=root_features_np,
-                child_features=np.zeros((0, root_features_np.shape[0]), dtype=np.float32),
-                priors=np.zeros((n_legal,), dtype=np.float32),
             )
-            self._expansion_cache[state] = expansion
-            return expansion
-
-        child_features, child_states, child_results = self.ext.successor_features(
-            state, moves, n_legal,
-        )
-        child_features_np = np.asarray(child_features, dtype=np.float32).copy()
-        child_results_np = np.asarray(child_results, dtype=np.int32).copy()
-
-        with torch.inference_mode():
-            root_t = torch.from_numpy(root_features_np).unsqueeze(0)
-            child_t = torch.from_numpy(child_features_np)
-            root_embed = self._embed_cache.get(state)
-            if root_embed is None:
-                root_embed = self.net.encode(root_t)
-                self._embed_cache[state] = root_embed
-                self._value_cache[state] = float(self.net.value_head(root_embed).item())
-            child_embed = self.net.encode(child_t)
-            logits = self.net.score_actions(
-                root_embed.expand(n_legal, -1),
-                child_embed,
-                root_t.expand(n_legal, -1),
-                child_t,
-            )
-            priors = torch.softmax(logits.float(), dim=0).cpu().numpy().astype(np.float32)
-            child_values = self.net.value_head(child_embed).flatten().tolist()
-        for child_state, child_feature, child_embed_row, child_value in zip(
-            child_states, child_features_np, child_embed, child_values,
-        ):
-            if child_state not in self._value_cache:
-                # These arrays/tensors already belong to this move's expansion
-                # cache, so retaining views avoids thousands of tiny copies.
-                self._feature_cache[child_state] = child_feature
-                self._embed_cache[child_state] = child_embed_row.unsqueeze(0)
-                self._value_cache[child_state] = float(child_value)
-
-        expansion = _Expansion(
-            moves=moves,
-            child_states=list(child_states),
-            child_results=child_results_np,
-            root_features=root_features_np,
-            child_features=child_features_np,
-            priors=priors,
-        )
         self._expansion_cache[state] = expansion
         return expansion
 
@@ -273,17 +219,16 @@ class FNNAlphaBetaPlayer:
         n = len(expansion.moves)
         if n == 0:
             return []
-        scores = expansion.priors.astype(np.float64, copy=True)
-        if not self.config.neural_policy_all_nodes:
-            killer_pair = self._killers.get(ply)
-            for idx, move in enumerate(expansion.moves):
-                key = self._move_key(move)
-                scores[idx] += float(self._history.get(key, 0))
-                if killer_pair is not None:
-                    if key == killer_pair[0]:
-                        scores[idx] += 1_000_000.0
-                    elif key == killer_pair[1]:
-                        scores[idx] += 900_000.0
+        scores = np.zeros((n,), dtype=np.float64)
+        killer_pair = self._killers.get(ply)
+        for idx, move in enumerate(expansion.moves):
+            key = self._move_key(move)
+            scores[idx] += float(self._history.get(key, 0))
+            if killer_pair is not None:
+                if key == killer_pair[0]:
+                    scores[idx] += 1_000_000.0
+                elif key == killer_pair[1]:
+                    scores[idx] += 900_000.0
         # A known terminal win must be tried before learned ordering.
         for idx, (child_state, result) in enumerate(
             zip(expansion.child_states, expansion.child_results)
@@ -414,7 +359,7 @@ class FNNAlphaBetaPlayer:
         self._consume_node()
         if result != 0:
             return None, self._terminal_value(state, result, 0)
-        expansion = self._expand(state, use_policy=True)
+        expansion = self._expand(state)
         if not expansion.child_states:
             return None, self._leaf_value(state)
 
@@ -488,10 +433,10 @@ class FNNAlphaBetaPlayer:
             )
             return np.asarray(move, dtype=np.uint8).copy()
 
-        root = self._expand(state, use_policy=True)
+        root = self._expand(state)
         if not root.child_states:
             return np.zeros((int(self.ext.SIZEOF_GPU_MOVE),), dtype=np.uint8)
-        fallback = self._move_key(root.moves[int(np.argmax(root.priors))])
+        fallback = self._move_key(root.moves[0])
         best_move = fallback
         best_value = self._leaf_value(state)
         for depth in range(1, max(1, int(self.config.max_depth)) + 1):
