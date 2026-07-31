@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--search-profile",
-        choices=("baseline", "threat", "proof", "ordering", "full"),
+        choices=("baseline", "quiescence", "threat", "proof", "ordering", "full"),
         help="Named ablation profile; explicit --search-config takes precedence",
     )
     parser.add_argument("--endgame-fraction", type=float, default=0.0)
