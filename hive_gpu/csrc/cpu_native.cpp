@@ -451,9 +451,11 @@ struct CPUSearch {
     };
     const float* params;
     CPUFNNWeights weights;
-    int budget, nodes = 0, cutoffs = 0;
-    int tt_hits = 0;
-    bool aborted = false;
+    int budget, nodes = 0, cutoffs = 0, tt_hits = 0;
+    int qnodes = 0, tactical_moves = 0, extension_nodes = 0;
+    int quiescence_plies = 1, qnode_budget = 1, tactical_mask = 15;
+    bool recursive_threat_qsearch = false, aborted = false;
+    int forced_extension_max_chain = 0;
     std::vector<TTEntry> tt = std::vector<TTEntry>(1 << 18);
 
     float terminal(const HiveState& state, int ply) const {
@@ -462,6 +464,101 @@ struct CPUSearch {
         bool won = (side == WHITE && state.result == WHITE_WINS) ||
             (side == BLACK && state.result == BLACK_WINS);
         return (won ? 1.0f : -1.0f) * (10.0f - std::min(ply, 100) * 0.01f);
+    }
+    bool color_won(const HiveState& state, Color color) const {
+        return (color == WHITE && state.result == WHITE_WINS) ||
+               (color == BLACK && state.result == BLACK_WINS);
+    }
+    bool adjacent_to(int cell, uint16_t target) const {
+        if (cell < 0 || cell >= NUM_CELLS || target >= NUM_CELLS) return false;
+        for (int d = 0; d < NUM_DIRS; ++d) if (NEIGHBORS[target][d] == cell) return true;
+        return false;
+    }
+    bool side_under_immediate_threat(const HiveState& state) const {
+        if (state.result != IN_PROGRESS) return false;
+        Color side = current_player(state);
+        if (queen_surround_count_for_color_device(state, side) < 5) return false;
+        HiveState probe = state;
+        probe.turn ^= 1U;
+        probe.stunned_cell = 0xFFFF;
+        return has_immediate_surround_win_for_current_player(probe);
+    }
+    bool power_piece_mobile(const HiveState& state, int cell, MovegenStateCache& cache) const {
+        if (cell < 0 || cell >= NUM_CELLS || state.height[cell] == 0 ||
+            is_stunned_cell(state, cell) || is_pinned(cache, cell)) return false;
+        PieceType type = top_piece_type_at(state, cell);
+        if (type == PT_QUEEN) return has_queen_move(state, cell);
+        if (type == PT_BEETLE) return has_beetle_move(state, cell);
+        if (type == PT_ANT) {
+            const Bitboard& perimeter = ensure_base_perimeter(state, cache);
+            return has_ant_move_with_perimeter(state, cell, perimeter);
+        }
+        return false;
+    }
+    Bitboard mobile_power_pieces(
+        const HiveState& state, Color color, MovegenStateCache& cache
+    ) const {
+        Bitboard mobile;
+        mobile.clear();
+        const Bitboard& tops = color == WHITE ? state.white_top : state.black_top;
+        for (int wi = 0; wi < BB_WORDS; ++wi) {
+            uint64_t bits = tops.w[wi];
+            while (bits) {
+                int bit = __ffsll(bits) - 1;
+                int cell = wi * 64 + bit;
+                bits &= bits - 1;
+                if (cell < NUM_CELLS && power_piece_mobile(state, cell, cache)) mobile.set(cell);
+            }
+        }
+        return mobile;
+    }
+    bool immobilizes_from_mask(
+        const Bitboard& before, Color target, const GPUMove& move,
+        const HiveState& child, MovegenStateCache& child_cache
+    ) const {
+        for (int wi = 0; wi < BB_WORDS; ++wi) {
+            uint64_t bits = before.w[wi];
+            while (bits) {
+                int bit = __ffsll(bits) - 1;
+                int cell = wi * 64 + bit;
+                bits &= bits - 1;
+                if (move.type == MOVE_MOVE && (int)move.from_cell == cell) continue;
+                bool still_mobile = cell < NUM_CELLS && child.height[cell] > 0 &&
+                    top_piece_color_at(child, cell) == target &&
+                    power_piece_mobile(child, cell, child_cache);
+                if (!still_mobile) return true;
+            }
+        }
+        return false;
+    }
+    bool creates_queen_threat(const HiveState& child, Color mover) const {
+        if (child.result != IN_PROGRESS) return false;
+        Color opponent = mover == WHITE ? BLACK : WHITE;
+        if (queen_surround_count_for_color_device(child, opponent) != 5) return false;
+        HiveState probe = child;
+        probe.turn = (uint16_t)((probe.turn & ~1U) | (uint16_t)mover);
+        probe.stunned_cell = 0xFFFF;
+        return has_immediate_surround_win_for_current_player(probe);
+    }
+    bool priority_q_candidate(
+        const HiveState& state, const GPUMove& move, Color mover,
+        Color opponent, const Bitboard& mobile
+    ) const {
+        if (adjacent_to((int)move.to_cell, state.queen_cell[opponent])) return true;
+        if (move.type != MOVE_MOVE) return false;
+        if (move.from_cell == state.queen_cell[mover] ||
+            adjacent_to((int)move.from_cell, state.queen_cell[mover])) return true;
+        for (int wi = 0; wi < BB_WORDS; ++wi) {
+            uint64_t bits = mobile.w[wi];
+            while (bits) {
+                int bit = __ffsll(bits) - 1;
+                int cell = wi * 64 + bit;
+                bits &= bits - 1;
+                if ((int)move.to_cell == cell || adjacent_to((int)move.to_cell, cell) ||
+                    adjacent_to((int)move.from_cell, cell)) return true;
+            }
+        }
+        return false;
     }
     float order_score(const HiveState& state, const GPUMove& move) const {
         Color mover = current_player(state);
@@ -486,10 +583,63 @@ struct CPUSearch {
             if (best != rank) std::swap(moves[rank], moves[best]);
         }
     }
-    float negamax(HiveState& state, uint64_t hash, int depth, float alpha, float beta, int ply) {
+    float quiescence(HiveState& state, float alpha, float beta, int ply, int remaining = -1) {
+        if (state.result != IN_PROGRESS) return terminal(state, ply);
+        int qplies = remaining < 0 ? quiescence_plies : remaining;
+        if (qplies <= 0) return cpu_fnn_value(state, params, weights);
+        GPUMove moves[MAX_LEGAL_MOVES];
+        MovegenStateCache cache;
+        int n = generate_legal_moves_with_cache(state, moves, cache);
+        float best = cpu_fnn_value(state, params, weights);
+        if (best >= beta || n <= 0) return best;
+        alpha = std::max(alpha, best);
+        Color mover = current_player(state);
+        Color opponent = mover == WHITE ? BLACK : WHITE;
+        Bitboard mobile;
+        mobile.clear();
+        if (tactical_mask & 1) mobile = mobile_power_pieces(state, opponent, cache);
+        int own_before = queen_surround_count_for_color_device(state, mover);
+        int opp_before = queen_surround_count_for_color_device(state, opponent);
+        for (int phase = 0; phase < 2; ++phase) for (int i = 0; i < n; ++i) {
+            bool priority = priority_q_candidate(state, moves[i], mover, opponent, mobile);
+            if (priority != (phase == 0)) continue;
+            if (nodes >= budget) { aborted = true; return 0.0f; }
+            if (qnodes >= qnode_budget) return best;
+            ++nodes; ++qnodes;
+            CPUUndo undo;
+            cpu_make_move(state, moves[i], undo);
+            int own_after = queen_surround_count_for_color_device(state, mover);
+            int opp_after = queen_surround_count_for_color_device(state, opponent);
+            bool tactical = color_won(state, mover) ||
+                ((tactical_mask & 2) && opp_after > opp_before) ||
+                ((tactical_mask & 4) && own_after < own_before) ||
+                ((tactical_mask & 8) && opp_after == 5 && creates_queen_threat(state, mover));
+            MovegenStateCache child_cache;
+            if (!tactical && (tactical_mask & 1) && !mobile.is_zero()) {
+                init_movegen_state_cache(state, child_cache);
+                tactical = immobilizes_from_mask(mobile, opponent, moves[i], state, child_cache);
+            }
+            if (!tactical) { cpu_unmake_move(state, undo); continue; }
+            ++tactical_moves;
+            float value = state.result != IN_PROGRESS ? -terminal(state, ply + 1) :
+                (recursive_threat_qsearch && qplies > 1 ?
+                    -quiescence(state, -beta, -alpha, ply + 1, qplies - 1) :
+                    -cpu_fnn_value(state, params, weights));
+            cpu_unmake_move(state, undo);
+            if (aborted) return 0.0f;
+            best = std::max(best, value);
+            alpha = std::max(alpha, best);
+            if (alpha >= beta) { ++cutoffs; return best; }
+        }
+        return best;
+    }
+    float negamax(
+        HiveState& state, uint64_t hash, int depth, float alpha, float beta,
+        int ply, int extension_chain = 0
+    ) {
         if (++nodes > budget) { aborted = true; return 0.0f; }
         if (state.result != IN_PROGRESS) return terminal(state, ply);
-        if (depth <= 0) return cpu_fnn_value(state, params, weights);
+        if (depth <= 0) return quiescence(state, alpha, beta, ply);
         float alpha_start = alpha;
         TTEntry& entry = tt[hash & (tt.size() - 1)];
         if (entry.key == hash && entry.depth >= depth) {
@@ -502,19 +652,24 @@ struct CPUSearch {
         GPUMove moves[MAX_LEGAL_MOVES];
         int n = generate_legal_moves(state, moves);
         order(moves, n, state);
-        if (entry.key == hash) {
-            for (int i = 0; i < n; ++i) {
-                if (std::memcmp(&moves[i], &entry.best_move, sizeof(GPUMove)) == 0) {
-                    std::swap(moves[0], moves[i]);
-                    break;
-                }
+        bool extend = forced_extension_max_chain > 0 &&
+            extension_chain < forced_extension_max_chain &&
+            (n == 1 || side_under_immediate_threat(state));
+        int next_depth = depth - 1 + (extend ? 1 : 0);
+        int next_chain = extend ? extension_chain + 1 : 0;
+        if (extend) ++extension_nodes;
+        if (entry.key == hash) for (int i = 0; i < n; ++i) {
+            if (std::memcmp(&moves[i], &entry.best_move, sizeof(GPUMove)) == 0) {
+                std::swap(moves[0], moves[i]); break;
             }
         }
         float best = -1000.0f;
         GPUMove best_move = moves[0];
         for (int i = 0; i < n; ++i) {
-            CPUUndo undo; uint64_t child_hash = cpu_make_move_hashed(state, moves[i], hash, undo);
-            float value = -negamax(state, child_hash, depth - 1, -beta, -alpha, ply + 1);
+            CPUUndo undo;
+            uint64_t child_hash = cpu_make_move_hashed(state, moves[i], hash, undo);
+            float value = -negamax(
+                state, child_hash, next_depth, -beta, -alpha, ply + 1, next_chain);
             cpu_unmake_move(state, undo);
             if (aborted) return 0.0f;
             if (value > best) { best = value; best_move = moves[i]; }
@@ -531,7 +686,9 @@ struct CPUSearch {
 py::tuple cpu_native_alpha_beta(
     py::bytes raw,
     py::array_t<float, py::array::c_style | py::array::forcecast> params_arr,
-    int hidden_dim, int embed_dim, int node_budget, int max_depth
+    int hidden_dim, int embed_dim, int node_budget, int max_depth,
+    int quiescence_plies, float quiescence_budget_fraction, int tactical_mask,
+    bool recursive_threat_qsearch, int forced_extension_max_chain
 ) {
     init_cpu_tables_once();
     if (hidden_dim <= 0 || hidden_dim > 64 || embed_dim <= 0 || embed_dim > 64) {
@@ -541,6 +698,13 @@ py::tuple cpu_native_alpha_beta(
     auto params = params_arr.request();
     CPUSearch search{static_cast<const float*>(params.ptr), cpu_fnn_layout(hidden_dim, embed_dim),
                      std::max(1, node_budget)};
+    search.recursive_threat_qsearch = recursive_threat_qsearch;
+    search.quiescence_plies = std::max(0, std::min(
+        recursive_threat_qsearch ? 4 : 1, quiescence_plies));
+    search.qnode_budget = std::max(1, static_cast<int>(node_budget *
+        std::max(0.0f, std::min(0.95f, quiescence_budget_fraction))));
+    search.tactical_mask = tactical_mask & 15;
+    search.forced_extension_max_chain = std::max(0, forced_extension_max_chain);
     GPUMove root_moves[MAX_LEGAL_MOVES];
     int n = generate_legal_moves(root, root_moves);
     if (n <= 0) throw std::runtime_error("position has no legal moves");
@@ -570,6 +734,9 @@ py::tuple cpu_native_alpha_beta(
     stats["depth"] = completed; stats["nodes"] = search.nodes;
     stats["cutoffs"] = search.cutoffs; stats["value"] = best_value;
     stats["tt_hits"] = search.tt_hits;
+    stats["qnodes"] = search.qnodes;
+    stats["tactical_moves"] = search.tactical_moves;
+    stats["forced_extensions"] = search.extension_nodes;
     return py::make_tuple(move_out, stats);
 }
 

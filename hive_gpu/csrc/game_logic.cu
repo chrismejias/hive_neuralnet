@@ -1849,7 +1849,9 @@ static FNNAlphaBetaBatchOutputs run_fnn_alphabeta_batch(
     // The explicit state machine assigns one lane to each complete game.
     // Root branches are never split across lanes; only independent games
     // share a warp and reconverge around leaf evaluation.
-    const int search_threads = explicit_stack ? 32 : 1;
+    // Narrow launches favor the original one-thread blocks; at 512-class
+    // batches a warp-sized block materially improves aggregate throughput.
+    const int search_threads = explicit_stack ? 32 : ((batch_size >= 384 && max_depth <= 16) ? 32 : 1);
     const int search_blocks = (batch_size + search_threads - 1) / search_threads;
 #define FNN_AB_KERNEL_ARGS \
         reinterpret_cast<const HiveState*>(states.data_ptr<uint8_t>()), \

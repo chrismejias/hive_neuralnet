@@ -27,7 +27,7 @@ class AlphaBetaSearchConfig:
     lmr_min_depth: int = 4
     lmr_min_move: int = 4
     lmr_reduction: int = 1
-    quiescence_plies: int = 1
+    quiescence_plies: int = 0
     quiescence_budget_fraction: float = 0.2
     force_win_probes: bool = True
     tactical_immobilization: bool = True
@@ -60,6 +60,8 @@ class AlphaBetaSearchConfig:
         if profile in ("baseline", "value-only"):
             # ``value-only`` is retained as a legacy alias; all search is value-only.
             return baseline
+        if profile == "quiescence":
+            return replace(baseline, quiescence_plies=1)
         if profile == "threat":
             return replace(baseline, recursive_threat_qsearch=True,
                            quiescence_plies=4, forced_extensions=True)

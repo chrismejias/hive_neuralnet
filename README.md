@@ -9,11 +9,12 @@ retained as alternatives.
 
 **FNN alpha-beta is the recommended default search engine for play, analysis,
 and evaluation.** Use the latest alpha-beta checkpoint,
-`checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0161.pt`.
+`checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0167.pt`.
 A 20,000-node budget is a practical starting point; scale it to the latency
-available to your application. The native CPU
-search is intended for a single game or analysis session; the CUDA search
-scales across wide batches for self-play, training, and arenas.
+available to your application. The native CPU search is recommended for play, analysis, arenas, and CPU-worker
+self-play. CUDA remains available for wide-batch training and self-play, but
+benchmark both paths on the target machine before choosing: CPU search was more
+cost-efficient in the final local measurements.
 
 The alpha-beta engine combines iterative deepening, transposition tables,
 history/killer ordering, tactical quiescence, selective extensions, and an FNN
@@ -49,10 +50,10 @@ Single-game alpha-beta uses the native C++ bitmap engine through
 - PyTorch 2.4+ (tested with 2.10.0+cu128)
 - CUDA 12.4+ / driver supporting CUDA 12.8
 
-If you do not have an NVIDIA GPU, use the native **single-game CPU FNN
-alpha-beta engine**. GPU alpha-beta is preferred for wide-batch self-play and
-arenas, but the CPU path is the intended deployment target for ordinary
-single-game analysis.
+The native **CPU FNN alpha-beta engine** is the recommended deployment and arena
+path. It also scales across independent games with process workers. A GPU is
+still required for CUDA self-play and neural-network training; measure the
+CPU/GPU crossover on each machine rather than assuming GPU search is faster.
 
 ## Setup
 
@@ -106,7 +107,7 @@ from hive_fnn.fnn_alphabeta_player import AlphaBetaConfig, FNNAlphaBetaPlayer
 
 state = GameState()
 player = FNNAlphaBetaPlayer.from_checkpoint(
-    "checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0161.pt",
+    "checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0167.pt",
     config=AlphaBetaConfig(node_budget=20_000, max_depth=32),
 )
 move = player.choose_move(state)
@@ -123,7 +124,7 @@ The pygame GUI now defaults to the recommended CPU alpha-beta engine:
 cd /workspace/hive_neuralnet
 python3.11 gui.py \
   --engine alpha-beta \
-  --checkpoint checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0161.pt \
+  --checkpoint checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0167.pt \
   --nodes 20000 --max-depth 32 \
   --expansion MLP
 ```
@@ -424,7 +425,7 @@ The bare `train_fnn` defaults now map to the large configuration (`64/64/64`).
 The separate alpha-beta trainer learns one calibrated scalar value from
 completed iterative-deepening searches. The target is a configurable blend of
 the deeper search value and the final game result; no policy target is trained.
-The recommended checkpoint is iteration 161 of the value-only line. Its file
+The recommended checkpoint is iteration 167 of the value-only line. Its file
 retains action-head tensors for checkpoint-format compatibility, but alpha-beta
 neither packs, evaluates, nor trains them. Move-cap games are omitted
 from replay, and the default replay capacity is 75,000 records. Its initial
@@ -437,14 +438,22 @@ successor positions for policy ranking. Root and deeper nodes use previous
 iterative-deepening scores, transposition/PV moves, killer moves, history
 scores, and inexpensive Hive move geometry for ordering. Incremental hashing
 and make/unmake avoid copying
-the full state at every node. Quiescence is deliberately limited to one legal
-reply at leaf nodes: immediate queen surrounds, queen threats, own-queen escapes
-(including pillbug throws), and moves that immobilize a previously mobile ant,
-beetle, or queen. Its default node allowance is 20% of the search budget.
-Every applied tactical probe is charged to that allowance, including moves
-later rejected as quiet. Value-only leaves use an exact compact legal-move
+the full state at every node. Quiescence is disabled by default. A completed 128-game, 40,000-node CPU
+ablation scored 58 wins to 46 with 24 draws for plain search over the old
+one-ply quiescence baseline, while quiescence consumed its full 20% node
+allowance. The old behavior remains toggleable with the `quiescence` profile;
+it probes immediate queen surrounds, queen threats, own-queen escapes (including
+pillbug throws), and moves that immobilize a previously mobile ant, beetle, or
+queen. Value-only leaves use an exact compact legal-move
 summary, and move generation shares its articulation result with FNN feature
 extraction rather than calculating it twice.
+
+The CPU-native player exposes matching tactical profiles through
+`AlphaBetaConfig.from_profile(...)`: `baseline` and `plain` disable tactical leaf
+search, `quiescence` restores bounded one-ply quiescence, and `threat` enables recursive
+threat quiescence plus capped forced extensions. CPU statistics report
+quiescence probes, accepted tactical moves, and forced-extension nodes
+separately.
 
 TT entries, killer tables, and explicit-stack moves use a 32-bit encoding.
 Production per-ply move lists retain the native move structure because CUDA
@@ -474,11 +483,23 @@ the table. Ordinary play also skips teacher-only PV reconstruction. The GPU
 checkpoint arena keeps masks and counters on device and reports progress with
 `--progress-every`.
 
-GPU alpha-beta needs wide batches: each production search is still one serial
-CUDA thread. On the local RTX 4090 at a deterministic 12-ply position and a
+A 512-game CPU benchmark with 16 workers, checkpoint 167, depth 16, and a
+40,000-node budget reached 1.774M aggregate nodes/second (1.793M when
+normalizing away orchestration), or about 112k nodes/second per worker. The
+corresponding bounded-depth GPU test reached 2.21M nodes/second, a modest lead
+that may not justify GPU cost. Prefer CPU workers on CPU-heavy machines and use
+`cpu_alpha_beta_checkpoint_arena.py --workers N` to remeasure.
+
+GPU alpha-beta needs wide batches: each game remains a serial search, but 512-class
+batches with a depth limit of 16 or less now launch games in warp-sized blocks;
+narrower or deeper searches retain one-thread blocks. The depth guard is required
+by the recursive CUDA stack footprint. On the local RTX 4090 at a deterministic 12-ply position and a
 500-node budget, batches 8, 128, and 256 reached approximately 31k, 510k, and
-1.00M aggregate nodes/second respectively. Use at least 128 games for training
-when memory permits; small arenas remain a better fit for CPU workers. Re-run
+1.00M aggregate nodes/second respectively. Use 512 games for training when memory permits. Completed games are compacted
+out at each ply and expansion masks are already generated in contiguous groups;
+padding sparse tails back to 512 repeats work and is intentionally not the
+default. Small arenas and sparse late-game tails remain a better fit for CPU
+workers. Re-run
 the batch-width crossover benchmark for a checkpoint and machine with:
 
 ```bash
@@ -515,8 +536,9 @@ nodes per move with `--node-cost-penalty`. Full trainer continuation uses
 the tuned search configuration is preserved automatically.
 
 Long-horizon search experiments are independently toggleable through the
-`baseline`, `threat`, `proof`, `ordering`, and `full` profiles. `baseline`
-preserves the original one-ply quiescence and search behavior. `threat` enables
+`baseline`, `quiescence`, `threat`, `proof`, `ordering`, and `full` profiles.
+`baseline` is the quiescence-free production search; `quiescence` preserves the
+old bounded one-ply tactical leaf search. `threat` enables
 recursive forcing quiescence and capped forced extensions; `proof` enables the
 budgeted exhaustive forced-win verifier; `ordering` enables countermoves,
 continuation history, and cheap internal ordering; `full` combines them with
@@ -968,12 +990,10 @@ Dockerfile         # Container for cloud/RunPod deployment
 ### Nokamute arena
 
 The external [Nokamute](https://github.com/edre/nokamute) UHP engine is pinned
-under `external/nokamute`. Build it with the workspace-local Rust toolchain:
-
-```bash
-RUSTUP_HOME="$PWD/.tools/rustup" CARGO_HOME="$PWD/.tools/cargo" \
-  .tools/cargo/bin/cargo build --release --manifest-path external/nokamute/Cargo.toml
-```
+under `external/nokamute`. Clone or update it as a Git submodule, install stable
+Rust, and build with `cargo build --release --manifest-path
+external/nokamute/Cargo.toml`. See [the complete pull, build, and optional
+diagnostic-patch instructions](docs/NOKAMUTE_SETUP.md).
 
 Run a color-balanced Base-game match against the local FNN alpha-beta engine:
 
@@ -983,7 +1003,9 @@ python3 nokamute_arena.py --games 20 --our-nodes 10000 \
 ```
 
 Nokamute's UHP interface supports time or depth budgets, but not exact node
-budgets. Use `--nokamute-depth N` instead of `--nokamute-seconds` for a
+budgets. Saved escalating-budget and tactical replay data is under
+`diagnostics/results`; the interpretation and remaining teacher work are in
+`NOKAMUTE_TEACHER_PLAN.md`. Use `--nokamute-depth N` instead of `--nokamute-seconds` for a
 fixed-depth comparison. Random opening plies are played before colors alternate.
 
 The single-game CPU FNN alpha-beta player uses its fully native C++ tree by

@@ -1,0 +1,186 @@
+{
+  "checkpoint": "checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0166.pt",
+  "nodes": 400000,
+  "positions": [
+    {
+      "ply": 16,
+      "ours_to_move": true,
+      "profiles": [
+        {
+          "profile": "plain",
+          "ours_advantage": 0.03166729956865311,
+          "raw_current_player": 0.03166729956865311,
+          "move": "bA3 -wA2",
+          "depth": 4,
+          "nodes": 400001,
+          "qnodes": 0,
+          "tactical_moves": 0,
+          "forced_extensions": 0,
+          "seconds": 2.197335642762482,
+          "mate_plies": null
+        },
+        {
+          "profile": "baseline",
+          "ours_advantage": 0.03166729956865311,
+          "raw_current_player": 0.03166729956865311,
+          "move": "bA3 -wA2",
+          "depth": 4,
+          "nodes": 400001,
+          "qnodes": 80000,
+          "tactical_moves": 20515,
+          "forced_extensions": 0,
+          "seconds": 2.2714688973501325,
+          "mate_plies": null
+        },
+        {
+          "profile": "threat",
+          "ours_advantage": 0.03166729956865311,
+          "raw_current_player": 0.03166729956865311,
+          "move": "bA3 -wA2",
+          "depth": 4,
+          "nodes": 400001,
+          "qnodes": 80000,
+          "tactical_moves": 18415,
+          "forced_extensions": 190,
+          "seconds": 2.324071672745049,
+          "mate_plies": null
+        }
+      ]
+    },
+    {
+      "ply": 20,
+      "ours_to_move": true,
+      "profiles": [
+        {
+          "profile": "plain",
+          "ours_advantage": 0.07213889807462692,
+          "raw_current_player": 0.07213889807462692,
+          "move": "bS1 /bA1",
+          "depth": 5,
+          "nodes": 400001,
+          "qnodes": 0,
+          "tactical_moves": 0,
+          "forced_extensions": 0,
+          "seconds": 2.1080813705921173,
+          "mate_plies": null
+        },
+        {
+          "profile": "baseline",
+          "ours_advantage": 0.10401808470487595,
+          "raw_current_player": 0.10401808470487595,
+          "move": "bB1 /bA1",
+          "depth": 4,
+          "nodes": 400001,
+          "qnodes": 80000,
+          "tactical_moves": 14500,
+          "forced_extensions": 0,
+          "seconds": 2.147946333512664,
+          "mate_plies": null
+        },
+        {
+          "profile": "threat",
+          "ours_advantage": 0.044525716453790665,
+          "raw_current_player": 0.044525716453790665,
+          "move": "bB1 /bA1",
+          "depth": 4,
+          "nodes": 400001,
+          "qnodes": 80000,
+          "tactical_moves": 14693,
+          "forced_extensions": 332,
+          "seconds": 2.2231467831879854,
+          "mate_plies": null
+        }
+      ]
+    },
+    {
+      "ply": 21,
+      "ours_to_move": false,
+      "profiles": [
+        {
+          "profile": "plain",
+          "ours_advantage": 0.03421448543667793,
+          "raw_current_player": -0.03421448543667793,
+          "move": "wB2 wA1-",
+          "depth": 5,
+          "nodes": 400001,
+          "qnodes": 0,
+          "tactical_moves": 0,
+          "forced_extensions": 0,
+          "seconds": 2.1751427985727787,
+          "mate_plies": null
+        },
+        {
+          "profile": "baseline",
+          "ours_advantage": 0.03421448543667793,
+          "raw_current_player": -0.03421448543667793,
+          "move": "wB2 wA1-",
+          "depth": 5,
+          "nodes": 400001,
+          "qnodes": 80000,
+          "tactical_moves": 14848,
+          "forced_extensions": 0,
+          "seconds": 2.246796919964254,
+          "mate_plies": null
+        },
+        {
+          "profile": "threat",
+          "ours_advantage": 0.03421448543667793,
+          "raw_current_player": -0.03421448543667793,
+          "move": "wB2 wA1-",
+          "depth": 5,
+          "nodes": 400001,
+          "qnodes": 80000,
+          "tactical_moves": 16175,
+          "forced_extensions": 439,
+          "seconds": 2.3092120978981256,
+          "mate_plies": null
+        }
+      ]
+    },
+    {
+      "ply": 22,
+      "ours_to_move": true,
+      "profiles": [
+        {
+          "profile": "plain",
+          "ours_advantage": 0.1833857297897339,
+          "raw_current_player": 0.1833857297897339,
+          "move": "bS1 wQ\\",
+          "depth": 5,
+          "nodes": 400001,
+          "qnodes": 0,
+          "tactical_moves": 0,
+          "forced_extensions": 0,
+          "seconds": 2.2722374722361565,
+          "mate_plies": null
+        },
+        {
+          "profile": "baseline",
+          "ours_advantage": 0.1833857297897339,
+          "raw_current_player": 0.1833857297897339,
+          "move": "bS1 wQ\\",
+          "depth": 5,
+          "nodes": 400001,
+          "qnodes": 80000,
+          "tactical_moves": 13355,
+          "forced_extensions": 0,
+          "seconds": 2.2464679526165128,
+          "mate_plies": null
+        },
+        {
+          "profile": "threat",
+          "ours_advantage": 0.09316061437129974,
+          "raw_current_player": 0.09316061437129974,
+          "move": "bG3 \\bG2",
+          "depth": 4,
+          "nodes": 400000,
+          "qnodes": 80000,
+          "tactical_moves": 10371,
+          "forced_extensions": 1269,
+          "seconds": 2.383875632658601,
+          "mate_plies": null
+        }
+      ]
+    }
+  ]
+}

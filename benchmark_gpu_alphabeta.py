@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--position-plies", default="0,12,24")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--reuse-only", action="store_true")
     return parser.parse_args()
 
 
@@ -77,9 +78,11 @@ def main() -> None:
     for requested_plies in position_plies:
         for batch in batches:
             states, actual_plies = make_position(ext, batch, requested_plies)
-            fresh = timed_searches(net, states, args, reusable=False)
-            reused = timed_searches(net, states, args, reusable=True)
-            for mode, (seconds, nodes) in (("fresh", fresh), ("reuse", reused)):
+            results = []
+            if not args.reuse_only:
+                results.append(("fresh", timed_searches(net, states, args, reusable=False)))
+            results.append(("reuse", timed_searches(net, states, args, reusable=True)))
+            for mode, (seconds, nodes) in results:
                 moves = batch * args.repeats
                 print(
                     f"{mode},{batch},{actual_plies},{seconds:.6f},{nodes},"

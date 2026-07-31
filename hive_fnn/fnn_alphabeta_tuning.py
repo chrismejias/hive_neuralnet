@@ -51,7 +51,7 @@ SEARCH_PARAMETER_SPACE = (
     TunableParameter("lmr_min_depth", 3, 8, "int", 4),
     TunableParameter("lmr_min_move", 2, 12, "int", 4),
     TunableParameter("lmr_reduction", 0, 2, "int", 1),
-    TunableParameter("quiescence_plies", 0, 1, "int", 1),
+    TunableParameter("quiescence_plies", 0, 1, "int", 0),
     TunableParameter(
         "quiescence_budget_fraction", 0.05, 0.35, "float", 0.2,
     ),

@@ -58,6 +58,38 @@ class AlphaBetaConfig:
     tt_max_entries: int = 500_000
     pvs: bool = False
     native_tree: bool = True
+    quiescence_plies: int = 0
+    quiescence_budget_fraction: float = 0.2
+    tactical_immobilization: bool = True
+    tactical_opponent_surround: bool = True
+    tactical_own_relief: bool = True
+    tactical_queen_threat: bool = True
+    recursive_threat_qsearch: bool = False
+    forced_extensions: bool = False
+    forced_extension_max_chain: int = 2
+
+    @classmethod
+    def from_profile(cls, name: str, **kwargs: object) -> "AlphaBetaConfig":
+        profile = name.strip().lower()
+        if profile in ("plain", "legacy"):
+            return cls(
+                quiescence_plies=0, tactical_immobilization=False,
+                tactical_opponent_surround=False, tactical_own_relief=False,
+                tactical_queen_threat=False, **kwargs,
+            )
+        if profile in ("baseline", "value-only"):
+            return cls(**kwargs)
+        if profile == "quiescence":
+            return cls(quiescence_plies=1, **kwargs)
+        if profile in ("threat", "full"):
+            return cls(
+                quiescence_plies=4, recursive_threat_qsearch=True,
+                forced_extensions=True, **kwargs,
+            )
+        raise ValueError(
+            f"unknown CPU alpha-beta profile {name!r}; expected plain, "
+            "baseline, quiescence, threat, or full"
+        )
 
 
 @dataclass
@@ -68,6 +100,9 @@ class AlphaBetaStats:
     transposition_hits: int = 0
     pvs_researches: int = 0
     value: float = 0.0
+    qnodes: int = 0
+    tactical_moves: int = 0
+    forced_extensions: int = 0
 
 
 @dataclass
@@ -436,6 +471,15 @@ class FNNAlphaBetaPlayer:
                 int(self.net.config.embed_dim),
                 int(self.config.node_budget),
                 int(self.config.max_depth),
+                int(self.config.quiescence_plies),
+                float(self.config.quiescence_budget_fraction),
+                ((1 if self.config.tactical_immobilization else 0)
+                 | (2 if self.config.tactical_opponent_surround else 0)
+                 | (4 if self.config.tactical_own_relief else 0)
+                 | (8 if self.config.tactical_queen_threat else 0)),
+                bool(self.config.recursive_threat_qsearch),
+                (int(self.config.forced_extension_max_chain)
+                 if self.config.forced_extensions else 0),
             )
             self.last_stats = AlphaBetaStats(
                 completed_depth=int(stats["depth"]),
@@ -443,6 +487,9 @@ class FNNAlphaBetaPlayer:
                 cutoffs=int(stats["cutoffs"]),
                 transposition_hits=int(stats["tt_hits"]),
                 value=float(stats["value"]),
+                qnodes=int(stats["qnodes"]),
+                tactical_moves=int(stats["tactical_moves"]),
+                forced_extensions=int(stats["forced_extensions"]),
             )
             return np.asarray(move, dtype=np.uint8).copy()
 

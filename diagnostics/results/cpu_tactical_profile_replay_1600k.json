@@ -1,0 +1,114 @@
+{
+  "checkpoint": "checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0166.pt",
+  "nodes": 1600000,
+  "positions": [
+    {
+      "ply": 16,
+      "profiles": [
+        {
+          "profile": "baseline",
+          "ours_advantage": -0.10895436257123947,
+          "move": "bA3 /wA2",
+          "depth": 5,
+          "nodes": 1600001,
+          "qnodes": 320000,
+          "tactical_moves": 83517,
+          "forced_extensions": 0,
+          "seconds": 9.154448678717017
+        },
+        {
+          "profile": "threat",
+          "ours_advantage": -0.10895436257123947,
+          "move": "bA3 /wA2",
+          "depth": 5,
+          "nodes": 1600000,
+          "qnodes": 320000,
+          "tactical_moves": 71427,
+          "forced_extensions": 895,
+          "seconds": 9.257795767858624
+        }
+      ]
+    },
+    {
+      "ply": 20,
+      "profiles": [
+        {
+          "profile": "baseline",
+          "ours_advantage": 0.07213889807462692,
+          "move": "bS1 /bA1",
+          "depth": 5,
+          "nodes": 1600001,
+          "qnodes": 320000,
+          "tactical_moves": 67726,
+          "forced_extensions": 0,
+          "seconds": 8.284719455055892
+        },
+        {
+          "profile": "threat",
+          "ours_advantage": 0.07213889807462692,
+          "move": "bS1 /bA1",
+          "depth": 5,
+          "nodes": 1600001,
+          "qnodes": 320000,
+          "tactical_moves": 55261,
+          "forced_extensions": 3674,
+          "seconds": 9.453385149128735
+        }
+      ]
+    },
+    {
+      "ply": 21,
+      "profiles": [
+        {
+          "profile": "baseline",
+          "ours_advantage": 0.08251090347766876,
+          "move": "wB2 /wQ",
+          "depth": 6,
+          "nodes": 1600001,
+          "qnodes": 320000,
+          "tactical_moves": 73336,
+          "forced_extensions": 0,
+          "seconds": 9.164652289822698
+        },
+        {
+          "profile": "threat",
+          "ours_advantage": 0.03421448543667793,
+          "move": "wB2 wA1-",
+          "depth": 5,
+          "nodes": 1600001,
+          "qnodes": 320000,
+          "tactical_moves": 56830,
+          "forced_extensions": 3038,
+          "seconds": 9.662374950014055
+        }
+      ]
+    },
+    {
+      "ply": 22,
+      "profiles": [
+        {
+          "profile": "baseline",
+          "ours_advantage": -0.06053260341286659,
+          "move": "bS1 wQ\\",
+          "depth": 6,
+          "nodes": 1600001,
+          "qnodes": 320000,
+          "tactical_moves": 56193,
+          "forced_extensions": 0,
+          "seconds": 8.887717831879854
+        },
+        {
+          "profile": "threat",
+          "ours_advantage": 0.1833857297897339,
+          "move": "bS1 wQ\\",
+          "depth": 5,
+          "nodes": 1600001,
+          "qnodes": 320000,
+          "tactical_moves": 53277,
+          "forced_extensions": 7583,
+          "seconds": 9.669540545903146
+        }
+      ]
+    }
+  ]
+}

@@ -20,7 +20,7 @@ def test_default_parameter_vector_decodes_to_current_search_defaults() -> None:
     assert config.lmr_min_depth == 4
     assert config.lmr_min_move == 4
     assert config.lmr_reduction == 1
-    assert config.quiescence_plies == 1
+    assert config.quiescence_plies == 0
     assert config.quiescence_budget_fraction == pytest.approx(0.2)
     assert config.force_win_probes
     assert config.tactical_immobilization
@@ -34,12 +34,14 @@ def test_default_parameter_vector_decodes_to_current_search_defaults() -> None:
 def test_named_profiles_are_independent_and_value_only_alias_is_legacy() -> None:
     baseline = AlphaBetaSearchConfig.from_profile("baseline")
     value_only = AlphaBetaSearchConfig.from_profile("value-only")
+    quiescence = AlphaBetaSearchConfig.from_profile("quiescence")
     threat = AlphaBetaSearchConfig.from_profile("threat")
     proof = AlphaBetaSearchConfig.from_profile("proof")
     full = AlphaBetaSearchConfig.from_profile("full")
 
     assert baseline == AlphaBetaSearchConfig()
     assert value_only == baseline
+    assert quiescence.quiescence_plies == 1
     assert not baseline.recursive_threat_qsearch
     assert threat.recursive_threat_qsearch and threat.quiescence_plies == 4
     assert threat.forced_extensions and not threat.proof_search

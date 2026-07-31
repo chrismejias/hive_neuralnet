@@ -18,12 +18,12 @@ def main() -> None:
     parser.add_argument("--tuned-config")
     parser.add_argument(
         "--plus-profile",
-        choices=("baseline", "threat", "proof", "ordering", "full"),
+        choices=("baseline", "quiescence", "threat", "proof", "ordering", "full"),
         default="full",
     )
     parser.add_argument(
         "--minus-profile",
-        choices=("baseline", "threat", "proof", "ordering", "full"),
+        choices=("baseline", "quiescence", "threat", "proof", "ordering", "full"),
         default="baseline",
     )
     parser.add_argument("--pairs", type=int, default=32)

@@ -150,6 +150,13 @@ class UHPClient:
             raise RuntimeError(f"unexpected validmoves response: {response!r}")
         return [] if response[0] == "pass" else response[0].split(";")
 
+    def score(self) -> int:
+        """Return Nokamute.s backed-up score from its last completed search."""
+        response = self.command("score")
+        if len(response) != 1:
+            raise RuntimeError(f"unexpected score response: {response!r}")
+        return int(response[0])
+
     def best_move(self, state: GameState, search: str) -> Move:
         response = self.command("bestmove " + search)
         if len(response) != 1:

@@ -1,0 +1,57 @@
+diff --git a/src/player.rs b/src/player.rs
+index c74c9ed..fe985d8 100644
+--- a/src/player.rs
++++ b/src/player.rs
+@@ -20,6 +20,9 @@ pub(crate) trait Player {
+     fn principal_variation(&self) -> Vec<Turn> {
+         Vec::new()
+     }
++    fn root_value(&self) -> Option<Evaluation> {
++        None
++    }
+     fn set_max_depth(&mut self, _depth: u8) {}
+     fn set_timeout(&mut self, _time: Duration) {}
+     fn set_depth_or_timeout(&mut self, _depth: u8, _time: Duration) {}
+@@ -172,6 +175,10 @@ impl Player for NokamutePlayer {
+         self.strategy.principal_variation()
+     }
+ 
++    fn root_value(&self) -> Option<Evaluation> {
++        self.strategy.root_value()
++    }
++
+     fn set_max_depth(&mut self, depth: u8) {
+         self.strategy.set_max_depth(depth);
+     }
+diff --git a/src/uhp_server.rs b/src/uhp_server.rs
+index b0be34e..d75f78c 100644
+--- a/src/uhp_server.rs
++++ b/src/uhp_server.rs
+@@ -126,6 +126,19 @@ impl<W: Write> UhpServer<W> {
+         Ok(())
+     }
+ 
++    // Diagnostic extension: backed-up value from the last completed search
++    // iteration, from the perspective of the player who was at the root.
++    fn score(&mut self) -> Result<()> {
++        if self.pv_dirty {
++            return Err(UhpError::EngineError("Board changed since last engine move".into()));
++        }
++        let value = self.engine.as_ref().ok_or(UhpError::GameNotStarted)?
++            .root_value()
++            .ok_or_else(|| UhpError::EngineError("Strategy does not expose a root score".into()))?;
++        writeln!(self.output, "{value}")?;
++        Ok(())
++    }
++
+     fn undo(&mut self, args: &str) -> Result<()> {
+         self.pv_dirty = true;
+         let board = self.board.as_mut().ok_or(UhpError::GameNotStarted)?;
+@@ -264,6 +277,7 @@ impl<W: Write> UhpServer<W> {
+             "pass" => self.play("pass"),
+             "bestmove" => self.best_move(args),
+             "pv" => self.pv(),
++            "score" => self.score(),
+             "undo" => self.undo(args),
+             "options" => self.options(args),
+             "perft" => self.perft(args),

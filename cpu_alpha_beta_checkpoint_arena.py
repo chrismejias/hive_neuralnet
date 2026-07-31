@@ -90,6 +90,7 @@ def main() -> None:
         args.max_plies, args.opening_plies, args.seed,
     ) for index in range(games)]
     results = []
+    arena_started = time.perf_counter()
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as pool:
         for result in pool.map(_play_one, tasks):
             results.append(result)
@@ -100,6 +101,7 @@ def main() -> None:
                 f"plies={result['plies']}",
                 flush=True,
             )
+    arena_elapsed = time.perf_counter() - arena_started
 
     scores = {"challenger": 0, "baseline": 0, "draw": 0}
     elapsed = {"challenger": 0.0, "baseline": 0.0}
@@ -118,6 +120,15 @@ def main() -> None:
         f"draws={scores['draw']} games={games}"
     )
     print(f"challenger_score={score:.4f}")
+    total_nodes = sum(node_counts.values())
+    total_search_seconds = sum(elapsed.values())
+    print(f"wall_time={arena_elapsed:.3f}s")
+    print(f"total_nodes={total_nodes}")
+    print(f"aggregate_nodes_per_second={total_nodes / max(arena_elapsed, 1e-9):.1f}")
+    print(
+        "search_only_worker_normalized_nodes_per_second="
+        f"{total_nodes * args.workers / max(total_search_seconds, 1e-9):.1f}"
+    )
     for name in ("challenger", "baseline"):
         print(
             f"{name}_mean_time={elapsed[name] / max(1, move_counts[name]):.4f}s "

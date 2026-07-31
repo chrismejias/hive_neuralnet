@@ -1,0 +1,1222 @@
+{
+  "checkpoint": "checkpoints_fnn_alphabeta_value_only_20k_512/hive_fnn_alphabeta_0166.pt",
+  "our_nodes": 400000,
+  "nokamute_seconds": 10.0,
+  "seed": 20260727,
+  "score_semantics": "raw root score from player-to-move perspective; *_ours_advantage signed to our color",
+  "games": [
+    {
+      "game": 1,
+      "ours_color": "black",
+      "opening": [
+        "wS1",
+        "bA1 -wS1",
+        "wQ wS1-",
+        "bG1 -bA1"
+      ],
+      "trace": [
+        {
+          "ply": 5,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.2175639569759369,
+          "raw_ours_score": 0.2175639569759369,
+          "ours_mate_plies": null,
+          "ours_depth": 6,
+          "ours_nodes": 400001,
+          "ours_seconds": 1.69548927154392,
+          "nokamute_raw_score": 41,
+          "nokamute_ours_advantage": -41,
+          "nokamute_seconds": 10.000748422928154,
+          "nokamute_pv": [
+            "wA1 \\wQ",
+            "bQ \\bG1",
+            "wA1 bQ/",
+            "bA2 bG1\\",
+            "wA2 wA1-",
+            "bA2 wQ\\",
+            "wS2 \\wA2",
+            "bA3 bG1\\",
+            "wS2 -bQ"
+          ],
+          "current_queen_surround": 1,
+          "opponent_queen_surround": null,
+          "current_free_pieces": [
+            "wQ"
+          ],
+          "opponent_free_pieces": [],
+          "move": "wA1 wS1/"
+        },
+        {
+          "ply": 6,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.2158292531967163,
+          "raw_ours_score": -0.2158292531967163,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 1.8025404959917068,
+          "nokamute_raw_score": -41,
+          "nokamute_ours_advantage": -41,
+          "nokamute_seconds": 10.000590730458498,
+          "nokamute_pv": [
+            "bQ /bG1",
+            "wA1 bQ\\",
+            "bA2 \\bA1",
+            "wA2 /wA1",
+            "bA2 wQ\\",
+            "wS2 -wA2",
+            "bA3 \\bA1",
+            "wS2 -bG1"
+          ],
+          "current_queen_surround": null,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [],
+          "opponent_free_pieces": [
+            "wA1",
+            "wQ"
+          ],
+          "move": "bQ \\bG1"
+        },
+        {
+          "ply": 7,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.3006497323513031,
+          "raw_ours_score": 0.3006497323513031,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 1.7700298679992557,
+          "nokamute_raw_score": 11,
+          "nokamute_ours_advantage": -11,
+          "nokamute_seconds": 10.000518186949193,
+          "nokamute_pv": [
+            "wA1 bQ/",
+            "bS1 bG1\\",
+            "wA2 wA1-",
+            "bS1 wQ\\",
+            "wA3 \\wQ",
+            "bG2 bS1\\",
+            "wA2 wA2\\",
+            "bA2 bG1\\"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 1,
+          "current_free_pieces": [
+            "wA1",
+            "wQ"
+          ],
+          "opponent_free_pieces": [
+            "bQ"
+          ],
+          "move": "wA1 bQ/"
+        },
+        {
+          "ply": 8,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.17308233678340912,
+          "raw_ours_score": -0.17308233678340912,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 1.8812789721414447,
+          "nokamute_raw_score": -40,
+          "nokamute_ours_advantage": -40,
+          "nokamute_seconds": 10.000431659631431,
+          "nokamute_pv": [
+            "bG2 /bQ",
+            "wA1 -bG2",
+            "bA2 \\bA1",
+            "wS2 -wA1",
+            "bG1 wQ-",
+            "wS2 \\bQ",
+            "bA3 bQ\\",
+            "wA1 bA2/"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 1,
+          "current_free_pieces": [],
+          "opponent_free_pieces": [
+            "wQ"
+          ],
+          "move": "bA2 /bA1"
+        },
+        {
+          "ply": 9,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.4393310248851776,
+          "raw_ours_score": 0.4393310248851776,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 1.8882288560271263,
+          "nokamute_raw_score": 21,
+          "nokamute_ours_advantage": -21,
+          "nokamute_seconds": 10.000518223270774,
+          "nokamute_pv": [
+            "wS2 wA1/",
+            "bS1 bA2\\",
+            "wS2 -bQ",
+            "bS1 wQ\\",
+            "wA2 \\wA1",
+            "bA2 wA2/",
+            "wA3 \\wS2"
+          ],
+          "current_queen_surround": 1,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "wA1",
+            "wQ"
+          ],
+          "opponent_free_pieces": [
+            "bA2"
+          ],
+          "move": "wS2 wA1/"
+        },
+        {
+          "ply": 10,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.14090842008590698,
+          "raw_ours_score": -0.14090842008590698,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 1.887938117608428,
+          "nokamute_raw_score": -36,
+          "nokamute_ours_advantage": -36,
+          "nokamute_seconds": 10.000456536188722,
+          "nokamute_pv": [
+            "bG2 /bQ",
+            "wS2 -bQ",
+            "bG2 wQ-",
+            "wA2 \\wA1",
+            "bS1 bG2-",
+            "wG1 wA1-",
+            "bS1 wS1\\"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 1,
+          "current_free_pieces": [
+            "bA2"
+          ],
+          "opponent_free_pieces": [
+            "wQ",
+            "wS2"
+          ],
+          "move": "bA2 \\wS2"
+        },
+        {
+          "ply": 11,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.2624174952507019,
+          "raw_ours_score": 0.2624174952507019,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 1.927571153268218,
+          "nokamute_raw_score": 22,
+          "nokamute_ours_advantage": -22,
+          "nokamute_seconds": 10.000518626533449,
+          "nokamute_pv": [
+            "wA2 wS2\\",
+            "bS1 bG1\\",
+            "wA2 -bQ",
+            "bS1 wQ\\",
+            "wG1 wS2\\",
+            "bG2 bS1\\",
+            "wG1 -wA1",
+            "bG2 \\wQ"
+          ],
+          "current_queen_surround": 1,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "wQ"
+          ],
+          "opponent_free_pieces": [],
+          "move": "wA2 wA1-"
+        },
+        {
+          "ply": 12,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.06534851342439651,
+          "raw_ours_score": -0.06534851342439651,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.092269167304039,
+          "nokamute_raw_score": -22,
+          "nokamute_ours_advantage": -22,
+          "nokamute_seconds": 10.000448293052614,
+          "nokamute_pv": [
+            "bS1 bG1\\",
+            "wA2 -bQ",
+            "bS1 wQ\\",
+            "wG1 wS2\\",
+            "bG2 bS1\\",
+            "wG1 -wA1",
+            "bG2 \\wQ"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 1,
+          "current_free_pieces": [
+            "bA2"
+          ],
+          "opponent_free_pieces": [
+            "wA2",
+            "wQ"
+          ],
+          "move": "bG2 -bG1"
+        },
+        {
+          "ply": 13,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.29503190517425537,
+          "raw_ours_score": 0.29503190517425537,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.124697646126151,
+          "nokamute_raw_score": 35,
+          "nokamute_ours_advantage": -35,
+          "nokamute_seconds": 10.000357030890882,
+          "nokamute_pv": [
+            "wA2 /bG2",
+            "bS1 bG1\\",
+            "wQ \\wQ",
+            "bS1 wQ\\",
+            "wQ bS1/",
+            "bS2 bS1\\",
+            "wA3 wS2\\",
+            "bS2 wQ/"
+          ],
+          "current_queen_surround": 1,
+          "opponent_queen_surround": 3,
+          "current_free_pieces": [
+            "wA2",
+            "wQ"
+          ],
+          "opponent_free_pieces": [
+            "bA2",
+            "bG2"
+          ],
+          "move": "wA2 /bG2"
+        },
+        {
+          "ply": 14,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.1834065318107605,
+          "raw_ours_score": -0.1834065318107605,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.088608155027032,
+          "nokamute_raw_score": -60,
+          "nokamute_ours_advantage": -60,
+          "nokamute_seconds": 10.00044787954539,
+          "nokamute_pv": [
+            "bA3 bG1\\",
+            "wB1 wS1\\",
+            "bA3 wA1\\",
+            "wB1 wS1",
+            "bQ -wA1",
+            "wQ wB1\\"
+          ],
+          "current_queen_surround": 3,
+          "opponent_queen_surround": 1,
+          "current_free_pieces": [
+            "bA2"
+          ],
+          "opponent_free_pieces": [
+            "wQ"
+          ],
+          "move": "bA3 \\bG2"
+        },
+        {
+          "ply": 15,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.2234073430299759,
+          "raw_ours_score": 0.2234073430299759,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.137012272141874,
+          "nokamute_raw_score": 60,
+          "nokamute_ours_advantage": -60,
+          "nokamute_seconds": 10.000459804199636,
+          "nokamute_pv": [
+            "wB1 wS1\\",
+            "bA3 wA1\\",
+            "wB1 wS1",
+            "bQ -wA1",
+            "wQ wB1\\",
+            "bA2 wQ-",
+            "wS2 -bQ"
+          ],
+          "current_queen_surround": 1,
+          "opponent_queen_surround": 4,
+          "current_free_pieces": [
+            "wA2",
+            "wQ"
+          ],
+          "opponent_free_pieces": [
+            "bA2",
+            "bA3"
+          ],
+          "move": "wB1 /wQ"
+        },
+        {
+          "ply": 16,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": 0.03166729956865311,
+          "raw_ours_score": 0.03166729956865311,
+          "ours_mate_plies": null,
+          "ours_depth": 4,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.1865514554083347,
+          "nokamute_raw_score": -33,
+          "nokamute_ours_advantage": -33,
+          "nokamute_seconds": 10.000478465110064,
+          "nokamute_pv": [
+            "bS1 bG1\\",
+            "wA3 wS2\\",
+            "bA3 wA3-",
+            "wB1 bA1\\",
+            "bA2 wQ-",
+            "wB1 wS1",
+            "bS1 wQ\\"
+          ],
+          "current_queen_surround": 4,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bA2",
+            "bA3"
+          ],
+          "opponent_free_pieces": [
+            "wA2",
+            "wB1",
+            "wQ"
+          ],
+          "move": "bA3 -wA2"
+        },
+        {
+          "ply": 17,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.1515054553747177,
+          "raw_ours_score": 0.1515054553747177,
+          "ours_mate_plies": null,
+          "ours_depth": 4,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.221953478641808,
+          "nokamute_raw_score": 74,
+          "nokamute_ours_advantage": -74,
+          "nokamute_seconds": 10.000450046733022,
+          "nokamute_pv": [
+            "wA3 wA2\\",
+            "bA3 bG2\\",
+            "wA2 -bG2",
+            "bS1 bG1\\",
+            "wQ \\wQ",
+            "bA2 wQ-",
+            "wB1 wS1"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 3,
+          "current_free_pieces": [
+            "wB1",
+            "wQ"
+          ],
+          "opponent_free_pieces": [
+            "bA2"
+          ],
+          "move": "wA3 wA2\\"
+        },
+        {
+          "ply": 18,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.09703821688890457,
+          "raw_ours_score": -0.09703821688890457,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.154343407601118,
+          "nokamute_raw_score": -41,
+          "nokamute_ours_advantage": -41,
+          "nokamute_seconds": 10.000498129054904,
+          "nokamute_pv": [
+            "bB1 bG1\\",
+            "wA3 /bB1",
+            "bG3 -bA3",
+            "wA3 /bG3",
+            "bB1 bG2\\",
+            "wB1 wS1",
+            "bG2 wQ-"
+          ],
+          "current_queen_surround": 3,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bA2",
+            "bA3"
+          ],
+          "opponent_free_pieces": [
+            "wA3",
+            "wB1",
+            "wQ"
+          ],
+          "move": "bA3 wA3\\"
+        },
+        {
+          "ply": 19,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.03424736484885216,
+          "raw_ours_score": 0.03424736484885216,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.15931192971766,
+          "nokamute_raw_score": 43,
+          "nokamute_ours_advantage": -43,
+          "nokamute_seconds": 10.000356380827725,
+          "nokamute_pv": [
+            "wB1 wS1",
+            "bS1 bG1\\",
+            "wG1 wS2\\",
+            "bS1 wQ\\",
+            "wG1 -wA1",
+            "bG3 bS1\\",
+            "wB2 -wA2"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 3,
+          "current_free_pieces": [
+            "wB1",
+            "wQ"
+          ],
+          "opponent_free_pieces": [
+            "bA2"
+          ],
+          "move": "wB1 wS1"
+        },
+        {
+          "ply": 20,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": 0.07213889807462692,
+          "raw_ours_score": 0.07213889807462692,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.0889020171016455,
+          "nokamute_raw_score": -65,
+          "nokamute_ours_advantage": -65,
+          "nokamute_seconds": 10.000469927676022,
+          "nokamute_pv": [
+            "bS1 bG1\\",
+            "wG1 wS2\\",
+            "bS1 wQ\\",
+            "wG1 -wA1",
+            "bB1 bG1\\",
+            "wB2 -wG1",
+            "bA2 /wB2",
+            "wG2 wS2\\"
+          ],
+          "current_queen_surround": 3,
+          "opponent_queen_surround": 1,
+          "current_free_pieces": [
+            "bA2",
+            "bA3"
+          ],
+          "opponent_free_pieces": [
+            "wQ"
+          ],
+          "move": "bS1 /bA1"
+        },
+        {
+          "ply": 21,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": 0.03421448543667793,
+          "raw_ours_score": -0.03421448543667793,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.1625161292031407,
+          "nokamute_raw_score": 37,
+          "nokamute_ours_advantage": -37,
+          "nokamute_seconds": 10.000448158942163,
+          "nokamute_pv": [
+            "wG1 wS2\\",
+            "bS1 wQ\\",
+            "wG1 -wA1",
+            "bG3 bS1\\",
+            "wB2 -wG1",
+            "bA2 /wB2",
+            "wG2 wS2\\"
+          ],
+          "current_queen_surround": 1,
+          "opponent_queen_surround": 3,
+          "current_free_pieces": [
+            "wB1",
+            "wQ"
+          ],
+          "opponent_free_pieces": [
+            "bA2",
+            "bA3",
+            "bS1"
+          ],
+          "move": "wG1 wA1-"
+        },
+        {
+          "ply": 22,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": 0.1833857297897339,
+          "raw_ours_score": 0.1833857297897339,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.2614675471559167,
+          "nokamute_raw_score": -37,
+          "nokamute_ours_advantage": -37,
+          "nokamute_seconds": 10.000483776442707,
+          "nokamute_pv": [
+            "bS1 wQ\\",
+            "wG1 -wA1",
+            "bG3 bS1\\",
+            "wB2 -wG1",
+            "bA2 /wB2",
+            "wG2 wS2\\",
+            "bG3 \\wQ"
+          ],
+          "current_queen_surround": 3,
+          "opponent_queen_surround": 1,
+          "current_free_pieces": [
+            "bA2",
+            "bA3",
+            "bS1"
+          ],
+          "opponent_free_pieces": [
+            "wB1",
+            "wG1",
+            "wQ"
+          ],
+          "move": "bS1 wQ\\"
+        },
+        {
+          "ply": 23,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.33410120010375977,
+          "raw_ours_score": 0.33410120010375977,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.1508868793025613,
+          "nokamute_raw_score": 35,
+          "nokamute_ours_advantage": -35,
+          "nokamute_seconds": 10.000438320450485,
+          "nokamute_pv": [
+            "wG1 -wA1",
+            "bG3 bS1\\",
+            "wB2 -wG1",
+            "bG3 \\wQ",
+            "wB1 bG3"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 3,
+          "current_free_pieces": [
+            "wB1",
+            "wG1"
+          ],
+          "opponent_free_pieces": [
+            "bA2",
+            "bA3"
+          ],
+          "move": "wG1 \\bQ"
+        },
+        {
+          "ply": 24,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.33410120010375977,
+          "raw_ours_score": -0.33410120010375977,
+          "ours_mate_plies": null,
+          "ours_depth": 4,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.1647539790719748,
+          "nokamute_raw_score": -35,
+          "nokamute_ours_advantage": -35,
+          "nokamute_seconds": 10.000522350892425,
+          "nokamute_pv": [
+            "bG3 bS1\\",
+            "wB2 -wG1",
+            "bG3 \\wQ",
+            "wB1 bG3",
+            "bA2 /wB2"
+          ],
+          "current_queen_surround": 4,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bA2",
+            "bA3",
+            "bS1"
+          ],
+          "opponent_free_pieces": [
+            "wB1"
+          ],
+          "move": "bG3 /bS1"
+        },
+        {
+          "ply": 25,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.3157273232936859,
+          "raw_ours_score": 0.3157273232936859,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.1422281190752983,
+          "nokamute_raw_score": 37,
+          "nokamute_ours_advantage": -37,
+          "nokamute_seconds": 10.000451660715044,
+          "nokamute_pv": [
+            "wB2 -wG1",
+            "bA2 -wB2",
+            "wG2 -wS2",
+            "bG3 bS1/",
+            "wG2 wB2\\",
+            "bS2 bG3\\",
+            "wG3 wS2\\"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 4,
+          "current_free_pieces": [
+            "wB1",
+            "wG1"
+          ],
+          "opponent_free_pieces": [
+            "bA2",
+            "bA3",
+            "bG3"
+          ],
+          "move": "wB2 -wG1"
+        },
+        {
+          "ply": 26,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.2596698999404907,
+          "raw_ours_score": -0.2596698999404907,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.1677190363407135,
+          "nokamute_raw_score": -37,
+          "nokamute_ours_advantage": -37,
+          "nokamute_seconds": 10.000410265289247,
+          "nokamute_pv": [
+            "bA2 -wB2",
+            "wG2 -wS2",
+            "bG3 bS1/",
+            "wG3 /wA2",
+            "bS2 bG3-",
+            "wG2 wB2\\"
+          ],
+          "current_queen_surround": 4,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bA2",
+            "bA3",
+            "bG3"
+          ],
+          "opponent_free_pieces": [
+            "wB1",
+            "wB2"
+          ],
+          "move": "bA2 -wB2"
+        },
+        {
+          "ply": 27,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.4215647876262665,
+          "raw_ours_score": 0.4215647876262665,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.368153856135905,
+          "nokamute_raw_score": 43,
+          "nokamute_ours_advantage": -43,
+          "nokamute_seconds": 10.000619198195636,
+          "nokamute_pv": [
+            "wG2 -wS2",
+            "bG3 bS1/",
+            "wG3 wS2\\",
+            "bS2 bG3\\",
+            "wG3 -bA2",
+            "bS2 \\bG3",
+            "wG2 wB2\\",
+            "bA3 -bS2"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 4,
+          "current_free_pieces": [
+            "wB1",
+            "wS2"
+          ],
+          "opponent_free_pieces": [
+            "bA3",
+            "bG3"
+          ],
+          "move": "wG2 wG1/"
+        },
+        {
+          "ply": 28,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.4215647876262665,
+          "raw_ours_score": -0.4215647876262665,
+          "ours_mate_plies": null,
+          "ours_depth": 4,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.324673932045698,
+          "nokamute_raw_score": -43,
+          "nokamute_ours_advantage": -43,
+          "nokamute_seconds": 10.000555173493922,
+          "nokamute_pv": [
+            "bG3 bS1/",
+            "wG3 wS2\\",
+            "bS2 bG3-",
+            "wG3 -bA2",
+            "bS2 \\wQ",
+            "wG2 wB2\\",
+            "bA3 \\bG3"
+          ],
+          "current_queen_surround": 4,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bA2",
+            "bA3",
+            "bG3"
+          ],
+          "opponent_free_pieces": [
+            "wA1",
+            "wB1",
+            "wG2",
+            "wS2"
+          ],
+          "move": "bB1 bS1-"
+        },
+        {
+          "ply": 29,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.7221337556838989,
+          "raw_ours_score": 0.7221337556838989,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.477443303912878,
+          "nokamute_raw_score": 83,
+          "nokamute_ours_advantage": -83,
+          "nokamute_seconds": 10.00062770396471,
+          "nokamute_pv": [
+            "wG2 wB2\\",
+            "bA2 /wG2",
+            "wB1 wB1\\",
+            "bG3 \\wS1",
+            "wG3 -wS2",
+            "bG2 \\wB2",
+            "wB1 bS1"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 4,
+          "current_free_pieces": [
+            "wA1",
+            "wB1",
+            "wG2",
+            "wS2"
+          ],
+          "opponent_free_pieces": [
+            "bA2",
+            "bA3",
+            "bB1",
+            "bG3"
+          ],
+          "move": "wG2 \\bG2"
+        },
+        {
+          "ply": 30,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.36628443002700806,
+          "raw_ours_score": -0.36628443002700806,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.195278435945511,
+          "nokamute_raw_score": -44,
+          "nokamute_ours_advantage": -44,
+          "nokamute_seconds": 10.000629179179668,
+          "nokamute_pv": [
+            "bA2 /wG2",
+            "wB1 wB1\\",
+            "bG2 \\wB2",
+            "wS2 bG2/",
+            "bA3 wQ/",
+            "wB1 bS1",
+            "bB1 wB1"
+          ],
+          "current_queen_surround": 5,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bA2",
+            "bA3",
+            "bB1",
+            "bG3"
+          ],
+          "opponent_free_pieces": [
+            "wB1",
+            "wG1",
+            "wS2"
+          ],
+          "move": "bA2 \\wA2"
+        },
+        {
+          "ply": 31,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.6489601135253906,
+          "raw_ours_score": 0.6489601135253906,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.3069952242076397,
+          "nokamute_raw_score": 73,
+          "nokamute_ours_advantage": -73,
+          "nokamute_seconds": 10.000593338161707,
+          "nokamute_pv": [
+            "wB1 bA1",
+            "bG2 \\wB2",
+            "wG3 wS2/",
+            "bA3 wG3/",
+            "wA3 bA3-",
+            "bG3 \\bB1",
+            "wB1 wS1",
+            "bB2 bG1\\"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 5,
+          "current_free_pieces": [
+            "wB1",
+            "wB2",
+            "wG1",
+            "wG2",
+            "wS2"
+          ],
+          "opponent_free_pieces": [
+            "bA3",
+            "bB1",
+            "bG2",
+            "bG3"
+          ],
+          "move": "wB1 bA1"
+        },
+        {
+          "ply": 32,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.4483698606491089,
+          "raw_ours_score": -0.4483698606491089,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 1.998146708123386,
+          "nokamute_raw_score": -73,
+          "nokamute_ours_advantage": -73,
+          "nokamute_seconds": 10.0006765704602,
+          "nokamute_pv": [
+            "bG2 \\wB2",
+            "wG3 wS2/",
+            "bA3 wG3/",
+            "wA3 \\bA3",
+            "bG3 \\bB1",
+            "wB1 wS1",
+            "bB2 bG3/"
+          ],
+          "current_queen_surround": 5,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bA2",
+            "bA3",
+            "bB1",
+            "bG2",
+            "bG3"
+          ],
+          "opponent_free_pieces": [
+            "wB2",
+            "wG1",
+            "wG2",
+            "wS2"
+          ],
+          "move": "bG2 \\wB2"
+        },
+        {
+          "ply": 33,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -0.9446465969085693,
+          "raw_ours_score": 0.9446465969085693,
+          "ours_mate_plies": null,
+          "ours_depth": 6,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.289140723645687,
+          "nokamute_raw_score": 32767,
+          "nokamute_ours_advantage": -32767,
+          "nokamute_seconds": 0.0002907905727624893,
+          "nokamute_pv": [
+            "wG3 wS2/",
+            "bA3 wG3/",
+            "wA3 bA3-",
+            "bG3 \\bB1",
+            "wA2 wG2\\",
+            "bS2 bB1/",
+            "wB1 wA1\\"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 4,
+          "current_free_pieces": [
+            "wB1",
+            "wG1",
+            "wS2"
+          ],
+          "opponent_free_pieces": [
+            "bA3",
+            "bB1",
+            "bG3"
+          ],
+          "move": "wG3 wS2/"
+        },
+        {
+          "ply": 34,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -0.9446465969085693,
+          "raw_ours_score": -0.9446465969085693,
+          "ours_mate_plies": null,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.2180629074573517,
+          "nokamute_raw_score": -32767,
+          "nokamute_ours_advantage": -32767,
+          "nokamute_seconds": 0.0005815643817186356,
+          "nokamute_pv": [
+            "bB2 -bA2",
+            "wG3 wG2\\",
+            "bA3 /bG3",
+            "wA3 \\wS2",
+            "bA3 wQ/",
+            "wB1 wA1\\"
+          ],
+          "current_queen_surround": 4,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bA3",
+            "bB1",
+            "bG2",
+            "bG3"
+          ],
+          "opponent_free_pieces": [
+            "wB1",
+            "wG1",
+            "wG3"
+          ],
+          "move": "bA3 wG3-"
+        },
+        {
+          "ply": 35,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -1.0,
+          "raw_ours_score": 9.949999809265137,
+          "ours_mate_plies": 5,
+          "ours_depth": 5,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.561154531314969,
+          "nokamute_raw_score": 32767,
+          "nokamute_ours_advantage": -32767,
+          "nokamute_seconds": 0.19209409784525633,
+          "nokamute_pv": [
+            "wA3 bA3/",
+            "bB2 bA3\\",
+            "wA2 wG2\\",
+            "bA2 wA2\\",
+            "wB1 wA1\\"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 4,
+          "current_free_pieces": [
+            "wA3",
+            "wB1",
+            "wG1"
+          ],
+          "opponent_free_pieces": [
+            "bB1",
+            "bG2",
+            "bG3"
+          ],
+          "move": "wA3 bA3/"
+        },
+        {
+          "ply": 36,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -1.0,
+          "raw_ours_score": -9.960000038146973,
+          "ours_mate_plies": 4,
+          "ours_depth": 6,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.298890675418079,
+          "nokamute_raw_score": -32767,
+          "nokamute_ours_advantage": -32767,
+          "nokamute_seconds": 0.0029988549649715424,
+          "nokamute_pv": [
+            "bG3 \\bB1",
+            "wA2 wG2\\",
+            "bB2 bS1\\",
+            "wB1 wA1\\"
+          ],
+          "current_queen_surround": 4,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bB1",
+            "bG2",
+            "bG3"
+          ],
+          "opponent_free_pieces": [
+            "wA2",
+            "wB1",
+            "wG1"
+          ],
+          "move": "bB2 bG3-"
+        },
+        {
+          "ply": 37,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -1.0,
+          "raw_ours_score": 9.970000267028809,
+          "ours_mate_plies": 3,
+          "ours_depth": 6,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.183443228714168,
+          "nokamute_raw_score": 32767,
+          "nokamute_ours_advantage": -32767,
+          "nokamute_seconds": 0.0028122682124376297,
+          "nokamute_pv": [
+            "wA2 wG2\\",
+            "bA2 wS2\\",
+            "wB1 wA1\\"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 4,
+          "current_free_pieces": [
+            "wA2",
+            "wA3",
+            "wB1",
+            "wG1"
+          ],
+          "opponent_free_pieces": [
+            "bB1",
+            "bB2",
+            "bG2",
+            "bG3"
+          ],
+          "move": "wA2 bA2-"
+        },
+        {
+          "ply": 38,
+          "actor": "ours",
+          "ours_to_move": true,
+          "ours_advantage": -1.0,
+          "raw_ours_score": -9.979999542236328,
+          "ours_mate_plies": 2,
+          "ours_depth": 7,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.055363920517266,
+          "nokamute_raw_score": -32767,
+          "nokamute_ours_advantage": -32767,
+          "nokamute_seconds": 0.0003971550613641739,
+          "nokamute_pv": [
+            "bA2 \\bB1",
+            "wB1 wA1\\"
+          ],
+          "current_queen_surround": 5,
+          "opponent_queen_surround": 2,
+          "current_free_pieces": [
+            "bA2",
+            "bB1",
+            "bB2",
+            "bG2",
+            "bG3"
+          ],
+          "opponent_free_pieces": [
+            "wA3",
+            "wB1",
+            "wG1",
+            "wG2"
+          ],
+          "move": "bA2 wA3-"
+        },
+        {
+          "ply": 39,
+          "actor": "nokamute",
+          "ours_to_move": false,
+          "ours_advantage": -1.0,
+          "raw_ours_score": 9.989999771118164,
+          "ours_mate_plies": 1,
+          "ours_depth": 6,
+          "ours_nodes": 400001,
+          "ours_seconds": 2.055445193313062,
+          "nokamute_raw_score": 32767,
+          "nokamute_ours_advantage": -32767,
+          "nokamute_seconds": 0.000304187647998333,
+          "nokamute_pv": [
+            "wB1 wA1\\"
+          ],
+          "current_queen_surround": 2,
+          "opponent_queen_surround": 5,
+          "current_free_pieces": [
+            "wA2",
+            "wB1",
+            "wG1",
+            "wG2"
+          ],
+          "opponent_free_pieces": [
+            "bB1",
+            "bB2",
+            "bG2",
+            "bG3"
+          ],
+          "move": "wB1 bQ-"
+        }
+      ],
+      "result": "WHITE_WINS",
+      "winner": "nokamute",
+      "plies": 39
+    }
+  ]
+}
